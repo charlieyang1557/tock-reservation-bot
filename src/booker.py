@@ -127,7 +127,7 @@ class TockBooker:
             ):
                 return False
 
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(4000)  # calendar renders inside dropdown
 
             # ── Step 2: click the calendar day ────────────────────────
             if booking_won.is_set():
@@ -190,25 +190,24 @@ class TockBooker:
     async def _click_calendar_day(self, page: Page, slot: AvailableSlot) -> bool:
         """Click the calendar button matching slot.slot_date."""
         key = "available_day_button"
-        num_key = "day_number_span"
         selector = sel.get(key)
-        num_selector = sel.get(num_key)
         target_num = str(slot.slot_date.day)
 
         day_buttons = await page.query_selector_all(selector)
         for btn in day_buttons:
             try:
-                span = await btn.query_selector(num_selector)
-                if span:
-                    text = (await span.text_content() or "").strip()
-                    if text == target_num:
-                        await btn.click()
-                        return True
+                # Button text content IS the day number directly.
+                # (Old code looked for child span.B2; now span.MuiTypography-root.
+                # Reading btn.text_content() is span-class-agnostic and more robust.)
+                text = (await btn.text_content() or "").strip()
+                if text == target_num:
+                    await btn.click()
+                    return True
             except Exception:
                 continue
 
         logger.error(
-            f"SELECTOR_FAILED: key='{key}' / '{num_key}'\n"
+            f"SELECTOR_FAILED: key='{key}'\n"
             f"  Could not find or click day {target_num} for {slot.slot_date_str}.\n"
             f"  → Update src/selectors.py"
         )

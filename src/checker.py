@@ -119,7 +119,7 @@ class AvailabilityChecker:
             if not await self._wait_for_calendar(page, date_str):
                 return []
 
-            await page.wait_for_timeout(800)  # let JS finish rendering slots
+            await page.wait_for_timeout(4000)  # calendar renders inside dropdown — needs time
 
             # Is our target day marked as available?
             if not await self._is_day_available(page, target_date):
@@ -188,11 +188,12 @@ class AvailabilityChecker:
         target_num = str(target_date.day)
         for btn in day_buttons:
             try:
-                span = await btn.query_selector(num_selector)
-                if span:
-                    text = (await span.text_content() or "").strip()
-                    if text == target_num:
-                        return True
+                # Read the button's text content directly — the day number is the
+                # button's full text. (Old approach used a child span.B2 which
+                # changed to span.MuiTypography-root; text_content() is span-agnostic.)
+                text = (await btn.text_content() or "").strip()
+                if text == target_num:
+                    return True
             except Exception:
                 continue
 
@@ -202,21 +203,18 @@ class AvailabilityChecker:
         """Click the calendar button for target_date. Returns True on success."""
         key = "available_day_button"
         selector = sel.get(key)
-        num_selector = sel.get("day_number_span")
         target_num = str(target_date.day)
 
         day_buttons = await page.query_selector_all(selector)
         for btn in day_buttons:
             try:
-                span = await btn.query_selector(num_selector)
-                if span:
-                    text = (await span.text_content() or "").strip()
-                    if text == target_num:
-                        await btn.click()
-                        logger.debug(
-                            f"[check] Clicked day {target_num} for {target_date.isoformat()}"
-                        )
-                        return True
+                text = (await btn.text_content() or "").strip()
+                if text == target_num:
+                    await btn.click()
+                    logger.debug(
+                        f"[check] Clicked day {target_num} for {target_date.isoformat()}"
+                    )
+                    return True
             except Exception:
                 continue
 

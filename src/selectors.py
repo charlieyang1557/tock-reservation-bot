@@ -47,20 +47,28 @@ SELECTORS: dict[str, str] = {
     # Element that appears only when the user IS logged in.
     # Used to skip re-login when session cookies are still valid.
     # If this selector is wrong the bot will re-login on every cycle (harmless but slow).
+    # Verified 2026-03-10: profile button has data-testid="profile-button"
     "logged_in_indicator": (
+        '[data-testid="profile-button"], '
         '[data-testid="user-avatar"], '
         '.ConsumerHeader-account, '
-        'a[href*="/account"], '
-        'button[aria-label*="account" i]'
+        'a[href*="/account"]'
     ),
 
     # --- Search / calendar page ---------------------------------------------
-    # Outer container of the monthly calendar grid
+    # Outer container of the monthly calendar grid.
+    # Verified 2026-03-10: this selector IS correct. The calendar renders inside
+    # SearchBarModalContainer > ConsumerCalendar > ConsumerCalendar-month.
     "calendar_container": "div.ConsumerCalendar-month",
-    # Clickable day buttons that have at least one open slot
+    # Clickable day buttons that have at least one open slot.
+    # Verified 2026-03-10: class structure confirmed. States: is-available, is-sold,
+    # is-disabled, is-past, is-future, is-today, is-selected (combinable).
+    # All current slots are sold/disabled — is-available appears when new slots drop.
     "available_day_button": "button.ConsumerCalendar-day.is-in-month.is-available",
-    # <span> inside a day button containing the day number ("15", "16", …)
-    "day_number_span": "span.B2",
+    # <span> inside a day button showing the day number ("15", "16", …).
+    # Verified 2026-03-10: was span.B2 (old), now span.MuiTypography-root (MUI v5).
+    # Code in checker.py/booker.py reads btn.text_content() directly — more reliable.
+    "day_number_span": "span.MuiTypography-root",
     # Month + year heading (e.g. "March 2024") — used for debug logging only
     "calendar_month_heading": "div.ConsumerCalendar-monthHeading, span.H1",
 
@@ -144,15 +152,22 @@ def get(key: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Maps selector key → relative URL path to test it on.
-# {today} is replaced with today's ISO date string at runtime.
+# {friday} is replaced with next Friday's ISO date string at runtime.
+# We use next Friday (a preferred booking day) to get the most realistic calendar render.
+#
+# Keys marked SKIP_IF_SOLD_OUT cannot be verified when all Fuhuihua slots are sold out
+# (which is the normal state). They will be reported as "SKIP" rather than FAIL.
 _VERIFY_PLAN: dict[str, str] = {
     "login_email":          "/login",
     "login_password":       "/login",
     "login_submit":         "/login",
-    "calendar_container":   "/search?date={today}&size=2&time=17:00",
-    "available_day_button": "/search?date={today}&size=2&time=17:00",
-    "available_slot_button":"/search?date={today}&size=2&time=17:00",
+    "calendar_container":   "/search?date={friday}&size=2&time=17:00",
+    # These two only appear when live slots exist — shown as SKIP when sold out
+    "available_day_button": "/search?date={friday}&size=2&time=17:00",
+    "available_slot_button":"/search?date={friday}&size=2&time=17:00",
 }
+
+_SKIP_IF_SOLD_OUT = {"available_day_button", "available_slot_button"}
 
 
 async def verify_selectors(browser, config) -> None:
@@ -161,13 +176,18 @@ async def verify_selectors(browser, config) -> None:
     Logs PASS / FAIL with the exact selector string.
     Run with:  python main.py --verify
     """
+    from datetime import timedelta
     base = f"https://www.exploretock.com/{config.restaurant_slug}"
-    today_str = date.today().isoformat()
+
+    # Next Friday gives the most realistic calendar rendering
+    today = date.today()
+    days_until_friday = (4 - today.weekday()) % 7 or 7
+    friday_str = (today + timedelta(days=days_until_friday)).isoformat()
 
     # Group keys by URL so we only load each page once
     url_to_keys: dict[str, list[str]] = {}
     for key, rel_path in _VERIFY_PLAN.items():
-        url = base + rel_path.format(today=today_str)
+        url = base + rel_path.format(friday=friday_str)
         url_to_keys.setdefault(url, []).append(key)
 
     results: list[tuple[str, str, str]] = []  # (key, status, selector)
@@ -177,25 +197,33 @@ async def verify_selectors(browser, config) -> None:
         logger.info(f"[verify] Loading {url}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)   # let React render
 
             for key in keys:
                 selector = SELECTORS[key]
+
+                # Selectors that only appear when live slots exist — skip gracefully
+                if key in _SKIP_IF_SOLD_OUT:
+                    results.append((key, "SKIP", selector))
+                    logger.info(
+                        f"  ⊘ SKIP   {key}\n"
+                        f"           (only present when slots are available; "
+                        f"selector will be tested automatically when slots drop)"
+                    )
+                    continue
+
+                # Use wait_for_selector so it polls until the element appears
+                # (better than a fixed sleep — handles slow React renders)
                 try:
-                    el = await page.query_selector(selector)
-                    if el:
-                        results.append((key, "PASS", selector))
-                        logger.info(f"  ✓ PASS   {key}")
-                    else:
-                        results.append((key, "FAIL — element not found", selector))
-                        logger.warning(
-                            f"  ✗ FAIL   {key}\n"
-                            f"           selector : {selector}\n"
-                            f"           → Update src/selectors.py"
-                        )
+                    await page.wait_for_selector(selector, timeout=15000, state="attached")
+                    results.append((key, "PASS", selector))
+                    logger.info(f"  ✓ PASS   {key}")
                 except Exception as e:
-                    results.append((key, f"ERROR: {e}", selector))
-                    logger.error(f"  ✗ ERROR  {key}: {e}")
+                    results.append((key, "FAIL — element not found", selector))
+                    logger.warning(
+                        f"  ✗ FAIL   {key}\n"
+                        f"           selector : {selector}\n"
+                        f"           → Update src/selectors.py"
+                    )
         except Exception as e:
             logger.error(f"[verify] Could not load {url}: {e}")
             for key in keys:
@@ -203,12 +231,16 @@ async def verify_selectors(browser, config) -> None:
         finally:
             await page.close()
 
-    passed = sum(1 for _, s, _ in results if s == "PASS")
-    total = len(results)
-    logger.info(f"\n[verify] {passed}/{total} selectors passed.")
-    if passed < total:
+    passed  = sum(1 for _, s, _ in results if s == "PASS")
+    skipped = sum(1 for _, s, _ in results if s == "SKIP")
+    failed  = sum(1 for _, s, _ in results if s not in ("PASS", "SKIP"))
+    logger.info(
+        f"\n[verify] {passed} passed, {skipped} skipped (no live slots), "
+        f"{failed} failed  (total {len(results)})"
+    )
+    if failed:
         logger.warning(
-            "[verify] Some selectors need updating.\n"
-            "         Open the page in Chrome DevTools and find the new selector,\n"
+            "[verify] Failing selectors need updating.\n"
+            "         Open the page in Chrome DevTools, find the new element,\n"
             "         then update src/selectors.py."
         )

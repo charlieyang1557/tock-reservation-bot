@@ -26,23 +26,53 @@ from src.config import Config
 
 logger = logging.getLogger(__name__)
 
-# Where session cookies are persisted between runs
 COOKIES_FILE = Path("session_cookies.json")
-
 BASE_URL = "https://www.exploretock.com"
 
+# How long to wait for login redirect (seconds).
+# Set long enough for the user to manually solve any CAPTCHA in the browser window.
+LOGIN_REDIRECT_TIMEOUT_MS = 120_000  # 2 minutes
+
 # ---------------------------------------------------------------------------
-# Optional stealth import
+# playwright-stealth — supports both v1 (stealth_async) and v2 (Stealth class)
 # ---------------------------------------------------------------------------
+_stealth_apply = None  # will be an async callable (page) -> None, or None
+
 try:
-    from playwright_stealth import stealth_async
-    _STEALTH_AVAILABLE = True
+    # v2.x API
+    from playwright_stealth import Stealth as _Stealth
+    _stealth_instance = _Stealth(init_scripts_only=True)
+
+    async def _stealth_apply(page: Page) -> None:
+        await _stealth_instance.apply_stealth_async(page)
+
+    logger.debug("playwright-stealth v2 loaded (Stealth class)")
 except ImportError:
-    _STEALTH_AVAILABLE = False
+    pass
+
+if _stealth_apply is None:
+    try:
+        # v1.x API (fallback)
+        from playwright_stealth import stealth_async as _stealth_async_v1
+
+        async def _stealth_apply(page: Page) -> None:
+            await _stealth_async_v1(page)
+
+        logger.debug("playwright-stealth v1 loaded (stealth_async)")
+    except ImportError:
+        pass
+
+if _stealth_apply is None:
     logger.warning(
-        "playwright-stealth not installed — bot detection is more likely.\n"
-        "  Fix: pip install playwright-stealth"
+        "playwright-stealth not available — bot-detection resistance is reduced.\n"
+        "  The bot will still work but may trigger Cloudflare challenges more often."
     )
+
+    async def _stealth_apply(page: Page) -> None:  # type: ignore[misc]
+        # Minimal manual patch
+        await page.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        )
 
 
 class TockBrowser:
@@ -81,14 +111,11 @@ class TockBrowser:
             timezone_id="America/Los_Angeles",
         )
 
-        # Restore previously saved cookies (includes Cloudflare clearance)
         if COOKIES_FILE.exists():
             try:
                 cookies = json.loads(COOKIES_FILE.read_text())
                 await self._context.add_cookies(cookies)
-                logger.info(
-                    f"Restored {len(cookies)} session cookies from {COOKIES_FILE}"
-                )
+                logger.info(f"Restored {len(cookies)} session cookies from {COOKIES_FILE}")
             except Exception as e:
                 logger.warning(f"Could not restore session cookies: {e}")
 
@@ -107,15 +134,7 @@ class TockBrowser:
     async def new_page(self) -> Page:
         """Return a new page with stealth patches applied."""
         page = await self._context.new_page()
-
-        if _STEALTH_AVAILABLE:
-            await stealth_async(page)
-        else:
-            # Minimal manual patch when playwright-stealth is unavailable
-            await page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-
+        await _stealth_apply(page)
         return page
 
     # ------------------------------------------------------------------
@@ -130,8 +149,10 @@ class TockBrowser:
         1. Navigate to the restaurant search page.
         2. If a logged-in indicator is found → session still valid, done.
         3. Otherwise navigate to /login, fill credentials, submit.
-        4. Wait for redirect away from /login.
-        5. Persist all cookies (including Cloudflare clearance).
+        4. Wait up to 2 minutes for redirect away from /login.
+           (This gives time to manually solve any Cloudflare CAPTCHA in the
+            browser window when running with HEADLESS=false.)
+        5. Persist all cookies.
 
         Returns True on success, False on failure.
         """
@@ -141,48 +162,68 @@ class TockBrowser:
         try:
             # ---- Step 1: Check existing session ----
             logger.info("Checking existing session…")
-            search_url = f"{BASE_URL}/{slug}/search?date=2099-01-01&size=2&time=17:00"
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
+            # Use today's date so we get a valid calendar page
+            from datetime import date
+            today = date.today().isoformat()
+            check_url = (
+                f"{BASE_URL}/{slug}/search"
+                f"?date={today}&size={self.config.party_size}&time={self.config.preferred_time}"
+            )
+            await page.goto(check_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2500)
 
             if await self._is_logged_in(page):
                 logger.info("Session cookie valid — already logged in.")
                 return True
 
-            # ---- Step 2: Log in ----
-            logger.info("No valid session found. Navigating to login page…")
+            # ---- Step 2: Navigate to login ----
+            logger.info("No valid session. Navigating to login page…")
             await page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)  # let any Cloudflare JS settle
 
+            # ---- Step 3: Fill credentials ----
             if not await self._safe_fill(page, "login_email", self.config.tock_email):
                 return False
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(500)
 
             if not await self._safe_fill(page, "login_password", self.config.tock_password):
                 return False
-            await page.wait_for_timeout(400)
+            await page.wait_for_timeout(500)
 
+            logger.info("Credentials filled. Clicking sign-in…")
             if not await self._safe_click(page, "login_submit"):
                 return False
 
-            # ---- Step 3: Wait for redirect away from /login ----
+            # ---- Step 4: Wait for redirect ----
+            logger.info(
+                f"Waiting up to {LOGIN_REDIRECT_TIMEOUT_MS // 1000}s for login redirect…"
+                + (
+                    "\n  *** HEADED MODE: If a CAPTCHA appears in the browser window, "
+                    "solve it manually — the bot will continue automatically. ***"
+                    if not self.config.headless else ""
+                )
+            )
             try:
                 await page.wait_for_function(
                     "!window.location.pathname.startsWith('/login')",
-                    timeout=20000,
+                    timeout=LOGIN_REDIRECT_TIMEOUT_MS,
                 )
             except Exception:
+                current_url = page.url
                 logger.error(
-                    "Login did not redirect away from /login within 20s.\n"
-                    "  Possible causes:\n"
-                    "    • Wrong credentials in .env\n"
-                    "    • Cloudflare CAPTCHA appeared (run with HEADLESS=false to solve manually)\n"
-                    "    • Tock login page structure changed (check login_* selectors)"
+                    f"Login did not redirect away from /login within "
+                    f"{LOGIN_REDIRECT_TIMEOUT_MS // 1000}s.\n"
+                    f"  Current URL: {current_url}\n"
+                    f"  Possible causes:\n"
+                    f"    • Wrong email or password in .env\n"
+                    f"    • Cloudflare CAPTCHA not solved (use HEADLESS=false)\n"
+                    f"    • Tock login page structure changed (check login_* selectors in "
+                    f"      src/selectors.py)"
                 )
                 return False
 
             await self._save_cookies()
-            logger.info("Login successful. Session cookies saved.")
+            logger.info(f"Login successful → {page.url}. Cookies saved.")
             return True
 
         except Exception as e:
@@ -192,7 +233,7 @@ class TockBrowser:
             await page.close()
 
     async def _is_logged_in(self, page: Page) -> bool:
-        """Return True if an authenticated-only element is present."""
+        """Return True if an authenticated-only element is present on the page."""
         try:
             el = await page.query_selector(sel.get("logged_in_indicator"))
             return el is not None
@@ -205,7 +246,7 @@ class TockBrowser:
         logger.debug(f"Saved {len(cookies)} cookies → {COOKIES_FILE}")
 
     # ------------------------------------------------------------------
-    # Resilient selector helpers (used by login; booker/checker use their own)
+    # Resilient selector helpers
     # ------------------------------------------------------------------
 
     async def _safe_fill(
