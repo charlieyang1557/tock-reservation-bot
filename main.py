@@ -10,6 +10,8 @@ Usage:
   python main.py --test-notify           Send a test Discord message for each alert type
   python main.py --test-booking-flow     Navigate to checkout on a test restaurant and screenshot
   python main.py --test-booking-flow --test-restaurant SLUG  (specify which restaurant)
+  python main.py --test-sniper           Run sniper polling loop on a test restaurant (DRY_RUN, no booking)
+  python main.py --test-sniper --test-restaurant SLUG --test-sniper-polls N
 """
 
 import asyncio
@@ -256,6 +258,119 @@ async def _test_booking_flow(browser, config, test_slug: str, logger) -> None:
         await page.close()
 
 
+async def _test_sniper_mode(
+    browser, config, test_slug: str, num_polls: int, logger
+) -> None:
+    """
+    Simulate the sniper polling loop against *test_slug* for *num_polls*
+    iterations with DRY_RUN forced — never books anything.
+
+    Uses sequential date checking (same as real sniper mode) so the error
+    rate accurately reflects what Fuhuihua sniper will experience.
+    Counts SELECTOR_FAILED calendar_container errors per poll as a proxy
+    for Cloudflare rate-limiting.
+    """
+    import logging as _logging
+    from src.checker import AvailabilityChecker
+    from src.tracker import SlotTracker
+
+    # Mirror the real Fuhuihua sniper config: preferred days + 2-week scan
+    test_config = config.__class__(**{
+        **config.__dict__,
+        "restaurant_slug": test_slug,
+        "dry_run": True,
+    })
+
+    # Intercept checker log records to count calendar errors per poll
+    class _ErrorCounter(_logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.count = 0
+        def emit(self, record):
+            if "calendar_container" in record.getMessage():
+                self.count += 1
+        def reset(self):
+            n, self.count = self.count, 0
+            return n
+
+    counter = _ErrorCounter()
+    _logging.getLogger("src.checker").addHandler(counter)
+
+    tracker = SlotTracker()
+    checker = AvailabilityChecker(test_config, browser, tracker)
+
+    total_calendar_errors = 0
+    total_date_checks = 0
+    slots_seen = 0
+
+    logger.info(
+        f"\n{'='*60}\n"
+        f"[test-sniper] Starting sniper poll test\n"
+        f"  Restaurant  : {test_slug}\n"
+        f"  Polls       : {num_polls}\n"
+        f"  Scan window : {test_config.scan_weeks} weeks, "
+        f"{', '.join(test_config.preferred_days)}\n"
+        f"  Booking     : DISABLED (DRY_RUN forced)\n"
+        f"{'='*60}"
+    )
+
+    from datetime import date, timedelta
+    # Count how many dates will be checked per poll
+    today = date.today()
+    end = today + timedelta(weeks=test_config.scan_weeks)
+    cur = today + timedelta(days=1)
+    dates_per_poll = sum(
+        1 for _ in iter(lambda: None, None)
+        if (cur := cur + timedelta(days=1)) and cur > end
+        or True
+    )
+    # simpler: just count them
+    dates_per_poll = sum(
+        1 for d in (today + timedelta(days=i) for i in range(1, test_config.scan_weeks * 7 + 1))
+        if d.strftime("%A") in test_config.preferred_days and d <= end
+    )
+
+    for i in range(1, num_polls + 1):
+        logger.info(f"[test-sniper] ── Poll {i}/{num_polls} ──────────────────────")
+        counter.reset()
+        t0 = asyncio.get_event_loop().time()
+        try:
+            slots = await checker.check_all()
+            elapsed = asyncio.get_event_loop().time() - t0
+            cal_errors = counter.reset()
+            total_calendar_errors += cal_errors
+            total_date_checks += dates_per_poll
+            slots_seen += len(slots)
+
+            status = f"{len(slots)} slot(s) found" if slots else "no slots"
+            logger.info(
+                f"[test-sniper] Poll {i} → {status}  "
+                f"({elapsed:.1f}s, calendar errors: {cal_errors}/{dates_per_poll})"
+            )
+            for s in slots:
+                logger.info(f"  • {s}  (would book in real mode)")
+        except Exception as e:
+            elapsed = asyncio.get_event_loop().time() - t0
+            logger.error(f"[test-sniper] Poll {i} → EXCEPTION after {elapsed:.1f}s: {e}")
+
+        await asyncio.sleep(0)
+
+    _logging.getLogger("src.checker").removeHandler(counter)
+
+    error_rate = total_calendar_errors / total_date_checks if total_date_checks else 0
+    logger.info(
+        f"\n{'='*60}\n"
+        f"[test-sniper] RESULTS\n"
+        f"  Polls run          : {num_polls}\n"
+        f"  Dates per poll     : {dates_per_poll}\n"
+        f"  Calendar errors    : {total_calendar_errors}/{total_date_checks} "
+        f"({error_rate:.0%}) "
+        f"{'⚠️  HIGH — Cloudflare blocking' if error_rate > 0.2 else '✓ acceptable'}\n"
+        f"  Slots seen total   : {slots_seen}\n"
+        f"{'='*60}"
+    )
+
+
 def _setup_logging() -> None:
     fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -303,7 +418,22 @@ async def main() -> None:
         "--test-restaurant",
         default="benu",
         metavar="SLUG",
-        help="Tock restaurant slug used for --test-booking-flow (default: benu)",
+        help="Tock restaurant slug used for --test-booking-flow / --test-sniper (default: benu)",
+    )
+    parser.add_argument(
+        "--test-sniper",
+        action="store_true",
+        help=(
+            "Run the sniper concurrent-poll loop against a test restaurant with DRY_RUN "
+            "forced — never books. Use to verify Cloudflare error rate before sniper fires."
+        ),
+    )
+    parser.add_argument(
+        "--test-sniper-polls",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of consecutive sniper polls to run in --test-sniper mode (default: 10)",
     )
     args = parser.parse_args()
 
@@ -366,6 +496,17 @@ async def main() -> None:
                 logger.error("Login failed — cannot run --test-booking-flow.")
                 sys.exit(1)
             await _test_booking_flow(browser, config, args.test_restaurant, logger)
+            return
+
+        # ── Mode: --test-sniper ───────────────────────────────────────
+        if args.test_sniper:
+            if not await browser.login():
+                logger.error("Login failed — cannot run --test-sniper.")
+                sys.exit(1)
+            await _test_sniper_mode(
+                browser, config, args.test_restaurant,
+                args.test_sniper_polls, logger
+            )
             return
 
         # ── Mode: --verify ────────────────────────────────────────────

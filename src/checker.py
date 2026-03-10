@@ -58,36 +58,26 @@ class AvailabilityChecker:
     # Public
     # ------------------------------------------------------------------
 
-    async def check_all(self, concurrent: bool = False) -> list[AvailableSlot]:
+    async def check_all(self) -> list[AvailableSlot]:
         """
         Check every preferred-weekday date within the next SCAN_WEEKS weeks.
         Returns all found slots (each date's slots sorted by proximity to
         preferred_time, then dates sorted chronologically).
 
-        concurrent=True: check all dates in parallel (used by sniper mode for speed).
-        concurrent=False: check dates sequentially (default, gentler on the server).
+        Dates are checked sequentially to avoid triggering Cloudflare rate
+        limits — concurrent bursts cause ~70% of requests to be blocked.
+        Speed comes from selector-based waits instead of fixed sleeps.
         """
         target_dates = self._get_target_dates()
         logger.debug(
-            f"Scanning {len(target_dates)} date(s) [{'concurrent' if concurrent else 'sequential'}]: "
+            f"Scanning {len(target_dates)} date(s): "
             + ", ".join(d.isoformat() for d in target_dates)
         )
 
-        if concurrent:
-            import asyncio
-            results = await asyncio.gather(
-                *[self._check_date(d) for d in target_dates],
-                return_exceptions=True,
-            )
-            all_slots: list[AvailableSlot] = []
-            for r in results:
-                if isinstance(r, list):
-                    all_slots.extend(r)
-        else:
-            all_slots = []
-            for target_date in target_dates:
-                slots = await self._check_date(target_date)
-                all_slots.extend(slots)
+        all_slots: list[AvailableSlot] = []
+        for target_date in target_dates:
+            slots = await self._check_date(target_date)
+            all_slots.extend(slots)
 
         logger.info(
             f"Scan complete — {len(all_slots)} slot(s) found "

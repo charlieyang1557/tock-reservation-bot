@@ -111,9 +111,8 @@ class TockMonitor:
             return
 
         # --- Availability check ---
-        # Sniper mode checks all dates concurrently for maximum speed
         try:
-            slots = await self.checker.check_all(concurrent=self._sniper_active)
+            slots = await self.checker.check_all()
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
             self.notifier.error("Availability check error", str(e))
