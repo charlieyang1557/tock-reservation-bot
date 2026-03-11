@@ -57,12 +57,25 @@ class AvailabilityChecker:
         # monitor.py reads these to decide whether to switch concurrent↔sequential.
         self.last_errors: int = 0   # calendar_container failures in last poll
         self.last_checks: int = 0   # total date checks attempted in last poll
+        # Sniper mode: keep pages open across polls and reload them instead of
+        # opening fresh — faster (no DNS/TCP overhead) and looks more human.
+        self._sniper_pages: dict[str, "Page"] = {}  # date_str -> open Page
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
 
-    async def check_all(self, concurrent: bool = False) -> list[AvailableSlot]:
+    async def close_sniper_pages(self) -> None:
+        """Close all pages kept open during sniper mode. Call when window ends."""
+        for page in list(self._sniper_pages.values()):
+            try:
+                await page.close()
+            except Exception:
+                pass
+        self._sniper_pages.clear()
+        logger.debug("[check] Sniper pages closed.")
+
+    async def check_all(self, concurrent: bool = False, keep_pages: bool = False) -> list[AvailableSlot]:
         """
         Scan for available slots in two phases:
 
@@ -112,7 +125,7 @@ class AvailabilityChecker:
                 )
                 if concurrent:
                     results = await _asyncio.gather(
-                        *[self._check_date(d) for d in dates],
+                        *[self._check_date(d, keep_page=keep_pages) for d in dates],
                         return_exceptions=True,
                     )
                     slots: list[AvailableSlot] = []
@@ -123,7 +136,7 @@ class AvailabilityChecker:
                 else:
                     slots = []
                     for d in dates:
-                        slots.extend(await self._check_date(d))
+                        slots.extend(await self._check_date(d, keep_page=keep_pages))
                     return slots
 
             preferred_dates = self._get_target_dates(self.config.preferred_days)
@@ -182,12 +195,16 @@ class AvailabilityChecker:
             current += timedelta(days=1)
         return result
 
-    async def _check_date(self, target_date: date) -> list[AvailableSlot]:
+    async def _check_date(
+        self, target_date: date, keep_page: bool = False
+    ) -> list[AvailableSlot]:
         """
         Load the Tock search page for target_date, verify the day is
         available in the calendar, click it, then collect time slots.
+
+        keep_page=True (sniper mode): reuses the existing page for this date
+        (reload instead of full navigate) for speed and Cloudflare friendliness.
         """
-        page = await self.browser.new_page()
         date_str = target_date.isoformat()
         url = (
             f"{BASE_URL}/{self.config.restaurant_slug}/search"
@@ -196,9 +213,24 @@ class AvailabilityChecker:
             f"&time={self.config.preferred_time}"
         )
 
+        # Resolve page: reuse if keep_page and page is still open
+        existing = self._sniper_pages.get(date_str) if keep_page else None
+        if existing and not existing.is_closed():
+            page = existing
+            reusing = True
+        else:
+            page = await self.browser.new_page()
+            if keep_page:
+                self._sniper_pages[date_str] = page
+            reusing = False
+
         try:
-            logger.debug(f"[check] {date_str} → {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            if reusing:
+                logger.debug(f"[check] {date_str} → reload (sniper page reuse)")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            else:
+                logger.debug(f"[check] {date_str} → {url}")
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             # Wait for calendar to render
             if not await self._wait_for_calendar(page, date_str):
@@ -241,9 +273,18 @@ class AvailabilityChecker:
 
         except Exception as e:
             logger.error(f"[check] Unexpected error for {date_str}: {e}")
+            if keep_page and date_str in self._sniper_pages:
+                # Drop broken page so next poll creates a fresh one
+                del self._sniper_pages[date_str]
+                try:
+                    await page.close()
+                except Exception:
+                    pass
             return []
         finally:
-            await page.close()
+            # Only close if we're not keeping this page across polls
+            if not keep_page:
+                await page.close()
 
     async def _wait_for_calendar(self, page: Page, date_str: str) -> bool:
         """Wait for the calendar container to appear. Logs selector failures."""

@@ -79,6 +79,15 @@ class TockMonitor:
         # Release-time auto-detection: re-check every CHECK_INTERVAL_MIN
         self._last_release_check: datetime | None = None
 
+        # Session pre-warm: fire PREWARM_BEFORE_MIN minutes before each sniper window.
+        # Track which window we've already warmed for to avoid repeated calls.
+        self._session_prewarmed_for: str | None = None  # "DayName@HH:MM"
+
+# How many minutes before a sniper window to pre-warm the session.
+# Must be >= the longest non-sniper poll interval (15 min default) to guarantee
+# the pre-warm fires. Set to 15 so it always fires at the poll just before the window.
+PREWARM_BEFORE_MIN = 15
+
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
@@ -172,26 +181,33 @@ class TockMonitor:
             "Press Ctrl+C to stop."
         )
         while True:
-            # Capture sniper state BEFORE interval check (which may flip it)
-            prev_sniper = self._sniper_active
             # Determine interval BEFORE poll so it's logged up front
             interval = self._get_poll_interval()
-            was_sniper = self._sniper_active  # used for end-of-poll "just ended" check
+            was_sniper = self._sniper_active
 
-            # If sniper mode just activated, warm session cookies before rapid polling
-            if self._sniper_active and not prev_sniper:
+            # Pre-warm session BEFORE the window opens (not at window entry).
+            # Fires when we're within PREWARM_BEFORE_MIN minutes of the next
+            # sniper window — giving time to solve CAPTCHA in headed mode.
+            prewarm_target = self._get_prewarm_target()
+            if prewarm_target and prewarm_target != self._session_prewarmed_for:
                 logger.info(
-                    "[monitor] Sniper window opened — pre-warming session cookies…"
+                    f"[monitor] Sniper window within {PREWARM_BEFORE_MIN} min "
+                    f"({prewarm_target}) — pre-warming session cookies…"
                 )
                 await self.browser.warm_session()
+                self._session_prewarmed_for = prewarm_target
 
             self.notifier.poll_start(self._poll_count + 1, interval)
             await self.poll()
 
-            # If sniper mode just ended (we left the window), log it
+            # If sniper mode just ended (we left the window), log it and
+            # close the reused search pages held open during sniper.
             now_sniper = self._is_sniper_window()
             if was_sniper and not now_sniper:
                 self.notifier.sniper_mode_ended(self._poll_count)
+                await self.checker.close_sniper_pages()
+                # Reset so pre-warm fires again if sniper re-arms (new window same day)
+                self._session_prewarmed_for = None
 
             if interval > 0:
                 logger.info(f"Sleeping {interval}s…")
@@ -218,7 +234,10 @@ class TockMonitor:
         # If error rate spikes, adaptive logic switches to sequential automatically.
         use_concurrent = self._sniper_active and self._sniper_concurrent
         try:
-            slots = await self.checker.check_all(concurrent=use_concurrent)
+            slots = await self.checker.check_all(
+                concurrent=use_concurrent,
+                keep_pages=self._sniper_active,
+            )
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
             self.notifier.error("Availability check error", str(e))
@@ -384,6 +403,32 @@ class TockMonitor:
 
             if window_start <= t <= window_end:
                 return end_dt.strftime("%H:%M")
+
+        return None
+
+    def _get_prewarm_target(self) -> str | None:
+        """
+        Return a 'DayName@HH:MM' string if any configured sniper window starts
+        within the next PREWARM_BEFORE_MIN minutes. Otherwise return None.
+
+        Used to fire session warm-up BEFORE the window opens (not at entry).
+        """
+        now = datetime.now(PT)
+        day_name = now.strftime("%A")
+        if day_name not in self.config.sniper_days:
+            return None
+
+        for start_str in self.config.sniper_times:
+            window_start = _parse_time(start_str)
+            start_dt = now.replace(
+                hour=window_start.hour,
+                minute=window_start.minute,
+                second=0,
+                microsecond=0,
+            )
+            delta_sec = (start_dt - now).total_seconds()
+            if 0 < delta_sec <= PREWARM_BEFORE_MIN * 60:
+                return f"{day_name}@{start_str}"
 
         return None
 
