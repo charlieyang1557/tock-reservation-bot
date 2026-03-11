@@ -37,6 +37,7 @@ from src.booker import TockBooker
 from src.checker import AvailabilityChecker
 from src.config import Config
 from src.notifier import Notifier
+from src.release_detector import CHECK_INTERVAL_MIN, apply_release_schedule, detect_release_time
 from src.tracker import SlotTracker
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,9 @@ class TockMonitor:
         self._SNIPER_ERROR_THRESH  = _SNIPER_ERROR_THRESH
         self._SNIPER_RECOVER_POLLS = _SNIPER_RECOVER_POLLS
         self._sniper_sequential_clean = 0  # consecutive clean polls in sequential mode
+
+        # Release-time auto-detection: re-check every CHECK_INTERVAL_MIN
+        self._last_release_check: datetime | None = None
 
     # ------------------------------------------------------------------
     # Public
@@ -129,8 +133,34 @@ class TockMonitor:
             f"{'='*60}"
         )
 
+    async def _refresh_release_schedule(self) -> None:
+        """
+        Scrape the restaurant page for a release announcement and update the
+        sniper schedule if a new date/time is found. Runs on startup and then
+        every CHECK_INTERVAL_MIN minutes.
+        """
+        now = datetime.now(PT)
+        if (
+            self._last_release_check is not None
+            and (now - self._last_release_check).total_seconds() < CHECK_INTERVAL_MIN * 60
+        ):
+            return  # Not time to check yet
+
+        self._last_release_check = now
+        release_dt = await detect_release_time(self.browser, self.config)
+        if release_dt:
+            changed = apply_release_schedule(self.config, release_dt)
+            if changed:
+                logger.info(
+                    f"[release-detect] Sniper re-aimed at "
+                    f"{self.config.sniper_days} @ {self.config.sniper_times} PT"
+                )
+
     async def run(self) -> None:
         """Main loop — runs until interrupted (Ctrl+C)."""
+        # Detect release time before first poll so sniper is correctly aimed
+        await self._refresh_release_schedule()
+
         logger.info(
             "Monitor running.\n"
             f"  Preferred days : {', '.join(self.config.preferred_days)}\n"
@@ -157,6 +187,8 @@ class TockMonitor:
             if interval > 0:
                 logger.info(f"Sleeping {interval}s…")
                 await asyncio.sleep(interval)
+                # Re-check release page periodically between polls (not during sniper)
+                await self._refresh_release_schedule()
             else:
                 # Sniper mode: zero sleep — yield control briefly then immediately re-poll
                 await asyncio.sleep(0)
