@@ -172,9 +172,18 @@ class TockMonitor:
             "Press Ctrl+C to stop."
         )
         while True:
+            # Capture sniper state BEFORE interval check (which may flip it)
+            prev_sniper = self._sniper_active
             # Determine interval BEFORE poll so it's logged up front
             interval = self._get_poll_interval()
-            was_sniper = self._sniper_active
+            was_sniper = self._sniper_active  # used for end-of-poll "just ended" check
+
+            # If sniper mode just activated, warm session cookies before rapid polling
+            if self._sniper_active and not prev_sniper:
+                logger.info(
+                    "[monitor] Sniper window opened — pre-warming session cookies…"
+                )
+                await self.browser.warm_session()
 
             self.notifier.poll_start(self._poll_count + 1, interval)
             await self.poll()

@@ -346,34 +346,55 @@ class TockBooker:
                 "checkout may fail if CVC is required."
             )
 
-        # Click confirm
+        # Click confirm — retry once in case of transient failure under server load
         confirm_key = "confirm_button"
         confirm_selector = sel.get(confirm_key)
-        try:
-            await page.wait_for_selector(confirm_selector, timeout=15000)
-            await page.click(confirm_selector)
-            logger.info("[book] Clicked confirm button.")
-        except Exception as e:
-            logger.error(
-                f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
-                f"  Could not find or click the confirm button.\n"
-                f"  Current URL: {page.url}\n"
-                f"  → Update src/selectors.py  Error: {e}"
-            )
+        clicked = False
+        for click_attempt in range(2):
+            try:
+                await page.wait_for_selector(confirm_selector, timeout=15000)
+                await page.click(confirm_selector)
+                logger.info("[book] Clicked confirm button.")
+                clicked = True
+                break
+            except Exception as e:
+                if click_attempt == 0:
+                    logger.warning(
+                        f"[book] Confirm click failed, retrying in 2s: {e}"
+                    )
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(
+                        f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
+                        f"  Could not find or click the confirm button after 2 attempts.\n"
+                        f"  Current URL: {page.url}\n"
+                        f"  → Update src/selectors.py  Error: {e}"
+                    )
+        if not clicked:
             return False
 
-        # Verify confirmation — wait_for_selector polls on its own, no fixed sleep needed
+        # Verify confirmation.
+        # Use 30s timeout (vs 20s) to handle slow Tock servers under heavy traffic.
+        # If element not found, fall back to URL check twice (immediate + after 5s delay).
         confirmed_key = "booking_confirmed"
         confirmed_selector = sel.get(confirmed_key)
         try:
-            await page.wait_for_selector(confirmed_selector, timeout=20000)
+            await page.wait_for_selector(confirmed_selector, timeout=30000)
             logger.info(f"[book] Confirmation element found — BOOKED: {slot}")
             return True
         except Exception:
-            # URL-based fallback
             url = page.url
             if any(p in url for p in ("confirmation", "confirmed", "success")):
                 logger.info(f"[book] Booking confirmed via URL: {url}")
+                return True
+            # Server may be very slow to redirect under high traffic — wait 5s more
+            logger.warning(
+                "[book] Confirmation page not detected yet — waiting 5s for slow server…"
+            )
+            await asyncio.sleep(5)
+            url = page.url
+            if any(p in url for p in ("confirmation", "confirmed", "success")):
+                logger.info(f"[book] Booking confirmed via URL (delayed): {url}")
                 return True
             logger.error(
                 f"SELECTOR_FAILED: key='{confirmed_key}'  selector={confirmed_selector!r}\n"

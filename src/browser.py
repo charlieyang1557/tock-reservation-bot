@@ -232,6 +232,42 @@ class TockBrowser:
         finally:
             await page.close()
 
+    async def warm_session(self) -> None:
+        """
+        Navigate to the restaurant's main Tock page to refresh Cloudflare
+        cookies before the sniper window opens. Also re-logins if the session
+        has expired. Saves updated cookies to disk.
+
+        Called once when sniper mode activates so every rapid poll starts
+        with a fresh cf_clearance token.
+        """
+        url = f"{BASE_URL}/{self.config.restaurant_slug}"
+        page = await self.new_page()
+        try:
+            logger.info(f"[warm] Refreshing session: {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            await page.wait_for_timeout(3000)  # let CF JS settle
+
+            if not await self._is_logged_in(page):
+                logger.warning(
+                    "[warm] Session appears expired — re-authenticating before sniper fires."
+                )
+                await page.close()
+                page = None
+                await self.login()
+                return
+
+            await self._save_cookies()
+            logger.info("[warm] Session healthy — cookies refreshed and saved.")
+        except Exception as e:
+            logger.warning(f"[warm] Session warm failed (non-critical): {e}")
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
     async def _is_logged_in(self, page: Page) -> bool:
         """Return True if an authenticated-only element is present on the page."""
         try:
