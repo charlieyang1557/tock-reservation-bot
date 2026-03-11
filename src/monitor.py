@@ -63,6 +63,18 @@ class TockMonitor:
         self._booking_secured = False
         self._sniper_active = False  # tracks whether we're in a sniper window
 
+        # Adaptive sniper mode: start concurrent, fall back to sequential if
+        # Cloudflare error rate gets too high, retry concurrent after recovery.
+        self._sniper_concurrent = True          # current mode for sniper polls
+        self._sniper_error_window: list[float] = []  # rolling error rates (last N polls)
+        _SNIPER_WINDOW_SIZE   = 3    # look at last 3 polls to decide
+        _SNIPER_ERROR_THRESH  = 0.20 # >20% errors → switch to sequential
+        _SNIPER_RECOVER_POLLS = 3    # consecutive clean sequential polls → try concurrent again
+        self._SNIPER_WINDOW_SIZE   = _SNIPER_WINDOW_SIZE
+        self._SNIPER_ERROR_THRESH  = _SNIPER_ERROR_THRESH
+        self._SNIPER_RECOVER_POLLS = _SNIPER_RECOVER_POLLS
+        self._sniper_sequential_clean = 0  # consecutive clean polls in sequential mode
+
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
@@ -111,14 +123,51 @@ class TockMonitor:
             return
 
         # --- Availability check ---
-        # Sniper mode: concurrent checks all dates in parallel (~34s vs ~133s sequential).
-        # Tested at 14 dates (preferred + fallback × 2 weeks): 1% error rate, acceptable.
+        # Sniper mode uses concurrent by default (~34s vs ~133s sequential).
+        # If error rate spikes, adaptive logic switches to sequential automatically.
+        use_concurrent = self._sniper_active and self._sniper_concurrent
         try:
-            slots = await self.checker.check_all(concurrent=self._sniper_active)
+            slots = await self.checker.check_all(concurrent=use_concurrent)
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
             self.notifier.error("Availability check error", str(e))
             return
+
+        # --- Adaptive sniper mode switching ---
+        if self._sniper_active and self.checker.last_checks > 0:
+            rate = self.checker.last_errors / self.checker.last_checks
+            self._sniper_error_window.append(rate)
+            if len(self._sniper_error_window) > self._SNIPER_WINDOW_SIZE:
+                self._sniper_error_window.pop(0)
+            rolling_rate = sum(self._sniper_error_window) / len(self._sniper_error_window)
+
+            if self._sniper_concurrent and rolling_rate > self._SNIPER_ERROR_THRESH:
+                self._sniper_concurrent = False
+                self._sniper_sequential_clean = 0
+                logger.warning(
+                    f"[sniper] Concurrent error rate {rolling_rate:.0%} > "
+                    f"{self._SNIPER_ERROR_THRESH:.0%} threshold — "
+                    f"switching to SEQUENTIAL mode"
+                )
+            elif not self._sniper_concurrent:
+                if rate == 0.0:
+                    self._sniper_sequential_clean += 1
+                else:
+                    self._sniper_sequential_clean = 0
+                if self._sniper_sequential_clean >= self._SNIPER_RECOVER_POLLS:
+                    self._sniper_concurrent = True
+                    self._sniper_error_window.clear()
+                    self._sniper_sequential_clean = 0
+                    logger.info(
+                        f"[sniper] {self._SNIPER_RECOVER_POLLS} clean sequential polls "
+                        f"— switching back to CONCURRENT mode"
+                    )
+            else:
+                logger.debug(
+                    f"[sniper] {'concurrent' if self._sniper_concurrent else 'sequential'} "
+                    f"error rate this poll: {rate:.0%} "
+                    f"(rolling {rolling_rate:.0%})"
+                )
 
         if not slots:
             self.notifier.no_slots_found()
@@ -169,6 +218,10 @@ class TockMonitor:
             until_str = sniper_info
             if not self._sniper_active:
                 self._sniper_active = True
+                # Reset adaptive state for each new sniper window
+                self._sniper_concurrent = True
+                self._sniper_error_window.clear()
+                self._sniper_sequential_clean = 0
                 self.notifier.sniper_mode_active(
                     day=day_name,
                     trigger_time=t.strftime("%H:%M"),

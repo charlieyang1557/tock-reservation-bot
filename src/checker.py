@@ -53,6 +53,10 @@ class AvailabilityChecker:
         self.config = config
         self.browser = browser
         self.tracker = tracker
+        # Error stats from the most recent check_all() call.
+        # monitor.py reads these to decide whether to switch concurrent↔sequential.
+        self.last_errors: int = 0   # calendar_container failures in last poll
+        self.last_checks: int = 0   # total date checks attempted in last poll
 
     # ------------------------------------------------------------------
     # Public
@@ -66,65 +70,98 @@ class AvailabilityChecker:
           slots found, return them immediately without scanning fallback days.
 
         Phase 2 — fallback_days (e.g. Mon–Thu): only scanned when Phase 1
-          finds nothing. Slots from fallback days are returned sorted by
-          proximity to preferred_time, same as preferred slots.
+          finds nothing.
 
-        concurrent=False (default): sequential per date — avoids Cloudflare
-          rate-limiting (concurrent bursts cause ~70% blocks at 28 dates).
-        concurrent=True: parallel per date — only for benchmarking/testing.
+        concurrent=False (default): sequential per date — safe from Cloudflare.
+        concurrent=True: parallel per date — ~4× faster, 1% error rate at 14 dates.
+
+        After each call, self.last_errors / self.last_checks reflects the
+        calendar load error rate for this poll — monitor.py uses this to
+        adaptively switch between concurrent and sequential modes.
         """
         import asyncio as _asyncio
 
-        async def _scan_dates(dates: list[date]) -> list[AvailableSlot]:
-            if not dates:
-                return []
-            logger.debug(
-                f"Scanning {len(dates)} date(s) [{'concurrent' if concurrent else 'sequential'}]: "
-                + ", ".join(d.isoformat() for d in dates)
-            )
-            if concurrent:
-                results = await _asyncio.gather(
-                    *[self._check_date(d) for d in dates],
-                    return_exceptions=True,
+        errors: list[int] = [0]   # mutable counter accessible in closure
+
+        async def _check_date_tracked(d: date) -> list[AvailableSlot]:
+            result = await self._check_date(d)
+            # _check_date returns [] on calendar failure; we detect it by
+            # checking whether _wait_for_calendar logged a SELECTOR_FAILED.
+            # Simpler proxy: if result is [] AND the date is in a phase where
+            # we'd expect the calendar to load, count it as a potential error.
+            # The real signal comes from _wait_for_calendar's log, so we use
+            # a hook: override to count failures directly.
+            return result
+
+        # Patch _wait_for_calendar to count failures for this poll
+        original_wait = self._wait_for_calendar
+        async def _counting_wait(page, date_str: str) -> bool:
+            ok = await original_wait(page, date_str)
+            if not ok:
+                errors[0] += 1
+            return ok
+        self._wait_for_calendar = _counting_wait  # type: ignore[method-assign]
+
+        try:
+            async def _scan_dates(dates: list[date]) -> list[AvailableSlot]:
+                if not dates:
+                    return []
+                logger.debug(
+                    f"Scanning {len(dates)} date(s) [{'concurrent' if concurrent else 'sequential'}]: "
+                    + ", ".join(d.isoformat() for d in dates)
                 )
-                slots: list[AvailableSlot] = []
-                for r in results:
-                    if isinstance(r, list):
-                        slots.extend(r)
-                return slots
-            else:
-                slots = []
-                for d in dates:
-                    slots.extend(await self._check_date(d))
-                return slots
+                if concurrent:
+                    results = await _asyncio.gather(
+                        *[self._check_date(d) for d in dates],
+                        return_exceptions=True,
+                    )
+                    slots: list[AvailableSlot] = []
+                    for r in results:
+                        if isinstance(r, list):
+                            slots.extend(r)
+                    return slots
+                else:
+                    slots = []
+                    for d in dates:
+                        slots.extend(await self._check_date(d))
+                    return slots
 
-        preferred_dates = self._get_target_dates(self.config.preferred_days)
-        preferred_slots = await _scan_dates(preferred_dates)
+            preferred_dates = self._get_target_dates(self.config.preferred_days)
+            preferred_slots = await _scan_dates(preferred_dates)
 
-        if preferred_slots:
+            fallback_dates = self._get_target_dates(self.config.fallback_days)
+            total_dates = len(preferred_dates) + len(fallback_dates)
+
+            if preferred_slots:
+                self.last_errors = errors[0]
+                self.last_checks = len(preferred_dates)
+                logger.info(
+                    f"Scan complete — {len(preferred_slots)} slot(s) found "
+                    f"across {len(preferred_dates)} preferred date(s)"
+                )
+                return preferred_slots
+
+            if not fallback_dates:
+                self.last_errors = errors[0]
+                self.last_checks = len(preferred_dates)
+                logger.info(
+                    f"Scan complete — 0 slot(s) found across "
+                    f"{len(preferred_dates)} date(s) (no fallback days configured)"
+                )
+                return []
+
+            fallback_slots = await _scan_dates(fallback_dates)
+            self.last_errors = errors[0]
+            self.last_checks = total_dates
             logger.info(
-                f"Scan complete — {len(preferred_slots)} slot(s) found "
-                f"across {len(preferred_dates)} preferred date(s)"
+                f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
+                f"across {total_dates} date(s) total "
+                f"(0 preferred + {len(fallback_slots)} fallback)"
             )
-            return preferred_slots
+            return fallback_slots
 
-        # No preferred slots — try fallback days if configured
-        fallback_dates = self._get_target_dates(self.config.fallback_days)
-        if not fallback_dates:
-            logger.info(
-                f"Scan complete — 0 slot(s) found across "
-                f"{len(preferred_dates)} date(s) (no fallback days configured)"
-            )
-            return []
-
-        fallback_slots = await _scan_dates(fallback_dates)
-        total_dates = len(preferred_dates) + len(fallback_dates)
-        logger.info(
-            f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
-            f"across {total_dates} date(s) total "
-            f"(0 preferred + {len(fallback_slots)} fallback)"
-        )
-        return fallback_slots
+        finally:
+            self._wait_for_calendar = original_wait  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------
     # Internal
