@@ -79,6 +79,56 @@ class TockMonitor:
     # Public
     # ------------------------------------------------------------------
 
+    async def run_adaptive_test(self, num_polls: int) -> None:
+        """
+        Test the adaptive concurrent↔sequential switching logic end-to-end.
+
+        Forces sniper mode active, lowers the error threshold to 0% (any
+        calendar failure triggers a switch), and runs num_polls consecutive
+        polls through the real TockMonitor.poll() path — the same code that
+        runs during a live sniper window.
+
+        DRY_RUN is forced so no booking ever fires.
+        """
+        self.config.dry_run = True
+
+        # Force sniper mode on and use a hair-trigger threshold (0%) so even
+        # 1 Cloudflare blip triggers the concurrent→sequential transition
+        self._sniper_active = True
+        self._sniper_concurrent = True
+        self._sniper_error_window.clear()
+        self._sniper_sequential_clean = 0
+        saved_thresh = self._SNIPER_ERROR_THRESH
+        self._SNIPER_ERROR_THRESH = 0.0  # any error triggers switch
+
+        logger.info(
+            f"\n{'='*60}\n"
+            f"[test-adaptive] Adaptive sniper switching test\n"
+            f"  Polls       : {num_polls}\n"
+            f"  Error thresh: 0% (hair-trigger — any error switches mode)\n"
+            f"  Booking     : DISABLED (DRY_RUN forced)\n"
+            f"  Expected    : concurrent → sequential on first CF error,\n"
+            f"                sequential → concurrent after "
+            f"{self._SNIPER_RECOVER_POLLS} clean polls\n"
+            f"{'='*60}"
+        )
+
+        for i in range(1, num_polls + 1):
+            mode = "CONCURRENT" if self._sniper_concurrent else "sequential"
+            logger.info(f"[test-adaptive] ── Poll {i}/{num_polls}  [{mode}] ──")
+            await self.poll()
+            await asyncio.sleep(0)
+
+        self._SNIPER_ERROR_THRESH = saved_thresh
+        self._sniper_active = False
+        logger.info(
+            f"\n{'='*60}\n"
+            f"[test-adaptive] Done. Review log above for mode-switch events:\n"
+            f"  switching to SEQUENTIAL  → threshold triggered\n"
+            f"  switching back to CONCURRENT → recovery confirmed\n"
+            f"{'='*60}"
+        )
+
     async def run(self) -> None:
         """Main loop — runs until interrupted (Ctrl+C)."""
         logger.info(

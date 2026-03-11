@@ -12,6 +12,7 @@ Usage:
   python main.py --test-booking-flow --test-restaurant SLUG  (specify which restaurant)
   python main.py --test-sniper           Run sniper polling loop on a test restaurant (DRY_RUN, no booking)
   python main.py --test-sniper --test-restaurant SLUG --test-sniper-polls N
+  python main.py --test-adaptive-sniper  Test concurrent↔sequential auto-switching (threshold forced to 0%)
 """
 
 import asyncio
@@ -458,6 +459,15 @@ async def main() -> None:
         metavar="N",
         help="Number of consecutive sniper polls to run in --test-sniper mode (default: 10)",
     )
+    parser.add_argument(
+        "--test-adaptive-sniper",
+        action="store_true",
+        help=(
+            "Test adaptive concurrent↔sequential switching through the real monitor "
+            "poll() path. Forces sniper active, threshold=0%% (any error triggers switch), "
+            "DRY_RUN forced. Use --test-sniper-polls N to control poll count."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_logging()
@@ -532,6 +542,17 @@ async def main() -> None:
                 browser, config, args.test_restaurant,
                 args.test_sniper_polls, logger
             )
+            return
+
+        # ── Mode: --test-adaptive-sniper ──────────────────────────────
+        if args.test_adaptive_sniper:
+            if not await browser.login():
+                logger.error("Login failed — cannot run --test-adaptive-sniper.")
+                sys.exit(1)
+            # Point config at test restaurant, keep all other settings identical
+            config.restaurant_slug = args.test_restaurant
+            monitor = TockMonitor(config, browser, checker, notifier, tracker)
+            await monitor.run_adaptive_test(args.test_sniper_polls)
             return
 
         # ── Mode: --verify ────────────────────────────────────────────
