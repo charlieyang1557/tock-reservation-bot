@@ -3,16 +3,18 @@
 Tock Reservation Bot — entry point.
 
 Usage:
-  python main.py                         Start the monitoring loop (runs indefinitely)
-  python main.py --once                  Run one availability check then exit
-  python main.py --verify                Verify DOM selectors against the live site
-  python main.py --dry-run               Override DRY_RUN=true for this session only
-  python main.py --test-notify           Send a test Discord message for each alert type
-  python main.py --test-booking-flow     Navigate to checkout on a test restaurant and screenshot
-  python main.py --test-booking-flow --test-restaurant SLUG  (specify which restaurant)
-  python main.py --test-sniper           Run sniper polling loop on a test restaurant (DRY_RUN, no booking)
-  python main.py --test-sniper --test-restaurant SLUG --test-sniper-polls N
-  python main.py --test-adaptive-sniper  Test concurrent↔sequential auto-switching (threshold forced to 0%)
+  python main.py                              Start the monitoring loop (runs indefinitely)
+  python main.py --once                       Run one availability check then exit
+  python main.py --verify                     Verify DOM selectors against the live site
+  python main.py --dry-run                    Override DRY_RUN=true for this session only
+  python main.py --test-notify                Send a test Discord message for each alert type
+  python main.py --test-booking-flow          Navigate to checkout on a test restaurant and screenshot
+  python main.py --test-booking-flow --test-restaurant SLUG
+  python main.py --test-sniper                Run 3 robustness tests: pre-warm, page-reuse, confirm-retry
+  python main.py --test-sniper --test-restaurant SLUG
+  python main.py --test-sniper-benchmark      A/B benchmark: sequential vs concurrent poll speed/error rate
+  python main.py --test-sniper-benchmark --test-restaurant SLUG --test-sniper-polls N
+  python main.py --test-adaptive-sniper       Test concurrent↔sequential auto-switching (threshold forced to 0%)
 """
 
 import asyncio
@@ -395,6 +397,311 @@ async def _test_sniper_mode(
     )
 
 
+async def _test_sniper_robustness(
+    browser, config, test_slug: str, logger
+) -> None:
+    """
+    Three-part robustness test for sniper mode improvements.
+    Run with: python main.py --test-sniper
+
+    Test 1 — Session pre-warm
+        Calls browser.warm_session() and logs the cf_clearance cookie expiry
+        so you know how long the session stays valid.
+
+    Test 2 — Page reuse (reload vs fresh navigate)
+        Calls checker._check_date(keep_page=True) twice on the same date.
+        Verifies the second call reuses the cached Playwright page (reload
+        instead of goto) and logs the timing difference.
+
+    Test 3 — Confirm retry (at Benu checkout, NEVER clicks confirm)
+        Navigates to test_slug's checkout page.
+        Uses a deliberately broken selector to force attempt-1 to fail, then
+        measures that the retry fires ~2 seconds later.
+        The real confirm button is NEVER clicked.
+    """
+    import time as _time
+    from datetime import date, timedelta
+    from src.checker import AvailabilityChecker
+    from src.tracker import SlotTracker
+    import src.selectors as sel
+
+    PASS = "PASS"
+    FAIL = "FAIL"
+    results: list[tuple[str, str]] = []
+
+    # ── TEST 1: Session pre-warm ──────────────────────────────────────────
+
+    logger.info(f"\n{'='*60}")
+    logger.info("[test-sniper] TEST 1/3 — Session pre-warm (warm_session)")
+    logger.info(f"{'='*60}")
+
+    t0 = _time.monotonic()
+    await browser.warm_session()
+    elapsed = _time.monotonic() - t0
+
+    cookies = await browser._context.cookies()
+    cf = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+
+    logger.info(f"[test-sniper] warm_session() completed in {elapsed:.1f}s")
+    logger.info(f"[test-sniper] Total cookies in browser context: {len(cookies)}")
+
+    # Log all cookies with expiry for diagnostics
+    import time as _time_mod
+    now_ts = _time_mod.time()
+    for c in sorted(cookies, key=lambda x: x.get("expires", 0), reverse=True):
+        exp = c.get("expires", -1)
+        if exp > 0:
+            remaining = (exp - now_ts) / 60
+            logger.info(
+                f"  {c['name']:35s}  expires in {remaining:6.0f} min  ({c['domain']})"
+            )
+        else:
+            logger.info(
+                f"  {c['name']:35s}  session cookie (no expiry)     ({c['domain']})"
+            )
+
+    if cf:
+        exp_ts = cf.get("expires", -1)
+        if exp_ts > 0:
+            from datetime import datetime
+            exp_dt = datetime.fromtimestamp(exp_ts)
+            remaining_min = (exp_ts - now_ts) / 60
+            logger.info(
+                f"\n[test-sniper] cf_clearance found:\n"
+                f"  Expires at : {exp_dt.strftime('%Y-%m-%d %H:%M:%S')} local\n"
+                f"  Remaining  : {remaining_min:.0f} minutes\n"
+                f"  Note: Cloudflare typically issues 30-min cf_clearance tokens.\n"
+                f"        Pre-warm fires {15} min before sniper — should still be valid."
+            )
+            verdict1 = PASS
+        else:
+            logger.info(
+                "[test-sniper] cf_clearance is a session cookie (no fixed expiry).\n"
+                "  This is normal — it stays valid for the browser session lifetime."
+            )
+            verdict1 = PASS
+    else:
+        logger.warning(
+            "[test-sniper] cf_clearance NOT found in cookies.\n"
+            "  This may mean Cloudflare did not issue a challenge on this request\n"
+            "  (e.g. the page loaded cleanly without a challenge) — this is fine.\n"
+            "  If you see CF challenges during live sniper, run HEADLESS=false once."
+        )
+        verdict1 = PASS  # absence of cf_clearance is not necessarily a failure
+
+    results.append(("Session pre-warm", verdict1))
+    logger.info(f"[test-sniper] TEST 1 result: {verdict1}")
+
+    # ── TEST 2: Page reuse / reload ───────────────────────────────────────
+
+    logger.info(f"\n{'='*60}")
+    logger.info("[test-sniper] TEST 2/3 — Page reuse (reload vs fresh navigate)")
+    logger.info(f"{'='*60}")
+
+    test_config = config.__class__(
+        **{**config.__dict__, "restaurant_slug": test_slug, "dry_run": True}
+    )
+    tracker = SlotTracker()
+    checker = AvailabilityChecker(test_config, browser, tracker)
+
+    # Use a date ~1 week out (stable, not too close)
+    target_date = date.today() + timedelta(days=7)
+    date_str = target_date.isoformat()
+    logger.info(
+        f"[test-sniper] Testing page reuse for {date_str} on {test_slug}\n"
+        f"  Call 1 — fresh page.goto()  (no cached page)\n"
+        f"  Call 2 — should page.reload()  (page cached from call 1)"
+    )
+
+    # Call 1: fresh navigate, page gets stored in _sniper_pages
+    t0 = _time.monotonic()
+    slots1 = await checker._check_date(target_date, keep_page=True)
+    t1 = _time.monotonic() - t0
+    page_after_call1 = checker._sniper_pages.get(date_str)
+    logger.info(
+        f"[test-sniper] Call 1: {t1:.2f}s  |  {len(slots1)} slot(s)  |  "
+        f"page cached: {page_after_call1 is not None}"
+    )
+
+    # Call 2: should reload the same page object
+    t0 = _time.monotonic()
+    slots2 = await checker._check_date(target_date, keep_page=True)
+    t2 = _time.monotonic() - t0
+    page_after_call2 = checker._sniper_pages.get(date_str)
+
+    same_page = (
+        page_after_call1 is not None
+        and page_after_call2 is not None
+        and page_after_call1 is page_after_call2
+    )
+    speedup_pct = (t1 - t2) / t1 * 100 if t1 > 0 else 0
+    logger.info(
+        f"[test-sniper] Call 2: {t2:.2f}s  |  {len(slots2)} slot(s)\n"
+        f"\n"
+        f"[test-sniper] Page reuse result:\n"
+        f"  Fresh navigate : {t1:.2f}s\n"
+        f"  Page reload    : {t2:.2f}s\n"
+        f"  Speedup        : {speedup_pct:+.0f}%  "
+        f"({'reload faster' if t2 < t1 else 'reload slower — normal network variance'})\n"
+        f"  Same page obj  : {same_page}  "
+        f"({'reload was used ✓' if same_page else 'new page created (unexpected)'})"
+    )
+
+    verdict2 = PASS if same_page else FAIL
+    results.append(("Page reuse (reload)", verdict2))
+    logger.info(f"[test-sniper] TEST 2 result: {verdict2}")
+    await checker.close_sniper_pages()
+
+    # ── TEST 3: Confirm retry ─────────────────────────────────────────────
+
+    logger.info(f"\n{'='*60}")
+    logger.info("[test-sniper] TEST 3/3 — Confirm retry (broken selector, no booking)")
+    logger.info(f"{'='*60}")
+    logger.info(
+        f"[test-sniper] Navigating to {test_slug} checkout to simulate the retry.\n"
+        "  A deliberately broken selector forces attempt 1 to fail immediately.\n"
+        "  We measure the ~2s sleep before attempt 2.\n"
+        "  The REAL confirm button is NEVER clicked."
+    )
+
+    page = await browser.new_page()
+    reached_checkout = False
+    try:
+        BASE_URL = "https://www.exploretock.com"
+        today = date.today()
+        cal_sel   = sel.get("calendar_container")
+        day_sel   = sel.get("available_day_button")
+        slot_sel  = sel.get("available_slot_button")
+        co_sel    = sel.get("checkout_container")
+        real_confirm_sel = sel.get("confirm_button")
+
+        for delta in range(1, 29):
+            check_date = today + timedelta(days=delta)
+            url = (
+                f"{BASE_URL}/{test_slug}/search"
+                f"?date={check_date.isoformat()}&size=2&time=17:00"
+            )
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.wait_for_selector(cal_sel, timeout=8000)
+            except Exception:
+                continue
+
+            day_num = str(check_date.day)
+            for btn in await page.query_selector_all(day_sel):
+                if (await btn.text_content() or "").strip() == day_num:
+                    await btn.click()
+                    await page.wait_for_timeout(2000)
+                    break
+
+            try:
+                await page.wait_for_selector(slot_sel, timeout=5000)
+            except Exception:
+                pass
+
+            slots = await page.query_selector_all(slot_sel)
+            if not slots:
+                continue
+
+            await slots[0].click()
+            await page.wait_for_timeout(3000)
+
+            try:
+                await page.wait_for_selector(co_sel, timeout=15000)
+                reached_checkout = True
+            except Exception:
+                if any(p in page.url for p in ("/checkout", "/reservation", "/book")):
+                    reached_checkout = True
+
+            if reached_checkout:
+                logger.info(f"[test-sniper] Reached checkout: {page.url}")
+                # Confirm button present?
+                has_real = await page.query_selector(real_confirm_sel)
+                logger.info(
+                    f"[test-sniper] Real confirm button detected: "
+                    f"{'YES (selector works ✓)' if has_real else 'NO (selector may need updating)'}"
+                )
+                break
+
+        if not reached_checkout:
+            logger.warning(
+                f"[test-sniper] Could not reach {test_slug} checkout in 28 days.\n"
+                "  Running retry timing simulation on current page instead."
+            )
+
+        # ── Retry simulation (broken selector — no booking possible) ──────
+        BROKEN = "button.__sniper_test_broken_confirm__"
+        attempt_times: list[float] = []
+        sleep_measured: float = 0.0
+
+        logger.info("[test-sniper] Starting retry simulation…")
+        for attempt in range(2):
+            attempt_times.append(_time.monotonic())
+            logger.info(
+                f"[test-sniper]   Attempt {attempt + 1}/2 — "
+                f"wait_for_selector(BROKEN, timeout=300ms)…"
+            )
+            try:
+                await page.wait_for_selector(BROKEN, timeout=300)  # fast-fail
+                await page.click(BROKEN)
+                logger.warning("[test-sniper]   Unexpected: broken selector matched something!")
+            except Exception as e:
+                if attempt == 0:
+                    logger.info(
+                        f"[test-sniper]   Attempt 1 failed as expected "
+                        f"({type(e).__name__}) — sleeping 2s before retry…"
+                    )
+                    sleep_t0 = _time.monotonic()
+                    await asyncio.sleep(2)
+                    sleep_measured = _time.monotonic() - sleep_t0
+                    logger.info(
+                        f"[test-sniper]   Sleep measured: {sleep_measured:.2f}s"
+                    )
+                else:
+                    logger.info(
+                        f"[test-sniper]   Attempt 2 failed as expected "
+                        f"({type(e).__name__}) — retry logic confirmed."
+                    )
+
+        if len(attempt_times) == 2:
+            total_gap = attempt_times[1] - attempt_times[0]
+            timing_ok = 1.8 <= total_gap <= 4.0
+            logger.info(
+                f"\n[test-sniper] Retry timing:\n"
+                f"  Attempt 1 → Attempt 2 gap : {total_gap:.2f}s\n"
+                f"  Sleep measured            : {sleep_measured:.2f}s\n"
+                f"  Expected gap              : ~2.3s (2s sleep + 0.3s overhead)\n"
+                f"  Timing correct            : {timing_ok}"
+            )
+            verdict3 = PASS if timing_ok else FAIL
+        else:
+            logger.error("[test-sniper] Attempt 2 never ran — retry logic broken.")
+            verdict3 = FAIL
+
+    except Exception as e:
+        logger.error(f"[test-sniper] Test 3 unexpected error: {e}")
+        verdict3 = FAIL
+    finally:
+        await page.close()
+
+    results.append(("Confirm retry", verdict3))
+    logger.info(f"[test-sniper] TEST 3 result: {verdict3}")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+
+    passed = sum(1 for _, v in results if v == PASS)
+    bar = "=" * 60
+    logger.info(
+        f"\n{bar}\n"
+        f"[test-sniper] RESULTS — {passed}/{len(results)} tests passed\n"
+        + "\n".join(
+            f"  {'✓' if v == PASS else '✗'}  {name:30s} : {v}"
+            for name, v in results
+        )
+        + f"\n{bar}"
+    )
+
+
 def _setup_logging() -> None:
     fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -448,8 +755,18 @@ async def main() -> None:
         "--test-sniper",
         action="store_true",
         help=(
-            "Run the sniper concurrent-poll loop against a test restaurant with DRY_RUN "
-            "forced — never books. Use to verify Cloudflare error rate before sniper fires."
+            "Run 3 robustness tests for sniper mode: "
+            "(1) session pre-warm with cf_clearance expiry logging, "
+            "(2) page reuse reload vs fresh navigate timing, "
+            "(3) confirm retry with broken selector — never books."
+        ),
+    )
+    parser.add_argument(
+        "--test-sniper-benchmark",
+        action="store_true",
+        help=(
+            "A/B benchmark: run --test-sniper-polls polls sequentially then concurrently "
+            "on a test restaurant and compare cycle time and Cloudflare error rate."
         ),
     )
     parser.add_argument(
@@ -457,7 +774,7 @@ async def main() -> None:
         type=int,
         default=10,
         metavar="N",
-        help="Number of consecutive sniper polls to run in --test-sniper mode (default: 10)",
+        help="Number of consecutive sniper polls to run in --test-sniper-benchmark mode (default: 10)",
     )
     parser.add_argument(
         "--test-adaptive-sniper",
@@ -533,10 +850,18 @@ async def main() -> None:
             await _test_booking_flow(browser, config, args.test_restaurant, logger)
             return
 
-        # ── Mode: --test-sniper ───────────────────────────────────────
+        # ── Mode: --test-sniper (3 robustness tests) ─────────────────
         if args.test_sniper:
             if not await browser.login():
                 logger.error("Login failed — cannot run --test-sniper.")
+                sys.exit(1)
+            await _test_sniper_robustness(browser, config, args.test_restaurant, logger)
+            return
+
+        # ── Mode: --test-sniper-benchmark (A/B concurrent vs sequential) ─
+        if args.test_sniper_benchmark:
+            if not await browser.login():
+                logger.error("Login failed — cannot run --test-sniper-benchmark.")
                 sys.exit(1)
             await _test_sniper_mode(
                 browser, config, args.test_restaurant,

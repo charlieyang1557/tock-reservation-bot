@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 
 PT = pytz.timezone("America/Los_Angeles")
 
+# How many minutes before a sniper window to pre-warm the session.
+# Must be >= the longest non-sniper poll interval (15 min default) to guarantee
+# the pre-warm fires at the poll just before the window opens.
+PREWARM_BEFORE_MIN = 15
+
 
 class TockMonitor:
     def __init__(
@@ -82,11 +87,6 @@ class TockMonitor:
         # Session pre-warm: fire PREWARM_BEFORE_MIN minutes before each sniper window.
         # Track which window we've already warmed for to avoid repeated calls.
         self._session_prewarmed_for: str | None = None  # "DayName@HH:MM"
-
-# How many minutes before a sniper window to pre-warm the session.
-# Must be >= the longest non-sniper poll interval (15 min default) to guarantee
-# the pre-warm fires. Set to 15 so it always fires at the poll just before the window.
-PREWARM_BEFORE_MIN = 15
 
     # ------------------------------------------------------------------
     # Public
