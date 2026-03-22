@@ -74,6 +74,7 @@ class TockMonitor:
         self._poll_count = 0
         self._booking_secured = False
         self._sniper_active = False  # tracks whether we're in a sniper window
+        self._sniper_slots_found = 0  # slots detected during current sniper window
 
         # Adaptive sniper mode: start concurrent, fall back to sequential if
         # Cloudflare error rate gets too high, retry concurrent after recovery.
@@ -224,7 +225,7 @@ class TockMonitor:
             # close the reused search pages held open during sniper.
             now_sniper = self._is_sniper_window()
             if was_sniper and not now_sniper:
-                self.notifier.sniper_mode_ended(self._poll_count)
+                self.notifier.sniper_mode_ended(self._sniper_slots_found)
                 await self.checker.close_sniper_pages()
                 # Reset so pre-warm fires again if sniper re-arms (new window same day)
                 self._session_prewarmed_for = None
@@ -312,6 +313,10 @@ class TockMonitor:
             self.notifier.no_slots_found()
             return
 
+        # Track slots found during sniper window for end-of-window summary
+        if self._sniper_active:
+            self._sniper_slots_found += len(slots)
+
         self.notifier.slots_found(slots)
 
         # --- Dry-run: log and stop ---
@@ -357,6 +362,7 @@ class TockMonitor:
             until_str = sniper_info
             if not self._sniper_active:
                 self._sniper_active = True
+                self._sniper_slots_found = 0
                 # Reset adaptive state for each new sniper window
                 self._sniper_concurrent = True
                 self._sniper_error_window.clear()

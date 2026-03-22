@@ -12,6 +12,7 @@ updates to src/selectors.py are straightforward.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
@@ -20,6 +21,11 @@ from playwright.async_api import Page
 import src.selectors as sel
 from src.config import Config, parse_time
 from src.tracker import SlotTracker
+
+# Debug screenshot: capture one screenshot per poll cycle on the first date
+# checked. Overwrites each time so disk doesn't fill up.
+_SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "debug_screenshots")
+os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,7 @@ class AvailabilityChecker:
         # Sniper mode: keep pages open across polls and reload them instead of
         # opening fresh — faster (no DNS/TCP overhead) and looks more human.
         self._sniper_pages: dict[str, "Page"] = {}  # date_str -> open Page
+        self._screenshot_taken_this_poll = False  # reset each poll cycle
 
     # ------------------------------------------------------------------
     # Public
@@ -94,6 +101,7 @@ class AvailabilityChecker:
         """
         import asyncio as _asyncio
 
+        self._screenshot_taken_this_poll = False
         errors: list[int] = [0]   # mutable counter accessible in closure
 
         async def _check_date_tracked(d: date) -> list[AvailableSlot]:
@@ -236,6 +244,17 @@ class AvailabilityChecker:
             if not await self._wait_for_calendar(page, date_str):
                 return []
 
+            # Debug screenshot: capture once per poll cycle (first date only)
+            if not self._screenshot_taken_this_poll:
+                self._screenshot_taken_this_poll = True
+                try:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    path = os.path.join(_SCREENSHOT_DIR, f"poll_{ts}_{date_str}.png")
+                    await page.screenshot(path=path, full_page=True)
+                    logger.info(f"[check] Debug screenshot saved: {path}")
+                except Exception as e:
+                    logger.debug(f"[check] Screenshot failed: {e}")
+
             # Wait for day buttons to appear inside the calendar (selector-based,
             # no fixed sleep — moves on as soon as buttons are ready)
             try:
@@ -311,6 +330,31 @@ class AvailabilityChecker:
         selector = sel.get(key)
         num_key = "day_number_span"
         num_selector = sel.get(num_key)
+
+        # Debug: dump raw classes of ALL calendar day buttons so we can see
+        # exactly what Tock renders (not just is-available ones).
+        try:
+            all_day_btns = await page.query_selector_all(
+                "button.ConsumerCalendar-day.is-in-month"
+            )
+            if all_day_btns:
+                class_samples = []
+                for btn in all_day_btns[:5]:  # first 5 to keep logs manageable
+                    cls = await btn.get_attribute("class") or ""
+                    text = (await btn.text_content() or "").strip()
+                    class_samples.append(f"day={text} classes=[{cls}]")
+                logger.debug(
+                    f"[check] {target_date.isoformat()} calendar day button classes "
+                    f"(first {len(class_samples)}):\n  "
+                    + "\n  ".join(class_samples)
+                )
+            else:
+                logger.debug(
+                    f"[check] {target_date.isoformat()} — no "
+                    f"button.ConsumerCalendar-day.is-in-month found at all"
+                )
+        except Exception as e:
+            logger.debug(f"[check] {target_date.isoformat()} — class dump failed: {e}")
 
         try:
             day_buttons = await page.query_selector_all(selector)
