@@ -255,6 +255,34 @@ class AvailabilityChecker:
                 except Exception as e:
                     logger.debug(f"[check] Screenshot failed: {e}")
 
+            # STRATEGY: Check two independent signals for available slots.
+            #
+            # Signal 1: The URL ?date= param pre-selects the date, so Tock may
+            #   already show time slot results in the results area (below the
+            #   calendar) WITHOUT needing a calendar click. Check these first.
+            #
+            # Signal 2: The calendar marks days with `is-available` class.
+            #   Click the day to load its slots if Signal 1 found nothing.
+
+            # --- Signal 1: Check for pre-loaded time slot results ---
+            try:
+                await page.wait_for_selector(
+                    sel.get("available_slot_button"), timeout=3000
+                )
+            except Exception:
+                pass  # no pre-loaded results; will try calendar click path
+
+            preloaded_slots = await self._collect_slots(page, target_date)
+            if preloaded_slots:
+                logger.info(
+                    f"[check] {date_str} — {len(preloaded_slots)} slot(s) found "
+                    f"via pre-loaded results (no calendar click needed)"
+                )
+                for slot in preloaded_slots:
+                    self.tracker.record(slot.slot_date, slot.slot_time)
+                return self._sort_by_preferred_time(preloaded_slots)
+
+            # --- Signal 2: Calendar-based detection ---
             # Wait for day buttons to appear inside the calendar (selector-based,
             # no fixed sleep — moves on as soon as buttons are ready)
             try:
@@ -266,14 +294,14 @@ class AvailabilityChecker:
 
             # Is our target day marked as available?
             if not await self._is_day_available(page, target_date):
-                logger.debug(f"[check] {date_str} — day not available in calendar")
+                logger.info(f"[check] {date_str} — day not marked is-available in calendar, skipping")
                 return []
 
             # Click the day to reveal its time slots
             if not await self._click_day(page, target_date):
                 return []
 
-            # Wait for slot buttons to appear (selector-based, not a fixed sleep)
+            # Wait for slot buttons to appear after calendar click
             try:
                 await page.wait_for_selector(
                     sel.get("available_slot_button"), timeout=3000
@@ -343,18 +371,18 @@ class AvailabilityChecker:
                     cls = await btn.get_attribute("class") or ""
                     text = (await btn.text_content() or "").strip()
                     class_samples.append(f"day={text} classes=[{cls}]")
-                logger.debug(
+                logger.info(
                     f"[check] {target_date.isoformat()} calendar day button classes "
                     f"(first {len(class_samples)}):\n  "
                     + "\n  ".join(class_samples)
                 )
             else:
-                logger.debug(
+                logger.info(
                     f"[check] {target_date.isoformat()} — no "
                     f"button.ConsumerCalendar-day.is-in-month found at all"
                 )
         except Exception as e:
-            logger.debug(f"[check] {target_date.isoformat()} — class dump failed: {e}")
+            logger.info(f"[check] {target_date.isoformat()} — class dump failed: {e}")
 
         try:
             day_buttons = await page.query_selector_all(selector)
