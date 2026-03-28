@@ -65,12 +65,23 @@ SELECTORS: dict[str, str] = {
     # is-disabled, is-past, is-future, is-today, is-selected (combinable).
     # All current slots are sold/disabled — is-available appears when new slots drop.
     "available_day_button": "button.ConsumerCalendar-day.is-in-month.is-available",
+    # ANY clickable day button in the current month (not filtered by availability).
+    # Used by Approach A: click the day by number, check if slots/Book-now appear.
+    "all_day_button": "button.ConsumerCalendar-day.is-in-month",
     # <span> inside a day button showing the day number ("15", "16", …).
     # Verified 2026-03-10: was span.B2 (old), now span.MuiTypography-root (MUI v5).
     # Code in checker.py/booker.py reads btn.text_content() directly — more reliable.
     "day_number_span": "span.MuiTypography-root",
     # Month + year heading (e.g. "March 2024") — used for debug logging only
     "calendar_month_heading": "div.ConsumerCalendar-monthHeading, span.H1",
+
+    # "Book now" action button on the restaurant/search page.
+    # Visible when at least one slot is available for the experience.
+    "book_now_button": (
+        'button:text("Book now"), '
+        'a:text("Book now"), '
+        '[data-testid="book-now"]'
+    ),
 
     # --- Time slot results --------------------------------------------------
     # Clickable button for an available time slot

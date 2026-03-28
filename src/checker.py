@@ -282,35 +282,42 @@ class AvailabilityChecker:
                     self.tracker.record(slot.slot_date, slot.slot_time)
                 return self._sort_by_preferred_time(preloaded_slots)
 
-            # --- Signal 2: Calendar-based detection ---
-            # Wait for day buttons to appear inside the calendar (selector-based,
-            # no fixed sleep — moves on as soon as buttons are ready)
-            try:
-                await page.wait_for_selector(
-                    sel.get("available_day_button"), timeout=5000
-                )
-            except Exception:
-                pass  # no available days this month; _is_day_available will return False
-
-            # Is our target day marked as available?
-            if not await self._is_day_available(page, target_date):
-                logger.info(f"[check] {date_str} — day not marked is-available in calendar, skipping")
+            # --- Signal 2: Click day by number, then check for slots ---
+            # Skip the is-available class gate entirely — Tock's modal calendar
+            # doesn't reliably use it. Instead, click the target day by number
+            # and check if slots or a "Book now" button appear.
+            clicked = await self._click_day(page, target_date)
+            if not clicked:
+                logger.info(f"[check] {date_str} — could not click day in calendar")
                 return []
 
-            # Click the day to reveal its time slots
-            if not await self._click_day(page, target_date):
-                return []
-
-            # Wait for slot buttons to appear after calendar click
+            # After clicking the day, wait for slot buttons
             try:
                 await page.wait_for_selector(
                     sel.get("available_slot_button"), timeout=3000
                 )
             except Exception:
-                pass  # no slots visible yet; _collect_slots will return []
+                pass  # no slot buttons; check for Book Now path
 
-            # Collect and sort time slots
             slots = await self._collect_slots(page, target_date)
+
+            # If no direct slot results, check for "Book now" button
+            if not slots:
+                try:
+                    book_now = await page.query_selector(sel.get("book_now_button"))
+                    if book_now:
+                        logger.info(f"[check] {date_str} — 'Book now' button found, clicking")
+                        await book_now.click()
+                        # Wait for the booking/slot selection page to load
+                        try:
+                            await page.wait_for_selector(
+                                sel.get("available_slot_button"), timeout=5000
+                            )
+                        except Exception:
+                            pass
+                        slots = await self._collect_slots(page, target_date)
+                except Exception as e:
+                    logger.debug(f"[check] {date_str} — Book Now check failed: {e}")
 
             # Record each new slot in the tracker
             for slot in slots:
