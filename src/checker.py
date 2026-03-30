@@ -410,28 +410,53 @@ class AvailabilityChecker:
         Uses all_day_button (any in-month day) — NOT available_day_button —
         so we click days even when they lack the is-available class (e.g.
         Fuhuihua shows is-sold/is-disabled until the exact release moment).
+
+        If the target day isn't visible, paginates the calendar forward
+        (clicks the > arrow) up to 2 times before giving up.
         """
-        key = "all_day_button"
-        selector = sel.get(key)
+        selector = sel.get("all_day_button")
         target_num = str(target_date.day)
 
-        day_buttons = await page.query_selector_all(selector)
-        for btn in day_buttons:
-            try:
-                text = (await btn.text_content() or "").strip()
-                if text == target_num:
-                    await btn.click()
-                    logger.debug(
-                        f"[check] Clicked day {target_num} for {target_date.isoformat()}"
-                    )
-                    return True
-            except Exception:
-                continue
+        # Try to find and click the day, paginating forward if needed
+        for attempt in range(3):  # initial view + 2 pagination attempts
+            day_buttons = await page.query_selector_all(selector)
+            for btn in day_buttons:
+                try:
+                    text = (await btn.text_content() or "").strip()
+                    if text == target_num:
+                        await btn.click()
+                        logger.info(
+                            f"[check] Clicked day {target_num} for {target_date.isoformat()}"
+                        )
+                        return True
+                except Exception:
+                    continue
 
-        logger.warning(
-            f"[check] Could not click day {target_num} for {target_date.isoformat()}\n"
-            f"  SELECTOR_FAILED: key='{key}'  selector={selector!r}\n"
-            f"  → Update src/selectors.py"
+            # Day not found — try paginating the calendar forward
+            if attempt < 2:
+                try:
+                    # The calendar has < > arrows near the month heading
+                    next_btn = await page.query_selector(
+                        'button[aria-label="Next"], '
+                        'button[aria-label="next"], '
+                        'button.ConsumerCalendar-nextMonth, '
+                        'button.ConsumerCalendar-arrow--next, '
+                        '[class*="Calendar"] button:has-text(">")'
+                    )
+                    if next_btn:
+                        await next_btn.click()
+                        await page.wait_for_timeout(1000)
+                        logger.debug(
+                            f"[check] Paginated calendar forward (attempt {attempt + 1})"
+                        )
+                        continue
+                except Exception:
+                    pass
+                break  # no next button found, stop trying
+
+        logger.info(
+            f"[check] Day {target_num} not visible in calendar for "
+            f"{target_date.isoformat()} (likely not yet released)"
         )
         return False
 
