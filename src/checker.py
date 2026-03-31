@@ -244,13 +244,14 @@ class AvailabilityChecker:
                 self._sniper_pages[date_str] = page
             reusing = False
 
+        nav_timeout = 10000 if keep_page else 30000
         try:
             if reusing:
                 logger.debug(f"[check] {date_str} → reload (sniper page reuse)")
-                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                await page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
             else:
                 logger.debug(f"[check] {date_str} → {url}")
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
 
             # Wait for calendar to render (shorter timeout in sniper mode)
             cal_timeout = 5000 if keep_page else 15000
