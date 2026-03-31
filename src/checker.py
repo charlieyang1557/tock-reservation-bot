@@ -120,8 +120,8 @@ class AvailabilityChecker:
 
         # Patch _wait_for_calendar to count failures for this poll
         original_wait = self._wait_for_calendar
-        async def _counting_wait(page, date_str: str) -> bool:
-            ok = await original_wait(page, date_str)
+        async def _counting_wait(page, date_str: str, **kwargs) -> bool:
+            ok = await original_wait(page, date_str, **kwargs)
             if not ok:
                 errors[0] += 1
             return ok
