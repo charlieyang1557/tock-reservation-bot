@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tock Reservation Bot — Project Report</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=JetBrains+Mono:wght@400;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0f;
+  --surface: #12121a;
+  --surface-2: #1a1a26;
+  --border: #2a2a3a;
+  --text: #e8e8f0;
+  --text-dim: #8888a0;
+  --accent: #6366f1;
+  --accent-glow: #818cf8;
+  --green: #34d399;
+  --green-dim: #065f46;
+  --red: #f87171;
+  --red-dim: #7f1d1d;
+  --yellow: #fbbf24;
+  --yellow-dim: #78350f;
+  --orange: #fb923c;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Outfit', sans-serif;
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+.grain {
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  pointer-events: none;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  z-index: 9999;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 40px;
+}
+
+/* ─── HERO ─── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  position: relative;
+  padding: 80px 0;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -200px; right: -300px;
+  width: 800px; height: 800px;
+  background: radial-gradient(circle, rgba(99,102,241,0.08) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 100px;
+  padding: 6px 16px 6px 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+  width: fit-content;
+  margin-bottom: 32px;
+  animation: fadeUp 0.8s ease both;
+}
+
+.hero-badge .dot {
+  width: 8px; height: 8px;
+  background: var(--green);
+  border-radius: 50%;
+  animation: pulse 2s ease infinite;
+}
+
+.hero h1 {
+  font-family: 'DM Serif Display', serif;
+  font-size: clamp(48px, 7vw, 84px);
+  line-height: 1.05;
+  letter-spacing: -2px;
+  margin-bottom: 24px;
+  animation: fadeUp 0.8s ease 0.1s both;
+}
+
+.hero h1 .accent { color: var(--accent-glow); }
+
+.hero .subtitle {
+  font-size: 20px;
+  color: var(--text-dim);
+  max-width: 600px;
+  font-weight: 300;
+  animation: fadeUp 0.8s ease 0.2s both;
+}
+
+.hero-meta {
+  display: flex;
+  gap: 32px;
+  margin-top: 48px;
+  animation: fadeUp 0.8s ease 0.3s both;
+}
+
+.hero-meta .meta-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hero-meta .meta-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--text-dim);
+}
+
+.hero-meta .meta-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: var(--accent-glow);
+}
+
+/* ─── SECTIONS ─── */
+section {
+  padding: 100px 0;
+  border-top: 1px solid var(--border);
+}
+
+.section-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 3px;
+  color: var(--accent-glow);
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+
+.section-title {
+  font-family: 'DM Serif Display', serif;
+  font-size: clamp(32px, 4vw, 48px);
+  letter-spacing: -1px;
+  margin-bottom: 48px;
+}
+
+/* ─── ARCHITECTURE DIAGRAM ─── */
+.arch-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 48px;
+}
+
+.arch-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px;
+  transition: border-color 0.3s, transform 0.3s;
+}
+
+.arch-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+
+.arch-card.full { grid-column: 1 / -1; }
+
+.arch-card .card-icon {
+  font-size: 28px;
+  margin-bottom: 12px;
+}
+
+.arch-card h3 {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.arch-card p {
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+.arch-card .file-path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--accent-glow);
+  background: rgba(99,102,241,0.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
+  margin-top: 8px;
+}
+
+/* ─── TIMELINE ─── */
+.timeline {
+  position: relative;
+  padding-left: 40px;
+}
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 7px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, var(--accent), var(--green), var(--yellow), var(--red), var(--green));
+}
+
+.timeline-item {
+  position: relative;
+  margin-bottom: 48px;
+}
+
+.timeline-item::before {
+  content: '';
+  position: absolute;
+  left: -40px;
+  top: 6px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 3px solid var(--bg);
+}
+
+.timeline-item.build::before { background: var(--accent); }
+.timeline-item.fix::before { background: var(--yellow); }
+.timeline-item.critical::before { background: var(--red); }
+.timeline-item.success::before { background: var(--green); }
+
+.timeline-date {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.timeline-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.timeline-desc {
+  font-size: 14px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+.timeline-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  padding: 3px 10px;
+  border-radius: 100px;
+  margin-top: 8px;
+}
+
+.tag-build { background: rgba(99,102,241,0.15); color: var(--accent-glow); }
+.tag-fix { background: rgba(251,191,36,0.15); color: var(--yellow); }
+.tag-critical { background: rgba(248,113,113,0.15); color: var(--red); }
+.tag-success { background: rgba(52,211,153,0.15); color: var(--green); }
+
+/* ─── STATS GRID ─── */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 64px;
+}
+
+.stat-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px;
+  text-align: center;
+}
+
+.stat-number {
+  font-family: 'DM Serif Display', serif;
+  font-size: 42px;
+  color: var(--accent-glow);
+  line-height: 1;
+  margin-bottom: 8px;
+}
+
+.stat-label {
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* ─── BUG TABLE ─── */
+.bug-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 32px;
+}
+
+.bug-table th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  color: var(--text-dim);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.bug-table td {
+  padding: 16px;
+  border-bottom: 1px solid rgba(42,42,58,0.5);
+  font-size: 14px;
+  vertical-align: top;
+}
+
+.bug-table tr:hover td {
+  background: rgba(99,102,241,0.03);
+}
+
+.severity {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.severity.critical { background: var(--red-dim); color: var(--red); }
+.severity.high { background: var(--yellow-dim); color: var(--yellow); }
+.severity.medium { background: rgba(99,102,241,0.15); color: var(--accent-glow); }
+
+.status-fixed {
+  color: var(--green);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+/* ─── FLOW DIAGRAM ─── */
+.flow {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  overflow-x: auto;
+  padding: 32px 0;
+  margin: 32px 0;
+}
+
+.flow-step {
+  flex-shrink: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  text-align: center;
+  min-width: 140px;
+  transition: border-color 0.3s;
+}
+
+.flow-step:hover { border-color: var(--accent); }
+
+.flow-step .step-icon { font-size: 24px; margin-bottom: 8px; }
+.flow-step .step-name { font-size: 13px; font-weight: 600; }
+.flow-step .step-detail { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+.flow-arrow {
+  flex-shrink: 0;
+  color: var(--text-dim);
+  font-size: 20px;
+  padding: 0 8px;
+}
+
+/* ─── LESSONS ─── */
+.lessons-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.lesson-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 28px;
+}
+
+.lesson-card .lesson-num {
+  font-family: 'DM Serif Display', serif;
+  font-size: 36px;
+  color: rgba(99,102,241,0.2);
+  margin-bottom: 8px;
+}
+
+.lesson-card h3 { font-size: 16px; margin-bottom: 8px; }
+.lesson-card p { font-size: 14px; color: var(--text-dim); }
+
+/* ─── FOOTER ─── */
+.footer {
+  padding: 80px 0;
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+
+.footer-link {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: var(--accent-glow);
+  text-decoration: none;
+  padding: 12px 24px;
+  border: 1px solid var(--accent);
+  border-radius: 100px;
+  transition: all 0.3s;
+  display: inline-block;
+}
+
+.footer-link:hover {
+  background: var(--accent);
+  color: white;
+}
+
+.footer-credits {
+  margin-top: 32px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+/* ─── CODE BLOCK ─── */
+.code-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-x: auto;
+  margin: 24px 0;
+  color: var(--text-dim);
+}
+
+.code-block .comment { color: #555570; }
+.code-block .highlight { color: var(--green); }
+.code-block .error { color: var(--red); }
+.code-block .warn { color: var(--yellow); }
+
+/* ─── ANIMATIONS ─── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@media (max-width: 768px) {
+  .container { padding: 0 20px; }
+  .arch-grid { grid-template-columns: 1fr; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  .lessons-grid { grid-template-columns: 1fr; }
+  .hero-meta { flex-wrap: wrap; gap: 20px; }
+  .flow { flex-wrap: wrap; justify-content: center; }
+}
+</style>
+</head>
+<body>
+<div class="grain"></div>
+
+<!-- ═══════════════ HERO ═══════════════ -->
+<div class="container">
+<div class="hero">
+  <div class="hero-badge"><span class="dot"></span> Project Report — April 2026</div>
+  <h1>Tock Reservation<br><span class="accent">Sniper Bot</span></h1>
+  <p class="subtitle">An automated system that monitors Fuhuihua (馥薈華) on Tock for reservation releases and books a table in seconds — before they sell out.</p>
+  <div class="hero-meta">
+    <div class="meta-item">
+      <span class="meta-label">Repository</span>
+      <span class="meta-value">charlieyang1557/tock-reservation-bot</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Stack</span>
+      <span class="meta-value">Python · Playwright · asyncio</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Runtime</span>
+      <span class="meta-value">Mac Mini · PM2 · 24/7</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Built with</span>
+      <span class="meta-value">Claude Code</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ═══════════════ STATS ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">By the Numbers</div>
+  <div class="section-title">Project Overview</div>
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-number">13</div>
+      <div class="stat-label">Python source files</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-number">4.8k</div>
+      <div class="stat-label">Lines of code</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-number">39</div>
+      <div class="stat-label">Unit tests passing</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-number">~10s</div>
+      <div class="stat-label">Sniper poll cycle</div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ ARCHITECTURE ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">System Design</div>
+  <div class="section-title">Architecture</div>
+  <div class="arch-grid">
+    <div class="arch-card">
+      <div class="card-icon">🌐</div>
+      <h3>Browser Engine</h3>
+      <p>Playwright with stealth patches. Handles Cloudflare Turnstile, maintains session cookies, supports headed/headless modes.</p>
+      <span class="file-path">src/browser.py</span>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🔍</div>
+      <h3>Availability Checker</h3>
+      <p>Multi-selector fallback system tries 6 different DOM selectors. Clicks calendar days regardless of CSS class, extracts time from parent text.</p>
+      <span class="file-path">src/checker.py</span>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">⚡</div>
+      <h3>Sniper Mode</h3>
+      <p>Activates at 7:59 PM PDT every Friday. 3-second polling with page reuse, skip cache for unreleased dates, session pre-warm 15 min before.</p>
+      <span class="file-path">src/monitor.py</span>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🏁</div>
+      <h3>Concurrent Booker</h3>
+      <p>Fires asyncio tasks for each available slot simultaneously. First successful booking sets an Event flag — all others abort instantly.</p>
+      <span class="file-path">src/booker.py</span>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🔔</div>
+      <h3>Discord Notifications</h3>
+      <p>Color-coded webhook embeds: green (confirmed), yellow (slots found), orange (sniper active), red (errors), blue (dry-run).</p>
+      <span class="file-path">src/notifier.py</span>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">📊</div>
+      <h3>Release Tracker</h3>
+      <p>Logs every detected slot to JSON + CSV with timestamp, date, time, and day of week. Used to reverse-engineer the release schedule.</p>
+      <span class="file-path">src/tracker.py</span>
+    </div>
+    <div class="arch-card full">
+      <div class="card-icon">🎯</div>
+      <h3>Sniper Mode — Booking Flow</h3>
+      <div class="flow">
+        <div class="flow-step"><div class="step-icon">🔥</div><div class="step-name">Pre-warm</div><div class="step-detail">T-15 min</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">🎯</div><div class="step-name">Sniper On</div><div class="step-detail">7:59 PM</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">🔄</div><div class="step-name">Rapid Poll</div><div class="step-detail">Every 3s</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">📅</div><div class="step-name">Click Days</div><div class="step-detail">Fri/Sat/Sun</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">🔎</div><div class="step-name">6 Selectors</div><div class="step-detail">Fallback chain</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">🏁</div><div class="step-name">Race Book</div><div class="step-detail">Concurrent</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">✅</div><div class="step-name">Confirm</div><div class="step-detail">+ CVC fill</div></div>
+        <span class="flow-arrow">→</span>
+        <div class="flow-step"><div class="step-icon">🔔</div><div class="step-name">Discord</div><div class="step-detail">Alert sent</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ TIMELINE ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">Development Journey</div>
+  <div class="section-title">Build &amp; Fix Timeline</div>
+  <div class="timeline">
+    <div class="timeline-item build">
+      <div class="timeline-date">Mar 10, 2026</div>
+      <div class="timeline-title">Initial Build — 14 files, 2,400 lines</div>
+      <div class="timeline-desc">Full project scaffolded by Claude Code in one 17-minute session. Login flow, availability checker, concurrent booker, Discord notifications, slot tracker, and sniper mode all built from a single detailed prompt.</div>
+      <span class="timeline-tag tag-build">Build</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Mar 10–20</div>
+      <div class="timeline-title">Selector Verification &amp; Stealth Fixes</div>
+      <div class="timeline-desc">playwright-stealth v2 API migration (stealth_async → Stealth().apply_stealth_async). Login timeout extended to 120s for manual Cloudflare CAPTCHA. DOM selectors validated against live Tock site — several were outdated from GitHub reference bots.</div>
+      <span class="timeline-tag tag-fix">Fix</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Mar 20</div>
+      <div class="timeline-title">Sniper Slot Count Bug</div>
+      <div class="timeline-desc">Notifier displayed "239 slots detected" but checker found 0. Root cause: monitor.py passed poll_count (cumulative poll number) as the slots_found argument to sniper_mode_ended(). Added dedicated _sniper_slots_found counter.</div>
+      <span class="timeline-tag tag-fix">Fix</span>
+    </div>
+    <div class="timeline-item success">
+      <div class="timeline-date">Mar 27</div>
+      <div class="timeline-title">Release Schedule Confirmed</div>
+      <div class="timeline-desc">Debug screenshot captured the key text: "New reservations will be released on March 27, 2026 at 8:00 PM PDT." Confirmed Friday 8PM release schedule. Sniper windows consolidated.</div>
+      <span class="timeline-tag tag-success">Discovery</span>
+    </div>
+    <div class="timeline-item critical">
+      <div class="timeline-date">Mar 30</div>
+      <div class="timeline-title">Checker Selector Mismatch</div>
+      <div class="timeline-desc">Real Tock UI uses button:has-text("Book") with hashed CSS classes (css-dr2rn7) — not button.Consumer-resultsListItem.is-available. Ported multi-selector fallback from --test-booking-flow into checker. Now tries 6 selectors in order.</div>
+      <span class="timeline-tag tag-critical">Critical Fix</span>
+    </div>
+    <div class="timeline-item critical">
+      <div class="timeline-date">Mar 30</div>
+      <div class="timeline-title">_click_day Selector Fix</div>
+      <div class="timeline-desc">_click_day used available_day_button (requires is-available CSS class). Fuhuihua never has this class — days show is-sold or is-disabled. Changed to all_day_button — clicks by day number regardless of class.</div>
+      <span class="timeline-tag tag-critical">Critical Fix</span>
+    </div>
+    <div class="timeline-item success">
+      <div class="timeline-date">Apr 3, 20:00</div>
+      <div class="timeline-title">First Live Detection — 4 Slots Found!</div>
+      <div class="timeline-desc">Bot successfully detected 4 slots (2× Saturday Apr 11, 2× Sunday Apr 12) the moment Fuhuihua released them. The multi-selector fallback and day-clicking fixes worked perfectly in production.</div>
+      <span class="timeline-tag tag-success">Milestone</span>
+    </div>
+    <div class="timeline-item critical">
+      <div class="timeline-date">Apr 3, 20:01</div>
+      <div class="timeline-title">Booker Failed — Still Using Old Selector</div>
+      <div class="timeline-desc">Checker was fixed but booker.py still used available_day_button for its own day-clicking. Detected slots but couldn't navigate to them for booking. Also: sniper fired at 20:01 instead of 19:59 due to int() truncation of sub-second timing delta.</div>
+      <span class="timeline-tag tag-critical">Critical Fix</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Apr 3</div>
+      <div class="timeline-title">Three-Fix Deploy</div>
+      <div class="timeline-desc">1) Booker selector: available_day_button → all_day_button + multi-selector fallback. 2) Sniper timing: int() → float precision with absolute-time scheduling. 3) Discord token moved from start-claude.sh to .env.</div>
+      <span class="timeline-tag tag-fix">Fix</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Apr 3</div>
+      <div class="timeline-title">PM2 + Chromium Crash Loop</div>
+      <div class="timeline-desc">Playwright's headless Chromium failed with MachPortRendezvousServer error under PM2. Root cause: PM2 God Daemon entered bad state after 30+ crash-restart cycles. Fixed by pm2 kill to recreate the daemon entirely.</div>
+      <span class="timeline-tag tag-fix">Infra Fix</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Apr 4</div>
+      <div class="timeline-title">Adversarial Review — Security Hardening</div>
+      <div class="timeline-desc">Codex adversarial review flagged two [high] trust-boundary issues: debug screenshots (page_debug*.png, test_booking_flow.png) capturing authenticated Tock UI state unignored in repo root, and .claude/ local config with machine paths and permission allowlists. Both gitignored. Live Playwright dry-run test confirmed full booking flow works end-to-end with new selectors.</div>
+      <span class="timeline-tag tag-fix">Security Fix</span>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ BUG TABLE ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">Quality Engineering</div>
+  <div class="section-title">Bugs Found &amp; Fixed</div>
+  <table class="bug-table">
+    <thead>
+      <tr>
+        <th>Severity</th>
+        <th>Bug</th>
+        <th>Root Cause</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="severity critical">Critical</span></td>
+        <td>Booker can't click days</td>
+        <td>booker.py used available_day_button (requires is-available class), Fuhuihua never has this class</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity critical">Critical</span></td>
+        <td>Checker finds 0 slots on live site</td>
+        <td>Only tried Consumer-resultsListItem.is-available selector. Real UI uses hashed CSS classes with "Book" text buttons</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity critical">Critical</span></td>
+        <td>Sniper fires 2 min late</td>
+        <td>int() truncation: 0.5s delta → 0 → hold check bypassed → non-sniper sequential poll ran through the window</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity high">High</span></td>
+        <td>3+ min poll during sniper</td>
+        <td>Unreleased dates triggered 60s pagination timeouts. Each of 3 unreleased dates = 180s wasted</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity high">High</span></td>
+        <td>Notifier shows wrong slot count</td>
+        <td>self._poll_count (cumulative poll #) passed as slots_found to sniper_mode_ended()</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity medium">Medium</span></td>
+        <td>PM2 Chromium crash loop</td>
+        <td>MachPortRendezvousServer failure. PM2 daemon corrupted after 30 rapid restart cycles</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity medium">Medium</span></td>
+        <td>playwright-stealth v2 API break</td>
+        <td>stealth_async() renamed to Stealth().apply_stealth_async() in v2</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity medium">Medium</span></td>
+        <td>Discord token in plaintext</td>
+        <td>Hardcoded in start-claude.sh, tracked by git</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity high">High</span></td>
+        <td>Debug PNGs + .claude/ config unignored</td>
+        <td>Authenticated page captures and machine-local Claude settings could be accidentally staged and pushed</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+</section>
+
+<!-- ═══════════════ TEST INFRASTRUCTURE ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">Testing &amp; Validation</div>
+  <div class="section-title">Test Infrastructure</div>
+  <div class="arch-grid">
+    <div class="arch-card">
+      <div class="card-icon">🔬</div>
+      <h3>--verify</h3>
+      <p>Validates DOM selectors against the live Tock site. First line of defense when Tock updates their frontend.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🧪</div>
+      <h3>--dry-run</h3>
+      <p>Full flow without booking. Logs what it would have booked. Safe for production testing.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">💳</div>
+      <h3>--test-booking-flow</h3>
+      <p>Navigates to checkout on a test restaurant (Benu). Verifies saved card, CVC field, confirm button. Screenshots the state.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🔔</div>
+      <h3>--test-notify</h3>
+      <p>Sends all 4 Discord notification types. Verifies webhook URL is correct and messages render properly.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">⚡</div>
+      <h3>--test-sniper</h3>
+      <p>Validates session pre-warm, page reuse with reload, and confirm retry logic. Tests all sniper components in isolation.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🔁</div>
+      <h3>--once</h3>
+      <p>Single poll cycle then exit. Fast validation that the full scan works without committing to the monitoring loop.</p>
+    </div>
+  </div>
+  <div class="code-block">
+<span class="comment"># Full validation pipeline after any code change:</span>
+<span class="highlight">python main.py --verify</span>                                    <span class="comment"># selectors ok?</span>
+<span class="highlight">python main.py --test-notify</span>                                <span class="comment"># discord ok?</span>
+<span class="highlight">python main.py --test-booking-flow --test-restaurant benu</span>  <span class="comment"># checkout ok?</span>
+<span class="highlight">python main.py --test-sniper</span>                                <span class="comment"># sniper ok?</span>
+<span class="highlight">python main.py --once</span>                                       <span class="comment"># full scan ok?</span>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ LESSONS ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">Reflections</div>
+  <div class="section-title">Key Lessons Learned</div>
+  <div class="lessons-grid">
+    <div class="lesson-card">
+      <div class="lesson-num">01</div>
+      <h3>Never trust mock-based selectors</h3>
+      <p>Unit tests with mocked DOM passed 39/39 while the live site used completely different CSS classes. Always validate against real pages with --test-booking-flow.</p>
+    </div>
+    <div class="lesson-card">
+      <div class="lesson-num">02</div>
+      <h3>Fix the checker AND the booker</h3>
+      <p>Fixing detection without fixing booking means you can see slots but can't grab them. Every selector change must be applied to both code paths.</p>
+    </div>
+    <div class="lesson-card">
+      <div class="lesson-num">03</div>
+      <h3>Seconds matter in sniper mode</h3>
+      <p>A 2-minute timing drift (int truncation) and 3-minute poll cycles (pagination timeouts) meant missing slots that sold out in under 60 seconds.</p>
+    </div>
+    <div class="lesson-card">
+      <div class="lesson-num">04</div>
+      <h3>Debug screenshots are invaluable</h3>
+      <p>The screenshot showing "New reservations will be released on March 27 at 8:00 PM PDT" confirmed the exact release schedule and revealed the modal calendar structure.</p>
+    </div>
+    <div class="lesson-card">
+      <div class="lesson-num">05</div>
+      <h3>Plan before coding</h3>
+      <p>Every successful feature started with research → plan → implement → test. Skipping the plan led to assumptions that broke on the live site.</p>
+    </div>
+    <div class="lesson-card">
+      <div class="lesson-num">06</div>
+      <h3>Infrastructure is part of the product</h3>
+      <p>PM2 daemon corruption, Chrome/Playwright port conflicts, conda vs system Python paths — production environment issues cost as much time as code bugs.</p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ NEXT STEPS ═══════════════ -->
+<section>
+<div class="container">
+  <div class="section-label">Roadmap</div>
+  <div class="section-title">Next Steps</div>
+  <div class="arch-grid">
+    <div class="arch-card">
+      <div class="card-icon">🎯</div>
+      <h3>Next Friday Sniper</h3>
+      <p>All three critical fixes deployed. Booker selector, sniper timing, and skip cache all validated. Ready for the next release window.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">🔒</div>
+      <h3>Post-Click Verification</h3>
+      <p>Add date validation after clicking a calendar day — confirm the UI actually transitioned to the target date before attempting to book.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">⏱️</div>
+      <h3>Slot-Time Targeting</h3>
+      <p>Match AvailableSlot.slot_time to the specific button clicked, so the bot books the preferred time slot rather than just the first available.</p>
+    </div>
+    <div class="arch-card">
+      <div class="card-icon">☁️</div>
+      <h3>Cloud Migration</h3>
+      <p>Move from Mac Mini to a cloud VM for true 24/7 uptime without Chrome conflicts or PM2 daemon issues.</p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ═══════════════ FOOTER ═══════════════ -->
+<div class="footer">
+  <a class="footer-link" href="https://github.com/charlieyang1557/tock-reservation-bot" target="_blank">View on GitHub →</a>
+  <div class="footer-credits">
+    Built with Claude Code · Supervised by human judgment<br>
+    <span style="color: var(--text-dim); font-size: 12px; margin-top: 8px; display: inline-block;">
+      "The art of vibe coding is in the planning, not the coding."
+    </span>
+  </div>
+</div>
+
+</body>
+</html>

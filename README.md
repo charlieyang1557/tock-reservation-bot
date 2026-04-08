@@ -199,6 +199,10 @@ Output shows which selectors pass and which need updating. Fix them in `src/sele
 | Cloudflare challenge | Run headed once, solve manually — clearance cookie is saved |
 | Selectors broken after Tock update | Run `--verify`, inspect elements in DevTools, update `src/selectors.py` |
 
+## Project Report
+
+See [docs/report.html](docs/report.html) for a detailed project report covering architecture, development timeline, bugs found and fixed, and lessons learned.
+
 ## Disclaimer
 
 This bot is for personal use. Use responsibly and in accordance with Tock's Terms of Service.
