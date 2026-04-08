@@ -201,7 +201,7 @@ Output shows which selectors pass and which need updating. Fix them in `src/sele
 
 ## Project Report
 
-See [docs/report.html](docs/report.html) for a detailed project report covering architecture, development timeline, bugs found and fixed, and lessons learned.
+See the [Project Report](https://charlieyang1557.github.io/tock-reservation-bot/report.html) for a detailed write-up covering architecture, development timeline, bugs found and fixed, and lessons learned.
 
 ## Disclaimer
 
