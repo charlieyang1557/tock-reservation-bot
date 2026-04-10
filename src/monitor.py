@@ -263,10 +263,22 @@ class TockMonitor:
         # Sniper mode uses concurrent by default (~34s vs ~133s sequential).
         # If error rate spikes, adaptive logic switches to sequential automatically.
         use_concurrent = self._sniper_active and self._sniper_concurrent
+        sniper_age = 0.0
+        if self._sniper_active:
+            now_pt = datetime.now(PT)
+            for start_str in self.config.sniper_times:
+                start_dt = _sniper_start_dt(now_pt, start_str)
+                if now_pt >= start_dt:
+                    age = (now_pt - start_dt).total_seconds()
+                    if age < self.config.sniper_duration_min * 60:
+                        sniper_age = age
+                        break
+
         try:
             slots = await self.checker.check_all(
                 concurrent=use_concurrent,
                 keep_pages=self._sniper_active,
+                sniper_window_age_sec=sniper_age,
             )
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")

@@ -70,10 +70,21 @@ class AvailabilityChecker:
         # Dates that failed to show the target day in the calendar.
         # Cleared when sniper pages are closed (new window).
         self._skip_dates: set[str] = set()
+        self._skip_cache_enabled: bool = True
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
+
+    def clear_skip_cache(self) -> None:
+        """Clear the skip-date cache. Call at the start of each sniper poll."""
+        self._skip_dates.clear()
+
+    def _should_skip_date(self, date_str: str, skip_cache_enabled: bool) -> bool:
+        """Return True if this date should be skipped based on cache."""
+        if not skip_cache_enabled:
+            return False
+        return date_str in self._skip_dates
 
     async def close_sniper_pages(self) -> None:
         """Close all pages kept open during sniper mode. Call when window ends."""
@@ -86,7 +97,12 @@ class AvailabilityChecker:
         self._skip_dates.clear()
         logger.debug("[check] Sniper pages closed.")
 
-    async def check_all(self, concurrent: bool = False, keep_pages: bool = False) -> list[AvailableSlot]:
+    async def check_all(
+        self,
+        concurrent: bool = False,
+        keep_pages: bool = False,
+        sniper_window_age_sec: float = 0,
+    ) -> list[AvailableSlot]:
         """
         Scan for available slots in two phases:
 
@@ -106,6 +122,14 @@ class AvailabilityChecker:
         import asyncio as _asyncio
 
         self._screenshot_taken_this_poll = False
+
+        # Disable skip cache during first 5 minutes of sniper window
+        # (release may happen mid-window)
+        self._skip_cache_enabled = sniper_window_age_sec > 300 if keep_pages else True
+        # Always clear stale entries at poll start so we retry dates that
+        # failed last poll
+        self._skip_dates.clear()
+
         errors: list[int] = [0]   # mutable counter accessible in closure
 
         async def _check_date_tracked(d: date) -> list[AvailableSlot]:
@@ -222,7 +246,7 @@ class AvailabilityChecker:
         # Skip dates that already failed (day not in calendar — beyond booking window).
         # Only skip during sniper mode (keep_page=True) to avoid wasting poll time.
         # Cache is cleared when sniper pages close (new window = new release possible).
-        if keep_page and date_str in self._skip_dates:
+        if keep_page and self._should_skip_date(date_str, skip_cache_enabled=self._skip_cache_enabled):
             logger.debug(f"[check] {date_str} — skipped (not in calendar last poll)")
             return []
 
