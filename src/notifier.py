@@ -38,6 +38,7 @@ class Notifier:
         self.config = config
         self._webhook_url: str = config.discord_webhook_url
         self._discord_enabled = bool(self._webhook_url)
+        self._critical_tasks: list[asyncio.Task] = []
 
         if self._discord_enabled:
             logger.info("[notify] Discord webhook configured ✓")
@@ -117,6 +118,7 @@ class Notifier:
                 ("Party", str(self.config.party_size), True),
                 ("Restaurant", self.config.restaurant_slug, False),
             ],
+            critical=True,
         )
 
     def booking_aborted(self, slot, reason: str) -> None:
@@ -143,6 +145,7 @@ class Notifier:
             title="💳 Add Payment Card to Tock!",
             description=msg,
             color=_RED,
+            critical=True,
         )
 
     def dry_run_would_book(self, slot) -> None:
@@ -172,18 +175,38 @@ class Notifier:
         description: str,
         color: int,
         fields: list[tuple[str, str, bool]] | None = None,
+        critical: bool = False,
     ) -> None:
-        """Schedule a Discord webhook call without blocking the caller."""
+        """Schedule a Discord webhook call without blocking the caller.
+
+        critical=True tasks are tracked so drain_pending() can await them
+        before shutdown — prevents booking confirmations from being dropped.
+        """
         if not self._discord_enabled:
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(
+            task = loop.create_task(
                 self._send_discord(title, description, color, fields or [])
             )
+            if critical:
+                self._critical_tasks.append(task)
+                task.add_done_callback(
+                    lambda t: self._critical_tasks.remove(t)
+                    if t in self._critical_tasks else None
+                )
         except RuntimeError:
             # No running loop (e.g. called from a sync test context) — skip
             pass
+
+    async def drain_pending(self, timeout: float = 10.0) -> None:
+        """Wait for critical notifications to send. Call before shutdown."""
+        if not self._critical_tasks:
+            return
+        logger.info(
+            f"[notify] Draining {len(self._critical_tasks)} critical notification(s)…"
+        )
+        await asyncio.wait(self._critical_tasks, timeout=timeout)
 
     async def _send_discord(
         self,
