@@ -62,27 +62,29 @@ def _make_mock_button(text: str):
 # ---------------------------------------------------------------------------
 
 class TestClickDayUsesAllButtons:
+    """_click_day now uses page.evaluate() for a single browser round-trip."""
 
     @pytest.mark.asyncio
     async def test_clicks_matching_day_number(self):
         checker = _make_checker()
         page = AsyncMock()
-        btn3 = _make_mock_button("3")
-        btn4 = _make_mock_button("4")
-        btn5 = _make_mock_button("5")
-        page.query_selector_all = AsyncMock(return_value=[btn3, btn4, btn5])
+        # page.evaluate returns True when JS finds and clicks the matching day
+        page.evaluate = AsyncMock(return_value=True)
 
         result = await checker._click_day(page, date(2026, 4, 4))
 
         assert result is True
-        btn4.click.assert_called_once()
-        btn3.click.assert_not_called()
+        page.evaluate.assert_called_once()
+        # Verify the target day number "4" was passed as argument
+        call_args = page.evaluate.call_args
+        assert call_args[0][1] == ["button.ConsumerCalendar-day.is-in-month", "4"]
 
     @pytest.mark.asyncio
     async def test_returns_false_when_day_not_found(self):
         checker = _make_checker()
         page = AsyncMock()
-        page.query_selector_all = AsyncMock(return_value=[_make_mock_button("1")])
+        # page.evaluate returns False when no matching day button found
+        page.evaluate = AsyncMock(return_value=False)
 
         assert await checker._click_day(page, date(2026, 4, 15)) is False
 
@@ -90,7 +92,8 @@ class TestClickDayUsesAllButtons:
     async def test_returns_false_when_no_buttons(self):
         checker = _make_checker()
         page = AsyncMock()
-        page.query_selector_all = AsyncMock(return_value=[])
+        # page.evaluate returns False when no buttons exist at all
+        page.evaluate = AsyncMock(return_value=False)
 
         assert await checker._click_day(page, date(2026, 4, 4)) is False
 

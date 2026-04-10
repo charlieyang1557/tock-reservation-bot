@@ -196,33 +196,36 @@ class TockBooker:
     # ------------------------------------------------------------------
 
     async def _click_calendar_day(self, page: Page, slot: AvailableSlot) -> bool:
-        """Click the calendar button matching slot.slot_date.
+        """Click the calendar button matching slot.slot_date using single evaluate().
 
         Uses all_day_button (any in-month day) — NOT available_day_button —
         so we click days even when they lack the is-available class (e.g.
         Fuhuihua shows is-sold/is-disabled until the exact release moment).
         """
-        key = "all_day_button"
-        selector = sel.get(key)
+        selector = sel.get("all_day_button")
         target_num = str(slot.slot_date.day)
 
-        day_buttons = await page.query_selector_all(selector)
-        for btn in day_buttons:
-            try:
-                text = (await btn.text_content() or "").strip()
-                if text == target_num:
-                    await btn.click()
-                    logger.info(
-                        f"[book] Clicked day {target_num} for {slot.slot_date_str}"
-                    )
-                    return True
-            except Exception:
-                continue
+        result = await page.evaluate("""
+        ([selector, targetNum]) => {
+            const buttons = document.querySelectorAll(selector);
+            for (const btn of buttons) {
+                if (btn.textContent.trim() === targetNum) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """, [selector, target_num])
+
+        if result:
+            logger.info(f"[book] Clicked day {target_num} for {slot.slot_date_str}")
+            return True
 
         logger.error(
-            f"SELECTOR_FAILED: key='{key}'\n"
+            f"SELECTOR_FAILED: key='all_day_button'\n"
             f"  Could not find or click day {target_num} for {slot.slot_date_str}.\n"
-            f"  → Update src/selectors.py"
+            f"  -> Update src/selectors.py"
         )
         return False
 

@@ -325,20 +325,53 @@ class AvailabilityChecker:
             from src.selectors import get_slot_button_selectors
             slot_selectors = get_slot_button_selectors()
 
+            # Split selectors: CSS-compatible ones go through fast page.evaluate(),
+            # Playwright-specific ones (:has-text, :text, :visible) fall back to locator API
+            css_selectors = []
+            pw_selectors = []
+            for s in slot_selectors:
+                if any(pw in s for pw in [':has-text', ':text(', ':visible']):
+                    pw_selectors.append(s)
+                else:
+                    css_selectors.append(s)
+
             found_selector = None
             slot_count = 0
-            for try_sel in slot_selectors:
-                try:
-                    count = await page.locator(try_sel).count()
-                    if count > 0:
-                        found_selector = try_sel
-                        slot_count = count
-                        logger.info(
-                            f"[check] {date_str} — {count} slot(s) found via {try_sel!r}"
-                        )
-                        break
-                except Exception:
-                    continue
+
+            # Fast path: batch CSS selectors in one evaluate() call
+            if css_selectors:
+                detect_js = """
+                (selectors) => {
+                    for (let i = 0; i < selectors.length; i++) {
+                        try {
+                            const els = document.querySelectorAll(selectors[i]);
+                            if (els.length > 0) return { index: i, count: els.length };
+                        } catch(e) { continue; }
+                    }
+                    return { index: -1, count: 0 };
+                }
+                """
+                detect_result = await page.evaluate(detect_js, css_selectors)
+                if detect_result["index"] >= 0:
+                    found_selector = css_selectors[detect_result["index"]]
+                    slot_count = detect_result["count"]
+
+            # Slow path: Playwright-specific selectors (only if fast path missed)
+            if not found_selector:
+                for try_sel in pw_selectors:
+                    try:
+                        count = await page.locator(try_sel).count()
+                        if count > 0:
+                            found_selector = try_sel
+                            slot_count = count
+                            break
+                    except Exception:
+                        continue
+
+            if found_selector:
+                logger.info(
+                    f"[check] {date_str} — {slot_count} slot(s) found via {found_selector!r}"
+                )
 
             if not found_selector:
                 logger.debug(f"[check] {date_str} — no slots found with any selector")
@@ -446,7 +479,7 @@ class AvailabilityChecker:
         return False
 
     async def _click_day(self, page: Page, target_date: date) -> bool:
-        """Click the calendar button for target_date. Returns True on success.
+        """Click the calendar button for target_date using a single evaluate() call.
 
         Uses all_day_button (any in-month day) — NOT available_day_button —
         so we click days even when they lack the is-available class (e.g.
@@ -458,18 +491,24 @@ class AvailabilityChecker:
         selector = sel.get("all_day_button")
         target_num = str(target_date.day)
 
-        day_buttons = await page.query_selector_all(selector)
-        for btn in day_buttons:
-            try:
-                text = (await btn.text_content() or "").strip()
-                if text == target_num:
-                    await btn.click()
-                    logger.info(
-                        f"[check] Clicked day {target_num} for {target_date.isoformat()}"
-                    )
-                    return True
-            except Exception:
-                continue
+        result = await page.evaluate("""
+        ([selector, targetNum]) => {
+            const buttons = document.querySelectorAll(selector);
+            for (const btn of buttons) {
+                if (btn.textContent.trim() === targetNum) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+        """, [selector, target_num])
+
+        if result:
+            logger.info(
+                f"[check] Clicked day {target_num} for {target_date.isoformat()}"
+            )
+            return True
 
         logger.info(
             f"[check] Day {target_num} not visible in calendar for "
