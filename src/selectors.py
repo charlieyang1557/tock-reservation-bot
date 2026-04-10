@@ -173,6 +173,18 @@ def get(key: str) -> str:
     return SELECTORS[key]
 
 
+def get_slot_button_selectors() -> list[str]:
+    """Ordered list of selectors for time-slot / booking buttons."""
+    return [
+        SELECTORS["available_slot_button"],
+        "button.Consumer-resultsListItem",
+        'button:visible:has-text("Book")',
+        SELECTORS["book_now_button"],
+        "button.SearchExperience-bookButton",
+        "[data-testid='book-button']",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Live verification  (python main.py --verify)
 # ---------------------------------------------------------------------------

@@ -227,33 +227,32 @@ class TockBooker:
         return False
 
     async def _click_time_slot(self, page: Page, slot: AvailableSlot) -> bool:
-        """Find the time slot closest to slot.slot_time and click it.
+        """Find the time slot matching slot.slot_time and click it.
 
-        Uses the same multi-selector fallback as checker.py so both modules
-        handle all Tock UI variants identically.
+        Iterates all matching buttons and compares text content to find the
+        correct time. Falls back to first button if no text match is found.
         """
-        slot_selectors = [
-            sel.get("available_slot_button"),          # button.Consumer-resultsListItem.is-available
-            "button.Consumer-resultsListItem",         # without is-available class
-            'button:visible:has-text("Book")',         # "Book" CTA (e.g. Benu css-dr2rn7)
-            sel.get("book_now_button"),                # "Book now" button
-            "button.SearchExperience-bookButton",      # alternative booking button
-            "[data-testid='book-button']",             # test ID variant
-        ]
+        import re
+        from src.selectors import get_slot_button_selectors
 
-        # Wait briefly for slot buttons to appear after the day click
-        await page.wait_for_timeout(1000)
+        slot_selectors = get_slot_button_selectors()
 
-        # Try each selector until one finds buttons
+        # Wait reactively for slot buttons (not fixed sleep)
+        for try_sel in slot_selectors[:2]:
+            try:
+                await page.wait_for_selector(try_sel, timeout=2000)
+                break
+            except Exception:
+                continue
+
+        # Find which selector has buttons
         matched_selector = None
         for try_sel in slot_selectors:
             try:
                 count = await page.locator(try_sel).count()
                 if count > 0:
                     matched_selector = try_sel
-                    logger.debug(
-                        f"[book] Found {count} slot button(s) via {try_sel!r}"
-                    )
+                    logger.debug(f"[book] Found {count} slot button(s) via {try_sel!r}")
                     break
             except Exception:
                 continue
@@ -262,21 +261,52 @@ class TockBooker:
             logger.error(
                 "[book] No slot buttons found after clicking the day.\n"
                 "  Tried all known selectors.\n"
-                "  → Update src/selectors.py or src/booker.py slot_selectors"
+                "  -> Update src/selectors.py"
             )
             return False
 
-        # Click the first matching button (checker already picked the best slot
-        # per date, and we navigated to that date's page)
-        try:
-            locator = page.locator(matched_selector)
-            btn_text = (await locator.first.text_content() or "").strip()
-            await locator.first.click()
-            logger.info(f"[book] Clicked slot button: {btn_text or matched_selector}")
-            return True
-        except Exception as e:
-            logger.error(f"[book] Could not click slot button: {e}")
-            return False
+        # Iterate buttons to find one matching slot.slot_time
+        locator = page.locator(matched_selector)
+        count = await locator.count()
+        target_time = slot.slot_time.strip().upper()
+
+        best_btn = None
+        for i in range(count):
+            btn = locator.nth(i)
+            try:
+                text = (await btn.text_content() or "").strip()
+                if target_time in text.upper():
+                    await btn.click()
+                    logger.info(f"[book] Clicked slot button matching '{slot.slot_time}': {text}")
+                    return True
+                time_match = re.search(
+                    r'\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b', text, re.IGNORECASE
+                )
+                if time_match and time_match.group(1).strip().upper() == target_time:
+                    await btn.click()
+                    logger.info(f"[book] Clicked slot button (regex match): {text}")
+                    return True
+                if best_btn is None:
+                    best_btn = btn
+            except Exception:
+                continue
+
+        # Fallback: click first button
+        if best_btn is not None:
+            try:
+                text = (await best_btn.text_content() or "").strip()
+                await best_btn.click()
+                logger.warning(
+                    f"[book] No exact time match for '{slot.slot_time}' — "
+                    f"clicked first button: {text}"
+                )
+                return True
+            except Exception as e:
+                logger.error(f"[book] Could not click fallback slot button: {e}")
+                return False
+
+        logger.error("[book] No slot buttons could be clicked")
+        return False
 
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
         """Return True when the checkout/booking-details page is detected."""
