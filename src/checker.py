@@ -130,24 +130,14 @@ class AvailabilityChecker:
 
         self._screenshot_taken_this_poll = False
 
-        # Disable skip cache during first 5 minutes of sniper window
-        # (release may happen mid-window)
-        self._skip_cache_enabled = sniper_window_age_sec > 300 if keep_pages else True
+        # Skip cache only active during sniper mode, and only after first 5 min
+        # (release may happen mid-window, so don't cache "not visible" early)
+        self._skip_cache_enabled = keep_pages and sniper_window_age_sec > 300
         # Always clear stale entries at poll start so we retry dates that
         # failed last poll
         self._skip_dates.clear()
 
         errors: list[int] = [0]   # mutable counter accessible in closure
-
-        async def _check_date_tracked(d: date) -> list[AvailableSlot]:
-            result = await self._check_date(d)
-            # _check_date returns [] on calendar failure; we detect it by
-            # checking whether _wait_for_calendar logged a SELECTOR_FAILED.
-            # Simpler proxy: if result is [] AND the date is in a phase where
-            # we'd expect the calendar to load, count it as a potential error.
-            # The real signal comes from _wait_for_calendar's log, so we use
-            # a hook: override to count failures directly.
-            return result
 
         # Patch _wait_for_calendar to count failures for this poll
         original_wait = self._wait_for_calendar

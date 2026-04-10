@@ -29,6 +29,7 @@ inside the lock is effectively atomic — no double-bookings can occur.
 
 import asyncio
 import logging
+import re
 
 from playwright.async_api import Page
 
@@ -37,6 +38,7 @@ from src.browser import TockBrowser
 from src.checker import AvailableSlot
 from src.config import Config
 from src.notifier import Notifier
+from src.selectors import get_slot_button_selectors
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,7 @@ class TockBooker:
             page = await self.browser.new_page()
 
         try:
-            if warm_page is None or warm_page.is_closed():
+            if owns_page:
                 # ── Step 1: load search page ──────────────────────────────
                 url = (
                     f"{BASE_URL}/{self.config.restaurant_slug}/search"
@@ -156,7 +158,6 @@ class TockBooker:
                     return False
 
                 # Wait reactively for slot buttons after day click
-                from src.selectors import get_slot_button_selectors
                 for try_sel in get_slot_button_selectors()[:2]:
                     try:
                         await page.wait_for_selector(try_sel, timeout=2000)
@@ -256,9 +257,6 @@ class TockBooker:
         Iterates all matching buttons and compares text content to find the
         correct time. Falls back to first button if no text match is found.
         """
-        import re
-        from src.selectors import get_slot_button_selectors
-
         slot_selectors = get_slot_button_selectors()
 
         # Wait reactively for slot buttons (not fixed sleep)

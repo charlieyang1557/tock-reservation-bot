@@ -201,12 +201,11 @@ class Notifier:
 
     async def drain_pending(self, timeout: float = 10.0) -> None:
         """Wait for critical notifications to send. Call before shutdown."""
-        if not self._critical_tasks:
+        tasks = list(self._critical_tasks)  # snapshot before await
+        if not tasks:
             return
-        logger.info(
-            f"[notify] Draining {len(self._critical_tasks)} critical notification(s)…"
-        )
-        await asyncio.wait(self._critical_tasks, timeout=timeout)
+        logger.info(f"[notify] Draining {len(tasks)} critical notification(s)…")
+        await asyncio.wait(tasks, timeout=timeout)
 
     async def _send_discord(
         self,

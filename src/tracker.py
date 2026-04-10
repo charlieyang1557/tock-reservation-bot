@@ -45,6 +45,7 @@ class SlotTracker:
         # Track (slot_date, slot_time) pairs already recorded THIS session
         # so we don't spam the log with the same slot every poll cycle.
         self._seen_this_session: set[str] = set()
+        self._pending_flush: bool = False
         self._load()
 
     # ------------------------------------------------------------------
@@ -85,7 +86,7 @@ class SlotTracker:
 
     def flush_deferred(self) -> None:
         """Flush any pending deferred records to disk."""
-        if getattr(self, '_pending_flush', False):
+        if self._pending_flush:
             self.save()
             self._pending_flush = False
 
