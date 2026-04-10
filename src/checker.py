@@ -320,16 +320,10 @@ class AvailabilityChecker:
             slot_wait = 500 if keep_page else 2500
             await page.wait_for_timeout(slot_wait)
 
-            # Try multiple selectors for slot/booking buttons (same order as
-            # --test-booking-flow). The first selector that matches wins.
-            slot_selectors = [
-                sel.get("available_slot_button"),          # button.Consumer-resultsListItem.is-available
-                "button.Consumer-resultsListItem",         # without is-available class
-                'button:visible:has-text("Book")',         # "Book" CTA (e.g. Benu css-dr2rn7)
-                sel.get("book_now_button"),                # "Book now" button
-                "button.SearchExperience-bookButton",      # alternative booking button
-                "[data-testid='book-button']",             # test ID variant
-            ]
+            # Try multiple selectors for slot/booking buttons.
+            # Centralized in selectors.py so checker and booker stay in sync.
+            from src.selectors import get_slot_button_selectors
+            slot_selectors = get_slot_button_selectors()
 
             found_selector = None
             slot_count = 0
