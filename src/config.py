@@ -48,6 +48,9 @@ class Config:
     sniper_duration_min: int         # how long each sniper window lasts
     sniper_interval_sec: int         # sleep between polls in sniper mode
 
+    # Debug
+    debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
+
 
 def load_config() -> Config:
     email = os.getenv("TOCK_EMAIL", "").strip()
@@ -95,6 +98,7 @@ def load_config() -> Config:
         ],
         sniper_duration_min=int(os.getenv("SNIPER_DURATION_MIN", "11")),
         sniper_interval_sec=int(os.getenv("SNIPER_INTERVAL_SEC", "3")),
+        debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 
 
