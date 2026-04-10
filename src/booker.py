@@ -143,8 +143,14 @@ class TockBooker:
             if not await self._click_calendar_day(page, slot):
                 return False
 
-            # Wait for the slot list to start loading after the day click
-            await page.wait_for_timeout(400)
+            # Wait reactively for slot buttons after day click
+            from src.selectors import get_slot_button_selectors
+            for try_sel in get_slot_button_selectors()[:2]:
+                try:
+                    await page.wait_for_selector(try_sel, timeout=2000)
+                    break
+                except Exception:
+                    continue
 
             # ── Step 3: click the time slot ───────────────────────────
             if booking_won.is_set():
@@ -154,8 +160,7 @@ class TockBooker:
             if not await self._click_time_slot(page, slot):
                 return False
 
-            # Brief tick so checkout navigation begins before we start waiting
-            await page.wait_for_timeout(200)
+            # _wait_for_checkout handles the timing — no need for a blind tick
 
             # ── Step 4: wait for checkout page ────────────────────────
             if booking_won.is_set():

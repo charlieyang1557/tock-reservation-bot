@@ -288,8 +288,12 @@ class AvailabilityChecker:
             if not await self._wait_for_calendar(page, date_str, timeout=cal_timeout):
                 return []
 
-            # Debug screenshot: capture once per poll cycle (first date only)
-            if not self._screenshot_taken_this_poll:
+            # Debug screenshot: only when enabled and not in sniper mode (too slow)
+            if (
+                self.config.debug_screenshots
+                and not keep_page  # skip during sniper — ~200ms overhead per poll
+                and not self._screenshot_taken_this_poll
+            ):
                 self._screenshot_taken_this_poll = True
                 try:
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -315,15 +319,18 @@ class AvailabilityChecker:
                     self._skip_dates.add(date_str)
                 return []
 
-            # Wait for the slot panel to render after clicking the day.
-            # Shorter wait in sniper mode (page is warm, React state cached).
-            slot_wait = 500 if keep_page else 2500
-            await page.wait_for_timeout(slot_wait)
-
             # Try multiple selectors for slot/booking buttons.
             # Centralized in selectors.py so checker and booker stay in sync.
             from src.selectors import get_slot_button_selectors
             slot_selectors = get_slot_button_selectors()
+
+            # Wait reactively for any slot-like element instead of blind sleep.
+            # Short timeout (500ms sniper, 2500ms normal) — move on if nothing appears.
+            slot_timeout = 500 if keep_page else 2500
+            try:
+                await page.wait_for_selector(slot_selectors[0], timeout=slot_timeout)
+            except Exception:
+                pass  # no slots visible yet — proceed to multi-selector check
 
             # Split selectors: CSS-compatible ones go through fast page.evaluate(),
             # Playwright-specific ones (:has-text, :text, :visible) fall back to locator API
