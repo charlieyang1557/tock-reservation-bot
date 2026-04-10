@@ -165,8 +165,14 @@ class AvailabilityChecker:
                         return_exceptions=True,
                     )
                     slots: list[AvailableSlot] = []
-                    for r in results:
-                        if isinstance(r, list):
+                    for i, r in enumerate(results):
+                        if isinstance(r, BaseException):
+                            errors[0] += 1
+                            logger.error(
+                                f"[check] Concurrent check failed for "
+                                f"{dates[i].isoformat()}: {r}"
+                            )
+                        elif isinstance(r, list):
                             slots.extend(r)
                     return slots
                 else:
