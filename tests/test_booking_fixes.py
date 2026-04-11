@@ -178,7 +178,7 @@ async def test_screenshot_taken_on_checkout_timeout(tmp_path):
     page.query_selector = AsyncMock(return_value=None)
     screenshot_paths = []
 
-    async def mock_screenshot(path=None, **kwargs):
+    async def mock_screenshot(path=None, **_kwargs):
         if path:
             screenshot_paths.append(path)
             Path(path).parent.mkdir(parents=True, exist_ok=True)

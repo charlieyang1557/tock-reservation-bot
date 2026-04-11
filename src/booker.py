@@ -31,7 +31,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime as _datetime
+from datetime import datetime
 
 from playwright.async_api import Page
 
@@ -49,7 +49,6 @@ BASE_URL = "https://www.exploretock.com"
 _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "debug_screenshots"
 )
-os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
 
 # Selectors that match generic "Book" buttons (restaurant/experience level, not time-slot).
 # These must only be clicked if surrounding context confirms the target time.
@@ -464,7 +463,8 @@ class TockBooker:
         if not self.config.debug_screenshots:
             return
         try:
-            ts = _datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+            os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             path = os.path.join(_SCREENSHOT_DIR, f"booking_{ts}_{step}.png")
             await page.screenshot(path=path, full_page=True)
             logger.info(f"[book] Screenshot saved: {path}")
