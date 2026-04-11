@@ -27,7 +27,7 @@ class TestGatherExceptionLogging:
         checker = AvailabilityChecker(config, MagicMock(), MagicMock())
 
         call_count = 0
-        async def _mock_check(d, keep_page=False):
+        async def _mock_check(d, keep_page=False, abort_event=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -48,7 +48,7 @@ class TestGatherExceptionLogging:
 
         slot = AvailableSlot(slot_date=date(2026, 4, 24), slot_time="5:00 PM", day_of_week="Friday")
         call_count = 0
-        async def _mock_check(d, keep_page=False):
+        async def _mock_check(d, keep_page=False, abort_event=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:

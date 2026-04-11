@@ -11,6 +11,7 @@ Selector failures are logged with the exact key and selector string so
 updates to src/selectors.py are straightforward.
 """
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass
@@ -170,8 +171,14 @@ class AvailabilityChecker:
                     + ", ".join(d.isoformat() for d in dates)
                 )
                 if concurrent:
+                    # In sniper mode, create an abort event: the first date to find
+                    # slots signals others to stop early via abort_event.set().
+                    abort_evt = _asyncio.Event() if keep_pages else None
                     results = await _asyncio.gather(
-                        *[self._check_date(d, keep_page=keep_pages) for d in dates],
+                        *[
+                            self._check_date(d, keep_page=keep_pages, abort_event=abort_evt)
+                            for d in dates
+                        ],
                         return_exceptions=True,
                     )
                     slots: list[AvailableSlot] = []
@@ -188,7 +195,13 @@ class AvailabilityChecker:
                 else:
                     slots = []
                     for d in dates:
-                        slots.extend(await self._check_date(d, keep_page=keep_pages))
+                        result = await self._check_date(d, keep_page=keep_pages)
+                        slots.extend(result)
+                        if result and keep_pages:
+                            logger.info(
+                                "[check] First slot found — stopping sequential scan early"
+                            )
+                            break
                     return slots
 
             preferred_dates = self._get_target_dates(self.config.preferred_days)
@@ -248,7 +261,8 @@ class AvailabilityChecker:
         return result
 
     async def _check_date(
-        self, target_date: date, keep_page: bool = False
+        self, target_date: date, keep_page: bool = False,
+        abort_event: "asyncio.Event | None" = None,
     ) -> list[AvailableSlot]:
         """
         Load the Tock search page for target_date, verify the day is
@@ -264,6 +278,14 @@ class AvailabilityChecker:
         # Cache is cleared when sniper pages close (new window = new release possible).
         if keep_page and self._should_skip_date(date_str, skip_cache_enabled=self._skip_cache_enabled):
             logger.debug(f"[check] {date_str} — skipped (not in calendar last poll)")
+            return []
+
+        # Sniper interrupt: another date already found slots — skip immediately
+        if abort_event is not None and abort_event.is_set():
+            logger.debug(
+                f"[check] {date_str} — skipped "
+                "(first slot already found on another date)"
+            )
             return []
 
         url = (
@@ -293,6 +315,10 @@ class AvailabilityChecker:
                 logger.debug(f"[check] {date_str} → {url}")
                 await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
 
+            # Check abort before expensive calendar work
+            if abort_event is not None and abort_event.is_set():
+                return []
+
             # Wait for calendar to render (shorter timeout in sniper mode)
             cal_timeout = 5000 if keep_page else 15000
             if not await self._wait_for_calendar(page, date_str, timeout=cal_timeout):
@@ -320,6 +346,9 @@ class AvailabilityChecker:
             # calendar days, others don't. Slot buttons may be Consumer-resultsListItem
             # or plain "Book" buttons with hashed CSS classes. We try all known
             # patterns and use the first that matches.
+
+            if abort_event is not None and abort_event.is_set():
+                return []
 
             # Click the target day in the calendar
             clicked = await self._click_day(page, target_date)
@@ -405,7 +434,14 @@ class AvailabilityChecker:
                 else:
                     self.tracker.record(slot.slot_date, slot.slot_time)
 
-            return self._sort_by_preferred_time(slots)
+            sorted_slots = self._sort_by_preferred_time(slots)
+            if sorted_slots and abort_event is not None:
+                abort_event.set()
+                logger.info(
+                    f"[check] {date_str} — first slot found, "
+                    "abort signaled to remaining tasks"
+                )
+            return sorted_slots
 
         except Exception as e:
             logger.error(f"[check] Unexpected error for {date_str}: {e}")
