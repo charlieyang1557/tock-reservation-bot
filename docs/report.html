@@ -530,11 +530,11 @@ section {
       <div class="stat-label">Lines of code</div>
     </div>
     <div class="stat-card">
-      <div class="stat-number">39</div>
+      <div class="stat-number">80</div>
       <div class="stat-label">Unit tests passing</div>
     </div>
     <div class="stat-card">
-      <div class="stat-number">~10s</div>
+      <div class="stat-number">~3s</div>
       <div class="stat-label">Sniper poll cycle</div>
     </div>
   </div>
@@ -562,7 +562,7 @@ section {
     <div class="arch-card">
       <div class="card-icon">⚡</div>
       <h3>Sniper Mode</h3>
-      <p>Activates at 7:59 PM PDT every Friday. 3-second polling with page reuse, skip cache for unreleased dates, session pre-warm 15 min before.</p>
+      <p>Two-phase sniper: Phase 1 (first 60s) is a lightweight no-op skip — slots haven't dropped yet. Phase 2 fires concurrent calendar scans with abort-on-first-slot. Page reuse across polls. Session pre-warm 15 min before window.</p>
       <span class="file-path">src/monitor.py</span>
     </div>
     <div class="arch-card">
@@ -680,6 +680,18 @@ section {
       <div class="timeline-desc">Codex adversarial review flagged two [high] trust-boundary issues: debug screenshots (page_debug*.png, test_booking_flow.png) capturing authenticated Tock UI state unignored in repo root, and .claude/ local config with machine paths and permission allowlists. Both gitignored. Live Playwright dry-run test confirmed full booking flow works end-to-end with new selectors.</div>
       <span class="timeline-tag tag-fix">Security Fix</span>
     </div>
+    <div class="timeline-item build">
+      <div class="timeline-date">Apr 10</div>
+      <div class="timeline-title">Speed &amp; Logic Overhaul — 7 Improvements</div>
+      <div class="timeline-desc">Seven targeted improvements shipped in one session: (1) Adaptive concurrent/sequential switching gated on sniper_age ≥ 60s so Phase 1 never toggles mode. (2) abort_event mechanism — first slot found instantly cancels all remaining concurrent date scans. (3) Generic Book button guard checks parent element text before clicking to prevent booking wrong slot. (4) _wait_for_checkout() rewritten as 2s-polling 30s loop instead of fragile single-selector wait. (5) Optional debug screenshots capture checkout state on booking timeout. (6) Discord notifications suppressed during sniper window to eliminate false-alarm pings when slots are found but not yet booked. (7) --test-sniper-phases test mode added to drive and validate two-phase sniper behavior. Unit tests grew from 39 → 80.</div>
+      <span class="timeline-tag tag-build">Build</span>
+    </div>
+    <div class="timeline-item fix">
+      <div class="timeline-date">Apr 11</div>
+      <div class="timeline-title">Phase 1 No-Op &amp; Saved Card Detection Fixes</div>
+      <div class="timeline-desc">Live integration tests caught two bugs: (1) --test-sniper-phases never set monitor._sniper_active, so keep_pages stayed False throughout all polls and the Phase 1 early-return never fired — all polls did full calendar scans. Fixed by setting _sniper_active and _sniper_concurrent before each poll call. (2) _has_saved_card() returned False despite a card being on the Tock account because the saved_payment_card selector didn't match the live UI. Fixed with CVC-presence fallback — Tock only renders the CVC re-entry field when a saved card is on file, confirmed by --test-booking-flow.</div>
+      <span class="timeline-tag tag-fix">Fix</span>
+    </div>
   </div>
 </div>
 </section>
@@ -753,6 +765,30 @@ section {
         <td>Authenticated page captures and machine-local Claude settings could be accidentally staged and pushed</td>
         <td><span class="status-fixed">✓ Fixed</span></td>
       </tr>
+      <tr>
+        <td><span class="severity high">High</span></td>
+        <td>Generic "Book" button clicks wrong slot</td>
+        <td>_click_time_slot() clicked the first visible Book button without verifying the parent element contained the target time text</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity high">High</span></td>
+        <td>_wait_for_checkout() times out early</td>
+        <td>Waited on a single DOM selector for checkout — timing mismatch caused premature timeout before checkout page rendered</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity medium">Medium</span></td>
+        <td>Phase 1 still doing full calendar scans</td>
+        <td>test_sniper_phases never set monitor._sniper_active, so keep_pages=False in every poll — the Phase 1 early-return never fired</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
+      <tr>
+        <td><span class="severity medium">Medium</span></td>
+        <td>Saved card detection false negative</td>
+        <td>saved_payment_card selector didn't match Tock's live UI; _has_saved_card() returned False despite card being on file</td>
+        <td><span class="status-fixed">✓ Fixed</span></td>
+      </tr>
     </tbody>
   </table>
 </div>
@@ -794,6 +830,11 @@ section {
       <h3>--once</h3>
       <p>Single poll cycle then exit. Fast validation that the full scan works without committing to the monitoring loop.</p>
     </div>
+    <div class="arch-card">
+      <div class="card-icon">🎛️</div>
+      <h3>--test-sniper-phases</h3>
+      <p>Drives N polls straddling the sniper window start. Validates Phase 1 (pre-release no-op, no calendar scans) transitions correctly to Phase 2 (aggressive concurrent scan).</p>
+    </div>
   </div>
   <div class="code-block">
 <span class="comment"># Full validation pipeline after any code change:</span>
@@ -801,6 +842,7 @@ section {
 <span class="highlight">python main.py --test-notify</span>                                <span class="comment"># discord ok?</span>
 <span class="highlight">python main.py --test-booking-flow --test-restaurant benu</span>  <span class="comment"># checkout ok?</span>
 <span class="highlight">python main.py --test-sniper</span>                                <span class="comment"># sniper ok?</span>
+<span class="highlight">python main.py --test-sniper-phases</span>                         <span class="comment"># phase 1/2 transition ok?</span>
 <span class="highlight">python main.py --once</span>                                       <span class="comment"># full scan ok?</span>
   </div>
 </div>
@@ -854,8 +896,8 @@ section {
   <div class="arch-grid">
     <div class="arch-card">
       <div class="card-icon">🎯</div>
-      <h3>Next Friday Sniper</h3>
-      <p>All three critical fixes deployed. Booker selector, sniper timing, and skip cache all validated. Ready for the next release window.</p>
+      <h3>Live Booking Run</h3>
+      <p>All critical fixes deployed and validated. Two-phase sniper, concurrent abort, correct saved-card detection, and checkout polling all confirmed. Waiting for next Friday 8PM release window.</p>
     </div>
     <div class="arch-card">
       <div class="card-icon">🔒</div>
