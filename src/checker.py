@@ -137,6 +137,19 @@ class AvailabilityChecker:
         # failed last poll
         self._skip_dates.clear()
 
+        # ── Two-phase sniper: Phase 1 (pre-release) ──────────────────────────
+        # The sniper window starts 60s before the actual release time.
+        # Scanning calendars before release produces only timeouts and error
+        # counts. Return immediately; Phase 2 (aggressive scan) begins at 60s.
+        if keep_pages and sniper_window_age_sec < 60.0:
+            self.last_errors = 0
+            self.last_checks = 0
+            logger.debug(
+                f"[check] Pre-release phase (age={sniper_window_age_sec:.1f}s) — "
+                "skipping calendar scan until release"
+            )
+            return []
+
         errors: list[int] = [0]   # mutable counter accessible in closure
 
         # Patch _wait_for_calendar to count failures for this poll

@@ -74,3 +74,69 @@ def test_recovery_still_works_post_release():
     for _ in range(3):
         monitor._apply_adaptive_switching(sniper_age=120.0)
     assert monitor._sniper_concurrent is True
+
+
+import pytest
+from unittest.mock import AsyncMock, patch
+
+
+def _make_checker():
+    from src.checker import AvailabilityChecker
+    from src.config import Config
+    from unittest.mock import MagicMock
+
+    config = Config(
+        tock_email="t@t.com", tock_password="pw", restaurant_slug="test",
+        party_size=2, preferred_days=["Friday"], fallback_days=[],
+        preferred_time="17:00", scan_weeks=4, dry_run=True, headless=True,
+        sniper_days=["Friday"], sniper_times=["19:59"], sniper_duration_min=11,
+        sniper_interval_sec=3, release_window_days=["Monday"],
+        release_window_start="09:00", release_window_end="11:00",
+        debug_screenshots=False, discord_webhook_url="", card_cvc="",
+    )
+    browser = MagicMock()
+    tracker = MagicMock()
+    tracker.record_deferred = MagicMock()
+    tracker.record = MagicMock()
+    return AvailabilityChecker(config, browser, tracker)
+
+
+@pytest.mark.asyncio
+async def test_pre_release_skips_calendar_scan():
+    """check_all with sniper_age < 60s returns [] without calling _check_date."""
+    checker = _make_checker()
+    with patch.object(checker, '_check_date', new_callable=AsyncMock) as mock_check:
+        result = await checker.check_all(
+            concurrent=True,
+            keep_pages=True,
+            sniper_window_age_sec=30.0,
+        )
+    assert result == []
+    mock_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pre_release_resets_error_counters():
+    """Pre-release return clears last_errors and last_checks (no phantom errors)."""
+    checker = _make_checker()
+    checker.last_errors = 99
+    checker.last_checks = 99
+    with patch.object(checker, '_check_date', new_callable=AsyncMock):
+        await checker.check_all(
+            concurrent=True, keep_pages=True, sniper_window_age_sec=10.0
+        )
+    assert checker.last_errors == 0
+    assert checker.last_checks == 0
+
+
+@pytest.mark.asyncio
+async def test_post_release_proceeds_to_scan():
+    """check_all with sniper_age >= 60s calls _check_date (normal aggressive mode)."""
+    checker = _make_checker()
+    with patch.object(checker, '_check_date', new_callable=AsyncMock, return_value=[]) as mock_check:
+        await checker.check_all(
+            concurrent=True,
+            keep_pages=True,
+            sniper_window_age_sec=61.0,
+        )
+    assert mock_check.call_count > 0
