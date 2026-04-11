@@ -262,7 +262,7 @@ class AvailabilityChecker:
 
     async def _check_date(
         self, target_date: date, keep_page: bool = False,
-        abort_event: "asyncio.Event | None" = None,
+        abort_event: asyncio.Event | None = None,
     ) -> list[AvailableSlot]:
         """
         Load the Tock search page for target_date, verify the day is

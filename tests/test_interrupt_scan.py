@@ -1,8 +1,6 @@
 """Tests for first-slot interrupt during concurrent sniper scanning."""
-import asyncio
 import pytest
-from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from src.checker import AvailabilityChecker, AvailableSlot
 from src.config import Config
@@ -51,9 +49,10 @@ async def test_abort_event_passed_in_sniper_concurrent_mode():
 async def test_remaining_tasks_see_abort_event_after_first_slot():
     """After one date finds a slot and sets the event, others see it and return []."""
     checker = _make_checker()
-    first_call = [True]
+    dates_called: list[str] = []
 
     async def fake_check_date(target_date, keep_page=False, abort_event=None):
+        dates_called.append(target_date.isoformat())
         if abort_event is not None and abort_event.is_set():
             return []
         slot = AvailableSlot(
@@ -70,7 +69,8 @@ async def test_remaining_tasks_see_abort_event_after_first_slot():
             concurrent=True, keep_pages=True, sniper_window_age_sec=90.0
         )
 
-    assert len(result) >= 1
+    # Only 1 slot should be returned: tasks that saw the event set returned []
+    assert len(result) == 1, f"Expected 1 slot (abort stopped others), got {len(result)}"
     assert result[0].slot_time == "5:00 PM"
 
 
