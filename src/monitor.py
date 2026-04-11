@@ -297,40 +297,7 @@ class TockMonitor:
             return
 
         # --- Adaptive sniper mode switching ---
-        if self._sniper_active and self.checker.last_checks > 0:
-            rate = self.checker.last_errors / self.checker.last_checks
-            self._sniper_error_window.append(rate)
-            if len(self._sniper_error_window) > self._SNIPER_WINDOW_SIZE:
-                self._sniper_error_window.pop(0)
-            rolling_rate = sum(self._sniper_error_window) / len(self._sniper_error_window)
-
-            if self._sniper_concurrent and rolling_rate > self._SNIPER_ERROR_THRESH:
-                self._sniper_concurrent = False
-                self._sniper_sequential_clean = 0
-                logger.warning(
-                    f"[sniper] Concurrent error rate {rolling_rate:.0%} > "
-                    f"{self._SNIPER_ERROR_THRESH:.0%} threshold — "
-                    f"switching to SEQUENTIAL mode"
-                )
-            elif not self._sniper_concurrent:
-                if rate == 0.0:
-                    self._sniper_sequential_clean += 1
-                else:
-                    self._sniper_sequential_clean = 0
-                if self._sniper_sequential_clean >= self._SNIPER_RECOVER_POLLS:
-                    self._sniper_concurrent = True
-                    self._sniper_error_window.clear()
-                    self._sniper_sequential_clean = 0
-                    logger.info(
-                        f"[sniper] {self._SNIPER_RECOVER_POLLS} clean sequential polls "
-                        f"— switching back to CONCURRENT mode"
-                    )
-            else:
-                logger.debug(
-                    f"[sniper] {'concurrent' if self._sniper_concurrent else 'sequential'} "
-                    f"error rate this poll: {rate:.0%} "
-                    f"(rolling {rolling_rate:.0%})"
-                )
+        self._apply_adaptive_switching(sniper_age)
 
         if not slots:
             self.notifier.no_slots_found()
@@ -376,6 +343,58 @@ class TockMonitor:
 
         # Flush any deferred tracker writes (sniper mode defers disk I/O)
         self.tracker.flush_deferred()
+
+    def _apply_adaptive_switching(self, sniper_age: float) -> None:
+        """Update concurrent/sequential mode based on rolling error rate.
+
+        Only applies AFTER the release time has passed (sniper_age >= 60s).
+        The sniper window starts 1 minute before release; errors in the first
+        60s are expected (sold-out state) and must not count toward degradation.
+        """
+        if not self._sniper_active:
+            return
+        if self.checker.last_checks <= 0:
+            return
+        if sniper_age < 60.0:
+            logger.debug(
+                f"[sniper] Pre-release (age={sniper_age:.1f}s) — "
+                "ignoring errors for adaptive switching"
+            )
+            return
+
+        rate = self.checker.last_errors / self.checker.last_checks
+        self._sniper_error_window.append(rate)
+        if len(self._sniper_error_window) > self._SNIPER_WINDOW_SIZE:
+            self._sniper_error_window.pop(0)
+        rolling_rate = sum(self._sniper_error_window) / len(self._sniper_error_window)
+
+        if self._sniper_concurrent and rolling_rate > self._SNIPER_ERROR_THRESH:
+            self._sniper_concurrent = False
+            self._sniper_sequential_clean = 0
+            logger.warning(
+                f"[sniper] Concurrent error rate {rolling_rate:.0%} > "
+                f"{self._SNIPER_ERROR_THRESH:.0%} threshold — "
+                f"switching to SEQUENTIAL mode"
+            )
+        elif not self._sniper_concurrent:
+            if rate == 0.0:
+                self._sniper_sequential_clean += 1
+            else:
+                self._sniper_sequential_clean = 0
+            if self._sniper_sequential_clean >= self._SNIPER_RECOVER_POLLS:
+                self._sniper_concurrent = True
+                self._sniper_error_window.clear()
+                self._sniper_sequential_clean = 0
+                logger.info(
+                    f"[sniper] {self._SNIPER_RECOVER_POLLS} clean sequential polls "
+                    f"— switching back to CONCURRENT mode"
+                )
+        else:
+            logger.debug(
+                f"[sniper] {'concurrent' if self._sniper_concurrent else 'sequential'} "
+                f"error rate this poll: {rate:.0%} "
+                f"(rolling {rolling_rate:.0%})"
+            )
 
     # ------------------------------------------------------------------
     # Scheduling
