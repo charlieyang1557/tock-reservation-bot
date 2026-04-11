@@ -1,5 +1,4 @@
 """Tests for sniper phase logic: pre-release error gating and two-phase scan."""
-import pytest
 from unittest.mock import MagicMock
 
 
