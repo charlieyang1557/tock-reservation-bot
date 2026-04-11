@@ -700,6 +700,8 @@ async def test_sniper_phases(
             phase = "PRE-WINDOW (not in sniper)"
 
         logger.info(f"[test-sniper-phases] ── Poll {i}/{num_polls} [{phase}] ──")
+        monitor._sniper_active = in_window
+        monitor._sniper_concurrent = in_window
         await monitor.poll()
         await asyncio.sleep(3)
 

@@ -596,7 +596,11 @@ class TockBooker:
             if el:
                 return True
             el2 = await page.query_selector(sel.get("saved_payment_card"))
-            return el2 is not None
+            if el2 is not None:
+                return True
+            # Fallback: CVC input visible ⇒ saved card present ⇒ payment needed
+            cvc_el = await self.browser.find_in_frames(page, sel.get("cvc_input"))
+            return cvc_el is not None
         except Exception:
             return False
 
@@ -616,10 +620,19 @@ class TockBooker:
             logger.debug("[book] CVC field not found on page (may not be required).")
 
     async def _has_saved_card(self, page: Page) -> bool:
-        """True if a saved payment card widget is visible."""
+        """True if a saved payment card widget is visible.
+
+        Tock only renders the CVC re-entry field when a card is already on
+        file, so CVC presence is used as a reliable fallback when the
+        saved-card widget selector doesn't match.
+        """
         try:
             el = await page.query_selector(sel.get("saved_payment_card"))
-            return el is not None
+            if el is not None:
+                return True
+            # Fallback: CVC input visible ⇒ card is on file
+            cvc_el = await self.browser.find_in_frames(page, sel.get("cvc_input"))
+            return cvc_el is not None
         except Exception:
             return False
 
