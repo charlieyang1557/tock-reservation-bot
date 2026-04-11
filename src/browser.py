@@ -90,7 +90,16 @@ class TockBrowser:
         """Launch the browser and restore saved session cookies if available."""
         self._playwright = await async_playwright().start()
 
+        # Always use Playwright's own bundled Chromium — never the system Chrome.
+        # Passing executable_path explicitly prevents any environment variable
+        # (e.g. PLAYWRIGHT_BROWSERS_PATH, CHROME_PATH) from accidentally
+        # redirecting to a system-managed browser that could conflict with
+        # Playwright's CDP protocol or user-profile state.
+        chromium_executable = self._playwright.chromium.executable_path
+        logger.info(f"[browser] Chromium executable: {chromium_executable}")
+
         self._browser = await self._playwright.chromium.launch(
+            executable_path=chromium_executable,
             headless=self.config.headless,
             args=[
                 "--no-sandbox",
