@@ -44,6 +44,17 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.exploretock.com"
 
+# Selectors that match generic "Book" buttons (restaurant/experience level, not time-slot).
+# These must only be clicked if surrounding context confirms the target time.
+_GENERIC_BOOK_SELECTORS: frozenset[str] = frozenset({
+    'button:visible:has-text("Book")',
+    'button:text("Book now")',
+    'a:text("Book now")',
+    '[data-testid="book-now"]',
+    "button.SearchExperience-bookButton",
+    "[data-testid='book-button']",
+})
+
 # How long to wait for the user to add a payment card (Tock holds slots ~10 min)
 PAYMENT_WAIT_TIMEOUT_SEC = 540   # 9 minutes
 PAYMENT_POLL_INTERVAL_SEC = 15
@@ -175,7 +186,12 @@ class TockBooker:
             if not await self._click_time_slot(page, slot):
                 return False
 
-            # _wait_for_checkout handles the timing — no need for a blind tick
+            # Scroll to bottom so the confirm button (which may be below the fold
+            # on a 800px viewport) becomes accessible before checkout detection.
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                pass  # non-critical — proceed regardless
 
             # ── Step 4: wait for checkout page ────────────────────────
             if booking_won.is_set():
@@ -291,16 +307,23 @@ class TockBooker:
         locator = page.locator(matched_selector)
         count = await locator.count()
         target_time = slot.slot_time.strip().upper()
+        is_generic = matched_selector in _GENERIC_BOOK_SELECTORS
 
         best_btn = None
         for i in range(count):
             btn = locator.nth(i)
             try:
                 text = (await btn.text_content() or "").strip()
+
+                # Exact time match in button text → click immediately
                 if target_time in text.upper():
                     await btn.click()
-                    logger.info(f"[book] Clicked slot button matching '{slot.slot_time}': {text}")
+                    logger.info(
+                        f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
+                    )
                     return True
+
+                # Regex time match in button text
                 time_match = re.search(
                     r'\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b', text, re.IGNORECASE
                 )
@@ -308,49 +331,116 @@ class TockBooker:
                     await btn.click()
                     logger.info(f"[book] Clicked slot button (regex match): {text}")
                     return True
+
+                # Generic "Book" button: only click if parent container has target time.
+                # This prevents clicking the restaurant-level "Book now" button by mistake.
+                if is_generic:
+                    try:
+                        parent_text = (
+                            await btn.locator("..").text_content() or ""
+                        ).strip()
+                    except Exception:
+                        parent_text = ""
+                    if target_time in parent_text.upper() or re.search(
+                        r'\b' + re.escape(slot.slot_time) + r'\b',
+                        parent_text, re.IGNORECASE
+                    ):
+                        await btn.click()
+                        logger.info(
+                            f"[book] Clicked generic 'Book' button — "
+                            f"time confirmed in parent: {parent_text[:80]!r}"
+                        )
+                        return True
+                    logger.debug(
+                        f"[book] Generic button at index {i} skipped — "
+                        f"no time match in parent: {parent_text[:80]!r}"
+                    )
+                    continue  # do NOT set best_btn for unmatched generic buttons
+
                 if best_btn is None:
                     best_btn = btn
             except Exception:
                 continue
 
-        # Fallback: click first button
+        # Fallback: click first non-generic button (only reached for specific selectors)
         if best_btn is not None:
             try:
                 text = (await best_btn.text_content() or "").strip()
                 await best_btn.click()
                 logger.warning(
                     f"[book] No exact time match for '{slot.slot_time}' — "
-                    f"clicked first button: {text}"
+                    f"clicked first specific button: {text}"
                 )
                 return True
             except Exception as e:
                 logger.error(f"[book] Could not click fallback slot button: {e}")
                 return False
 
-        logger.error("[book] No slot buttons could be clicked")
+        logger.error(
+            f"[book] No clickable slot button found for '{slot.slot_time}' "
+            f"(selector: {matched_selector!r})"
+        )
         return False
 
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
-        """Return True when the checkout/booking-details page is detected."""
+        """Return True when the checkout/booking-details page is detected.
+
+        Polls every 2s for up to 30s, checking three signals in order:
+          1. checkout_container selector present
+          2. URL contains /checkout, /reservation, or /book
+          3. Any payment-related element present (saved card or add-card prompt)
+        """
         key = "checkout_container"
         selector = sel.get(key)
-        try:
-            await page.wait_for_selector(selector, timeout=20000)
-            logger.info(f"[book] Checkout page loaded for {slot.slot_date_str}.")
-            return True
-        except Exception as e:
-            # URL-based fallback
+        no_pay_sel = sel.get("no_payment_indicator")
+        saved_card_sel = sel.get("saved_payment_card")
+        total_wait = 30
+        interval = 2
+
+        for elapsed in range(0, total_wait, interval):
+            # 1. Checkout container selector
+            try:
+                await page.wait_for_selector(selector, timeout=interval * 1000)
+                logger.info(
+                    f"[book] Checkout page loaded for {slot.slot_date_str} "
+                    f"(+{elapsed}s)"
+                )
+                return True
+            except Exception:
+                pass
+
+            # 2. URL-based detection
             url = page.url
             if any(p in url for p in ("/checkout", "/reservation", "/book")):
                 logger.info(f"[book] Checkout detected via URL: {url}")
                 return True
-            logger.error(
-                f"SELECTOR_FAILED: key='{key}'  selector={selector!r}\n"
-                f"  Checkout page not detected after clicking time slot.\n"
-                f"  Current URL: {url}\n"
-                f"  → Update src/selectors.py  Error: {e}"
+
+            # 3. Payment element detection
+            try:
+                pay_el = await page.query_selector(no_pay_sel)
+                if pay_el is None:
+                    pay_el = await page.query_selector(saved_card_sel)
+                if pay_el:
+                    logger.info(
+                        f"[book] Checkout detected via payment element "
+                        f"at +{elapsed + interval}s"
+                    )
+                    return True
+            except Exception:
+                pass
+
+            logger.debug(
+                f"[book] Waiting for checkout… {elapsed + interval}s / {total_wait}s"
             )
-            return False
+
+        url = page.url
+        logger.error(
+            f"SELECTOR_FAILED: key='{key}'  selector={selector!r}\n"
+            f"  Checkout page not detected after {total_wait}s.\n"
+            f"  Current URL: {url}\n"
+            f"  → Update src/selectors.py"
+        )
+        return False
 
     async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
         """
