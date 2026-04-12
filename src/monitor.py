@@ -286,10 +286,12 @@ class TockMonitor:
                         break
 
         try:
+            bypass_normal_skip = self._sniper_active or self._in_release_window()
             slots = await self.checker.check_all(
                 concurrent=use_concurrent,
                 keep_pages=self._sniper_active,
                 sniper_window_age_sec=sniper_age,
+                bypass_normal_skip=bypass_normal_skip,
             )
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
@@ -415,6 +417,17 @@ class TockMonitor:
     # ------------------------------------------------------------------
     # Scheduling
     # ------------------------------------------------------------------
+
+    def _in_release_window(self) -> bool:
+        now = datetime.now(PT)
+        day_name = now.strftime("%A")
+        t = now.time()
+        release_start = parse_time(self.config.release_window_start)
+        release_end = parse_time(self.config.release_window_end)
+        return (
+            day_name in self.config.release_window_days
+            and release_start <= t <= release_end
+        )
 
     def _get_poll_interval(self) -> int:
         """

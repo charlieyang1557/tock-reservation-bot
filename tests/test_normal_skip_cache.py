@@ -101,3 +101,42 @@ class TestNormalSkipCache:
         # Re-add should refresh the TTL
         checker._add_to_normal_skip("2026-04-18")
         assert checker._should_skip_normal("2026-04-18") is True
+
+
+def _make_checker() -> AvailabilityChecker:
+    return AvailabilityChecker(_make_config(), MagicMock(), MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_normal_skip_bypassed_during_release_window():
+    """Normal skip cache must NOT suppress checks during the release window."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from datetime import date as _date
+
+    checker = _make_checker()
+    target = _date(2026, 4, 20)
+    date_str = target.isoformat()
+
+    # Pre-populate normal skip cache for this date
+    checker._add_to_normal_skip(date_str)
+    assert checker._should_skip_normal(date_str), "pre-condition: date is cached"
+
+    # _check_date with bypass_normal_skip=True must NOT return early
+    # We verify by checking that it at least attempts navigation
+    page = AsyncMock()
+    page.goto = AsyncMock(return_value=None)
+    page.url = "https://www.exploretock.com/test/search"
+    page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    page.query_selector = AsyncMock(return_value=None)
+    page.close = AsyncMock()
+
+    with patch.object(checker.browser, "new_page", AsyncMock(return_value=page)):
+        result = await checker._check_date(
+            target_date=target,
+            keep_page=False,
+            abort_event=None,
+            bypass_normal_skip=True,
+        )
+
+    # If bypass worked, page.goto should have been called (not early-returned)
+    page.goto.assert_called_once()

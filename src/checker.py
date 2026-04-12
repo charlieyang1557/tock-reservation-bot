@@ -195,6 +195,7 @@ class AvailabilityChecker:
         concurrent: bool = False,
         keep_pages: bool = False,
         sniper_window_age_sec: float = 0,
+        bypass_normal_skip: bool = False,
     ) -> list[AvailableSlot]:
         """
         Scan for available slots in two phases:
@@ -259,11 +260,23 @@ class AvailabilityChecker:
                     # In sniper mode, create an abort event: the first date to find
                     # slots signals others to stop early via abort_event.set().
                     abort_evt = _asyncio.Event() if keep_pages else None
-                    results = await _asyncio.gather(
-                        *[
+                    if bypass_normal_skip:
+                        check_calls = [
+                            self._check_date(
+                                d,
+                                keep_page=keep_pages,
+                                abort_event=abort_evt,
+                                bypass_normal_skip=bypass_normal_skip,
+                            )
+                            for d in dates
+                        ]
+                    else:
+                        check_calls = [
                             self._check_date(d, keep_page=keep_pages, abort_event=abort_evt)
                             for d in dates
-                        ],
+                        ]
+                    results = await _asyncio.gather(
+                        *check_calls,
                         return_exceptions=True,
                     )
                     slots: list[AvailableSlot] = []
@@ -280,7 +293,14 @@ class AvailabilityChecker:
                 else:
                     slots = []
                     for d in dates:
-                        result = await self._check_date(d, keep_page=keep_pages)
+                        if bypass_normal_skip:
+                            result = await self._check_date(
+                                d,
+                                keep_page=keep_pages,
+                                bypass_normal_skip=bypass_normal_skip,
+                            )
+                        else:
+                            result = await self._check_date(d, keep_page=keep_pages)
                         slots.extend(result)
                         if result and keep_pages:
                             logger.info(
@@ -348,6 +368,7 @@ class AvailabilityChecker:
     async def _check_date(
         self, target_date: date, keep_page: bool = False,
         abort_event: asyncio.Event | None = None,
+        bypass_normal_skip: bool = False,
     ) -> list[AvailableSlot]:
         """
         Load the Tock search page for target_date, verify the day is
@@ -366,7 +387,7 @@ class AvailabilityChecker:
         # Normal-mode skip: date was not visible in calendar on a recent poll.
         # Skip for NORMAL_SKIP_TTL_SEC (20 min) to avoid ~15s calendar timeout
         # per date per poll cycle when dates are beyond the booking window.
-        if not keep_page and self._should_skip_normal(date_str):
+        if not keep_page and not bypass_normal_skip and self._should_skip_normal(date_str):
             logger.debug(f"[check] {date_str} — skipped (normal cache: not in calendar recently)")
             return []
 
