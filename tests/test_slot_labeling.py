@@ -14,7 +14,7 @@ import pytest
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock
 
-from src.checker import AvailabilityChecker, AvailableSlot
+from src.checker import AvailabilityChecker
 
 
 def _make_checker():
@@ -53,11 +53,14 @@ def _btn(*, text="", aria_label="", title="", parent_text="",
     # Parent / grandparent / great-grandparent text
     ancestors = [parent_text, grandparent_text, great_grandparent_text]
 
+    # Closure-state for ancestor-walk depth (list-cell idiom — avoids
+    # assigning attributes to a function, which type checkers flag)
+    depth_state = [0]
+
     def locator_factory(selector: str):
         if selector == "..":
-            # Return a chained locator that walks up; track depth via attribute
-            depth = getattr(locator_factory, "_depth", 0) + 1
-            locator_factory._depth = depth
+            depth_state[0] += 1
+            depth = depth_state[0]
             anc = AsyncMock()
             anc.text_content = AsyncMock(
                 return_value=ancestors[depth - 1] if depth <= 3 else ""
@@ -67,7 +70,6 @@ def _btn(*, text="", aria_label="", title="", parent_text="",
         # time_span selector — return the prepared time_span mock
         return time_span
 
-    locator_factory._depth = 0
     btn.locator = MagicMock(side_effect=locator_factory)
     return btn
 
