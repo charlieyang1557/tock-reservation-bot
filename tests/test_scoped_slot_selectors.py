@@ -25,7 +25,7 @@ def _make_checker():
 
 
 @pytest.mark.asyncio
-async def test_collect_only_buttons_inside_container():
+async def test_collect_only_buttons_inside_container(monkeypatch):
     """If slots_container is present, only buttons inside it are collected."""
     checker = _make_checker()
 
@@ -68,7 +68,7 @@ async def test_collect_only_buttons_inside_container():
 
     # Pre-resolve the container-finder selector by registering it
     import src.selectors as sel_mod
-    sel_mod.SELECTORS["slots_container"] = "div.results-list"
+    monkeypatch.setitem(sel_mod.SELECTORS, "slots_container", "div.results-list")
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
@@ -80,7 +80,7 @@ async def test_collect_only_buttons_inside_container():
 
 
 @pytest.mark.asyncio
-async def test_falls_back_to_page_when_container_missing():
+async def test_falls_back_to_page_when_container_missing(monkeypatch):
     """If slots_container is not present, falls back to page-wide collection."""
     checker = _make_checker()
 
@@ -108,11 +108,14 @@ async def test_falls_back_to_page_when_container_missing():
     page.locator = MagicMock(side_effect=page_locator)
 
     import src.selectors as sel_mod
-    sel_mod.SELECTORS["slots_container"] = "div.results-list"
+    monkeypatch.setitem(sel_mod.SELECTORS, "slots_container", "div.results-list")
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
         'button:visible:has-text("Book")'
     )
     # Falls back to page-wide collection when container missing
-    assert len(slots) >= 0  # behavior preserved (no regression)
+    assert len(slots) == 1, (
+        f"Expected fallback path to yield 1 slot from page-wide collection; got {slots}"
+    )
+    assert slots[0].slot_time.upper() == "5:00 PM"

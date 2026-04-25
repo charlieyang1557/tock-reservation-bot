@@ -773,11 +773,15 @@ class AvailabilityChecker:
             try:
                 if await container_finder.count() > 0:
                     scoped_root = container_finder.first
-            except Exception:
+            except Exception as exc:
+                logger.debug(
+                    f"[check] {target_date.isoformat()} — container count() raised "
+                    f"{type(exc).__name__}: {exc}; falling back to page-wide"
+                )
                 scoped_root = None
 
             if scoped_root is None:
-                logger.warning(
+                logger.debug(
                     f"[check] {target_date.isoformat()} — "
                     f"slots_container not found; falling back to page-wide "
                     f"collection (selector key: 'slots_container')"
