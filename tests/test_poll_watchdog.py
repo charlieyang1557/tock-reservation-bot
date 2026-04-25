@@ -27,14 +27,17 @@ def test_normal_rate_no_trip():
 
 def test_burst_above_threshold_trips():
     """≥10 ticks within 5 seconds must trip the watchdog."""
-    watchdog = PollWatchdog(burst_threshold=10, window_sec=5.0)
+    watchdog = PollWatchdog(burst_threshold=10, window_sec=5.0, throttle_sec=0.0)
     trips = _drain(watchdog, 15)  # 15 immediate ticks
     assert trips >= 1, f"Expected ≥1 trip from burst of 15, got {trips}"
 
 
 def test_third_trip_within_60s_escalates_to_exit():
     """Three trips within 60s must raise SystemExit (escalation policy)."""
-    watchdog = PollWatchdog(burst_threshold=5, window_sec=2.0, escalation_window_sec=60.0)
+    watchdog = PollWatchdog(
+        burst_threshold=5, window_sec=2.0,
+        escalation_window_sec=60.0, throttle_sec=0.0,
+    )
 
     # First trip: warn + throttle
     for _ in range(10):
@@ -62,7 +65,10 @@ def test_third_trip_within_60s_escalates_to_exit():
 
 def test_old_trips_age_out():
     """Trips older than escalation_window must not count toward escalation."""
-    watchdog = PollWatchdog(burst_threshold=5, window_sec=2.0, escalation_window_sec=0.5)
+    watchdog = PollWatchdog(
+        burst_threshold=5, window_sec=2.0,
+        escalation_window_sec=0.5, throttle_sec=0.0,
+    )
 
     # Trip once
     for _ in range(10):

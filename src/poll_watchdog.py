@@ -24,6 +24,16 @@ class WatchdogTrip(Exception):
 
 
 class PollWatchdog:
+    """Detects pathological poll bursts and escalates on repeat offenses.
+
+    Each ``tick()`` records the current time. If ``burst_threshold`` ticks
+    fall within the last ``window_sec`` seconds, ``tick()`` raises
+    ``WatchdogTrip`` and sleeps ``throttle_sec`` to break tight loops in
+    the caller. The third trip within ``escalation_window_sec`` calls
+    ``sys.exit(3)`` so the operator (or process supervisor) can restart
+    from a clean state.
+    """
+
     def __init__(
         self,
         burst_threshold: int = 10,
@@ -37,7 +47,11 @@ class PollWatchdog:
         self._throttle_sec = throttle_sec
         self._timestamps: deque[float] = deque(maxlen=64)
         self._trip_times: deque[float] = deque()  # times of WatchdogTrip
-        self.trip_count: int = 0  # exposed for tests
+
+    @property
+    def trip_count(self) -> int:
+        """Number of trips currently inside the escalation window."""
+        return len(self._trip_times)
 
     def reset_rolling(self) -> None:
         """Clear the rolling timestamp deque (used by tests + after throttling)."""
@@ -61,7 +75,6 @@ class PollWatchdog:
 
         # Burst detected
         self._trip_times.append(now)
-        self.trip_count = len(self._trip_times)
         recent_count = len(self._timestamps)
 
         logger.warning(

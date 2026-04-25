@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import IO
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +46,15 @@ def _read_holder_pid(lock_path: str) -> int | None:
         return None
 
 
-def acquire_singleton_lock(lock_path: str = "bot.lock"):
+def acquire_singleton_lock(lock_path: str = "bot.lock") -> IO[str]:
     """
     Acquire an exclusive flock on `lock_path`. Exit non-zero if another live
     process holds the lock. Returns the file handle (caller must keep it
     alive — closing the handle releases the lock).
     """
+    # NOTE: do NOT use a `with` block here — the flock is tied to this file
+    # handle's lifetime, so closing it would release the lock. Caller must
+    # keep the returned handle alive (it's auto-closed at process exit).
     fh = open(lock_path, "a+")
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
