@@ -37,6 +37,7 @@ from src.booker import TockBooker
 from src.checker import AvailabilityChecker
 from src.config import Config, parse_time
 from src.notifier import Notifier
+from src.poll_watchdog import PollWatchdog, WatchdogTrip
 from src.release_detector import CHECK_INTERVAL_MIN, apply_release_schedule, detect_release_time
 from src.tracker import SlotTracker
 
@@ -91,6 +92,10 @@ class TockMonitor:
         # Session pre-warm: fire PREWARM_BEFORE_MIN minutes before each sniper window.
         # Track which window we've already warmed for to avoid repeated calls.
         self._session_prewarmed_for: str | None = None  # "DayName@HH:MM"
+
+        # Watchdog: detect pathological poll bursts (see Apr 14 20:14 incident).
+        # Threshold is well above legitimate sniper rate (~1 poll per 3-4s).
+        self._watchdog = PollWatchdog(burst_threshold=10, window_sec=5.0)
 
     # ------------------------------------------------------------------
     # Public
@@ -261,6 +266,11 @@ class TockMonitor:
 
     async def poll(self) -> None:
         """One full check-and-book cycle."""
+        try:
+            self._watchdog.tick()
+        except WatchdogTrip as e:
+            logger.warning(f"[monitor] Watchdog throttled this poll: {e}")
+            return  # skip this cycle; throttle already slept
         self._poll_count += 1
 
         if self._booking_secured:
