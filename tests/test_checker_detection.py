@@ -135,16 +135,26 @@ class TestCollectSlotsMulti:
         assert slots[0].slot_time == "5:00 PM"
 
     @pytest.mark.asyncio
-    async def test_falls_back_to_slot_number(self):
-        """When no time found anywhere, label as 'Slot 1'."""
+    async def test_drops_slot_when_no_time_found(self):
+        """A3 fix: when no time can be extracted, the slot is NOT emitted.
+        The 'Slot N' fallback was removed because a slot the booker cannot
+        match (no real time string) is worse than no slot (Apr 17 root cause).
+        """
         checker = _make_checker()
         page = AsyncMock()
 
         mock_el = AsyncMock()
         mock_el.text_content = AsyncMock(return_value="Book")
+        mock_el.get_attribute = AsyncMock(return_value=None)  # no aria-label/title
 
         mock_parent = AsyncMock()
         mock_parent.text_content = AsyncMock(return_value="Dinner Book")  # no time
+        # Wire parent.locator() to return an _empty_locator for the slot_time_text
+        # selector and a stub ancestor (no time) for further ".." traversal.
+        no_time_ancestor = AsyncMock()
+        no_time_ancestor.text_content = AsyncMock(return_value="")
+        no_time_ancestor.locator = MagicMock(return_value=no_time_ancestor)
+        mock_parent.locator = MagicMock(return_value=no_time_ancestor)
 
         mock_el.locator = MagicMock(side_effect=lambda sel: (
             mock_parent if sel == ".." else _empty_locator()
@@ -159,8 +169,9 @@ class TestCollectSlotsMulti:
             page, date(2026, 4, 4), 'button:has-text("Book")'
         )
 
-        assert len(slots) == 1
-        assert slots[0].slot_time == "Slot 1"
+        assert slots == [], (
+            f"Slot with no extractable time must be dropped; got {slots}"
+        )
 
     @pytest.mark.asyncio
     async def test_multiple_slots(self):

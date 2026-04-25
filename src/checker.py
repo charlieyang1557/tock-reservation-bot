@@ -749,11 +749,20 @@ class AvailabilityChecker:
     ) -> list[AvailableSlot]:
         """Collect slots using whichever selector matched during detection.
 
-        For Consumer-resultsListItem selectors, extracts time from a child span.
-        For "Book" button selectors, extracts context from surrounding elements
-        or falls back to a generic slot label.
+        Time-extraction priority order:
+          1. Child span matching slot_time_text selector
+          2. Time pattern in parent.text_content()
+          3. Time pattern in any ancestor up to 3 levels deep
+          4. Button's aria-label or title attribute
+          5. Button's own text_content (when not a bare 'Book' / 'Book now')
+
+        If NO source yields a parseable time, the slot is NOT emitted —
+        the 'Slot N' fallback is forbidden because the booker cannot match
+        a slot without a real time string (Apr 17 root cause).
         """
         import re
+
+        time_re = re.compile(r'\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b')
 
         slots: list[AvailableSlot] = []
         try:
@@ -763,34 +772,22 @@ class AvailabilityChecker:
             for i in range(count):
                 el = locator.nth(i)
                 try:
-                    # Try to get time text from various sources
-                    time_text = None
-
-                    # Source 1: Child span with time class (legacy Tock)
-                    time_selector = sel.get("slot_time_text")
-                    time_span = el.locator(time_selector)
-                    if await time_span.count() > 0:
-                        time_text = (await time_span.first.text_content() or "").strip()
-
-                    # Source 2: Look for time pattern in nearby text (parent/sibling)
-                    if not time_text:
-                        # Get the parent container's text for time context
-                        parent = el.locator("..")
-                        parent_text = (await parent.text_content() or "").strip()
-                        # Match common time patterns: "5:00 PM", "8:00 PM", "17:00"
-                        time_match = re.search(
-                            r'\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b', parent_text
+                    time_text = await self._extract_slot_time(el, time_re)
+                    if time_text is None:
+                        # No parseable time — drop this slot (do NOT fabricate).
+                        # Apr 17 lesson: a slot the booker can't book is worse
+                        # than no slot at all.
+                        logger.warning(
+                            f"[check] {target_date.isoformat()} — "
+                            f"slot at index {i} has no extractable time; "
+                            f"skipping (was 'Slot {i + 1}' under old fallback)"
                         )
-                        if time_match:
-                            time_text = time_match.group(1)
-
-                    # Source 3: Fall back to button text or slot number
-                    if not time_text:
-                        btn_text = (await el.text_content() or "").strip()
-                        if btn_text and btn_text.lower() not in ("book", "book now"):
-                            time_text = btn_text
-                        else:
-                            time_text = f"Slot {i + 1}"
+                        if self.config.debug_screenshots:
+                            await self._save_error_screenshot(
+                                page, target_date.isoformat(),
+                                f"slot_no_time_idx{i}"
+                            )
+                        continue
 
                     slots.append(
                         AvailableSlot(
@@ -802,7 +799,9 @@ class AvailabilityChecker:
                 except Exception:
                     continue
         except Exception as e:
-            logger.error(f"[check] {target_date.isoformat()} — slot collection failed: {e}")
+            logger.error(
+                f"[check] {target_date.isoformat()} — slot collection failed: {e}"
+            )
 
         if slots:
             logger.info(
@@ -810,6 +809,69 @@ class AvailabilityChecker:
                 + ", ".join(s.slot_time for s in slots)
             )
         return slots
+
+    async def _extract_slot_time(self, element, time_re) -> str | None:
+        """Try sources 1-5 (see docstring of _collect_slots_multi).
+        Returns the extracted time string, or None when no source matches.
+        """
+        # Source 1: Child span with the standard slot_time_text selector
+        try:
+            time_selector = sel.get("slot_time_text")
+            time_span = element.locator(time_selector)
+            if await time_span.count() > 0:
+                t = (await time_span.first.text_content() or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+
+        # Source 2: Parent text_content
+        try:
+            parent = element.locator("..")
+            parent_text = (await parent.text_content() or "").strip()
+            m = time_re.search(parent_text)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+        # Source 3: Ancestors up to 3 levels above parent
+        try:
+            ancestor = element
+            for _ in range(3):
+                ancestor = ancestor.locator("..")
+                anc_text = (await ancestor.text_content() or "").strip()
+                m = time_re.search(anc_text)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
+
+        # Source 4: aria-label and title attributes
+        for attr in ("aria-label", "title"):
+            try:
+                val = await element.get_attribute(attr)
+                if val:
+                    m = time_re.search(val)
+                    if m:
+                        return m.group(1)
+            except Exception:
+                continue
+
+        # Source 5: Button's own text content, only if not a bare 'Book'
+        try:
+            btn_text = (await element.text_content() or "").strip()
+            if btn_text and btn_text.lower() not in ("book", "book now"):
+                m = time_re.search(btn_text)
+                if m:
+                    return m.group(1)
+                # Some restaurants use "5:00pm" without a space — accept raw text
+                if any(c.isdigit() for c in btn_text) and ":" in btn_text:
+                    return btn_text
+        except Exception:
+            pass
+
+        return None
 
     def _sort_by_preferred_time(
         self, slots: list[AvailableSlot]
