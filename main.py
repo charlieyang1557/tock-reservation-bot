@@ -138,6 +138,10 @@ async def main() -> None:
     _setup_logging()
     logger = logging.getLogger("main")
 
+    # --- Singleton lock — refuse to start if another bot is running ---
+    from src.process_lock import acquire_singleton_lock
+    _bot_lock = acquire_singleton_lock("bot.lock")  # keep handle alive
+
     # --- Config ---
     from src.config import load_config
     try:
