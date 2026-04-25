@@ -6,8 +6,6 @@ import tempfile
 import time
 from pathlib import Path
 
-import pytest
-
 
 def _spawn(lock_path: str, hold_secs: float) -> subprocess.Popen:
     """Spawn a subprocess that acquires the lock and holds it for hold_secs."""
