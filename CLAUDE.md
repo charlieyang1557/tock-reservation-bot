@@ -11,6 +11,7 @@ Automates snagging a reservation at Fuhuihua SF (`fui-hui-hua-san-francisco`) on
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # only needed to run the test suite
 playwright install chromium
 cp .env.example .env   # fill in credentials
 ```
