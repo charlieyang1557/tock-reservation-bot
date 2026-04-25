@@ -35,7 +35,7 @@ class TestGatherExceptionLogging:
             return []
 
         checker._check_date = _mock_check
-        checker._get_target_dates = lambda days=None: [date(2026, 4, 17), date(2026, 4, 24)]
+        checker._get_target_dates = lambda days=None, sniper_mode=False: [date(2026, 4, 17), date(2026, 4, 24)]
 
         await checker.check_all(concurrent=True)
         assert checker.last_errors >= 1
@@ -56,7 +56,7 @@ class TestGatherExceptionLogging:
             return [slot]
 
         checker._check_date = _mock_check
-        checker._get_target_dates = lambda days=None: [date(2026, 4, 17), date(2026, 4, 24)]
+        checker._get_target_dates = lambda days=None, sniper_mode=False: [date(2026, 4, 17), date(2026, 4, 24)]
         checker.tracker = MagicMock()
         checker.tracker.record = MagicMock(return_value=False)
 

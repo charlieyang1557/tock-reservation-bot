@@ -310,10 +310,14 @@ class AvailabilityChecker:
                             break
                     return slots
 
-            preferred_dates = self._get_target_dates(self.config.preferred_days)
+            preferred_dates = self._get_target_dates(
+                self.config.preferred_days, sniper_mode=keep_pages
+            )
             preferred_slots = await _scan_dates(preferred_dates)
 
-            fallback_dates = self._get_target_dates(self.config.fallback_days)
+            fallback_dates = self._get_target_dates(
+                self.config.fallback_days, sniper_mode=keep_pages
+            )
             total_dates = len(preferred_dates) + len(fallback_dates)
 
             if preferred_slots:
@@ -351,13 +355,21 @@ class AvailabilityChecker:
     # Internal
     # ------------------------------------------------------------------
 
-    def _get_target_dates(self, days: list[str] | None = None) -> list[date]:
-        """Dates from tomorrow through SCAN_WEEKS weeks that fall on *days*.
-        Defaults to config.preferred_days when days is None."""
+    def _get_target_dates(
+        self, days: list[str] | None = None, sniper_mode: bool = False
+    ) -> list[date]:
+        """Dates from tomorrow through the active scan horizon that fall on *days*.
+
+        Defaults to config.preferred_days when days is None.
+        When sniper_mode=True, the horizon is capped at config.sniper_scan_weeks
+        (Tock releases at most that many weeks of slots; scanning further out is
+        wasted effort that contributes only to error counts).
+        """
         if days is None:
             days = self.config.preferred_days
+        weeks = self.config.sniper_scan_weeks if sniper_mode else self.config.scan_weeks
         today = date.today()
-        end = today + timedelta(weeks=self.config.scan_weeks)
+        end = today + timedelta(weeks=weeks)
         result = []
         current = today + timedelta(days=1)
         while current <= end:
