@@ -45,8 +45,12 @@ def test_sniper_mode_caps_at_sniper_scan_weeks():
     assert all(d <= horizon for d in dates), (
         f"All dates must be within sniper_scan_weeks=2; got {dates}"
     )
-    # Specifically: no Fridays beyond 2 weeks
-    assert len(dates) <= 3  # at most 2-3 Fridays in a 2-week window
+    # Tight invariant: any 14-day window contains AT MOST 2 Fridays.
+    # The loose <=3 bound used previously could not catch a regression
+    # where sniper_scan_weeks and scan_weeks were accidentally swapped.
+    assert len(dates) <= 2, (
+        f"14-day window must contain ≤2 Fridays; got {len(dates)}: {dates}"
+    )
 
 
 def test_sniper_cap_smaller_than_normal():

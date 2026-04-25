@@ -310,13 +310,18 @@ class AvailabilityChecker:
                             break
                     return slots
 
+            # Sniper mode implies the tighter scan window (Tock releases ≤2 wks).
+            # `keep_pages` is the existing flag that signals sniper mode in this
+            # method — alias it explicitly so future readers don't have to trace
+            # the coupling.
+            sniper_horizon = keep_pages
             preferred_dates = self._get_target_dates(
-                self.config.preferred_days, sniper_mode=keep_pages
+                self.config.preferred_days, sniper_mode=sniper_horizon
             )
             preferred_slots = await _scan_dates(preferred_dates)
 
             fallback_dates = self._get_target_dates(
-                self.config.fallback_days, sniper_mode=keep_pages
+                self.config.fallback_days, sniper_mode=sniper_horizon
             )
             total_dates = len(preferred_dates) + len(fallback_dates)
 
