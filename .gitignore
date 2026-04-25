@@ -43,6 +43,10 @@ session_cookies.json
 slot_tracker.csv
 slot_tracker.json
 
+# === Deployment artifacts (host-specific) ===
+ecosystem.config.js
+logs/
+
 # === Debug artifacts (authenticated page captures) ===
 page_debug*.png
 test_booking_flow.png
