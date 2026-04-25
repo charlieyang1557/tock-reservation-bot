@@ -17,6 +17,31 @@ from unittest.mock import AsyncMock, MagicMock
 from src.checker import AvailabilityChecker
 
 
+def _zero_count_locator() -> MagicMock:
+    """Locator whose count() returns 0 — used to stub the container check."""
+    loc = MagicMock()
+    loc.count = AsyncMock(return_value=0)
+    return loc
+
+
+def _make_page_locator(slot_locator: MagicMock) -> MagicMock:
+    """page.locator side_effect: container selector → count=0 (fallback),
+    anything else → *slot_locator* (the real test locator)."""
+    zero = _zero_count_locator()
+
+    def _side_effect(sel: str) -> MagicMock:
+        # slots_container selector triggers the container-scoping path
+        from src.selectors import SELECTORS
+        container_sel = SELECTORS.get("slots_container", "")
+        if sel == container_sel:
+            return zero
+        return slot_locator
+
+    mock = MagicMock()
+    mock.side_effect = _side_effect
+    return mock
+
+
 def _make_checker():
     from src.config import Config
     config = Config(
@@ -79,11 +104,11 @@ async def test_extracts_from_child_span():
     """Source 1: time in child span wins."""
     checker = _make_checker()
     btn = _btn(time_span_text="5:00 PM", text="ignored")
-    page = MagicMock()
     locator = MagicMock()
     locator.count = AsyncMock(return_value=1)
     locator.nth = MagicMock(return_value=btn)
-    page.locator = MagicMock(return_value=locator)
+    page = MagicMock()
+    page.locator = _make_page_locator(locator)
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17), "button.Consumer-resultsListItem.is-available"
@@ -98,11 +123,11 @@ async def test_extracts_from_aria_label():
     checker = _make_checker()
     btn = _btn(text="Book", aria_label="Book table at 5:30 PM for 2 guests",
                parent_text="Book", grandparent_text="", great_grandparent_text="")
-    page = MagicMock()
     locator = MagicMock()
     locator.count = AsyncMock(return_value=1)
     locator.nth = MagicMock(return_value=btn)
-    page.locator = MagicMock(return_value=locator)
+    page = MagicMock()
+    page.locator = _make_page_locator(locator)
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17), 'button:visible:has-text("Book")'
@@ -118,11 +143,11 @@ async def test_extracts_from_grandparent():
     btn = _btn(text="Book", aria_label="", title="",
                parent_text="Book", grandparent_text="6:00 PM table for 2",
                great_grandparent_text="")
-    page = MagicMock()
     locator = MagicMock()
     locator.count = AsyncMock(return_value=1)
     locator.nth = MagicMock(return_value=btn)
-    page.locator = MagicMock(return_value=locator)
+    page = MagicMock()
+    page.locator = _make_page_locator(locator)
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17), 'button:visible:has-text("Book")'

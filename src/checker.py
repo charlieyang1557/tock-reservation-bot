@@ -765,7 +765,27 @@ class AvailabilityChecker:
 
         slots: list[AvailableSlot] = []
         try:
-            locator = page.locator(matched_selector)
+            # First try to scope to the slots container — prevents global
+            # "Book" buttons from becoming false positives.
+            container_selector = sel.get("slots_container")
+            container_finder = page.locator(container_selector)
+            scoped_root = None
+            try:
+                if await container_finder.count() > 0:
+                    scoped_root = container_finder.first
+            except Exception:
+                scoped_root = None
+
+            if scoped_root is None:
+                logger.warning(
+                    f"[check] {target_date.isoformat()} — "
+                    f"slots_container not found; falling back to page-wide "
+                    f"collection (selector key: 'slots_container')"
+                )
+                locator = page.locator(matched_selector)
+            else:
+                locator = scoped_root.locator(matched_selector)
+
             count = await locator.count()
 
             for i in range(count):

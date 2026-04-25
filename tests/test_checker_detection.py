@@ -48,6 +48,30 @@ def _make_checker(**config_overrides) -> AvailabilityChecker:
     return AvailabilityChecker(cfg, browser, tracker)
 
 
+def _zero_count_locator() -> MagicMock:
+    """Locator whose count() returns 0 — used to stub the container check."""
+    loc = MagicMock()
+    loc.count = AsyncMock(return_value=0)
+    return loc
+
+
+def _make_page_locator(slot_locator: MagicMock) -> MagicMock:
+    """page.locator side_effect: container selector → count=0 (fallback),
+    anything else → *slot_locator* (the real test locator)."""
+    zero = _zero_count_locator()
+
+    def _side_effect(sel: str) -> MagicMock:
+        from src.selectors import SELECTORS
+        container_sel = SELECTORS.get("slots_container", "")
+        if sel == container_sel:
+            return zero
+        return slot_locator
+
+    mock = MagicMock()
+    mock.side_effect = _side_effect
+    return mock
+
+
 def _make_mock_button(text: str):
     """Create a mock Playwright ElementHandle for a calendar day button."""
     btn = AsyncMock()
@@ -108,7 +132,6 @@ class TestCollectSlotsMulti:
     async def test_extracts_time_from_parent_text(self):
         """When parent element contains time like '5:00 PM', extract it."""
         checker = _make_checker()
-        page = AsyncMock()
 
         # Mock locator chain: page.locator(sel) → count=1 → nth(0) → ...
         mock_el = AsyncMock()
@@ -125,7 +148,8 @@ class TestCollectSlotsMulti:
         mock_locator = AsyncMock()
         mock_locator.count = AsyncMock(return_value=1)
         mock_locator.nth = MagicMock(return_value=mock_el)
-        page.locator = MagicMock(return_value=mock_locator)
+        page = MagicMock()
+        page.locator = _make_page_locator(mock_locator)
 
         slots = await checker._collect_slots_multi(
             page, date(2026, 4, 4), 'button:has-text("Book")'
@@ -195,7 +219,8 @@ class TestCollectSlotsMulti:
         mock_locator = AsyncMock()
         mock_locator.count = AsyncMock(return_value=2)
         mock_locator.nth = MagicMock(side_effect=lambda i: [el1, el2][i])
-        page.locator = MagicMock(return_value=mock_locator)
+        page = MagicMock()
+        page.locator = _make_page_locator(mock_locator)
 
         slots = await checker._collect_slots_multi(
             page, date(2026, 4, 4), 'button:has-text("Book")'

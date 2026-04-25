@@ -84,6 +84,16 @@ SELECTORS: dict[str, str] = {
     ),
 
     # --- Time slot results --------------------------------------------------
+    # Wrapping container for time-slot results — used by checker to scope slot
+    # collection so global "Book" buttons (header CTAs, private-event tiles)
+    # cannot become false positives. Multiple commas = OR-of-selectors.
+    "slots_container": (
+        "div.Consumer-resultsList, "
+        "div[role='region'][aria-label*='time'], "
+        "div[data-testid='search-results'], "
+        "div.SearchResults, "
+        "section.search-results"
+    ),
     # Clickable button for an available time slot
     "available_slot_button": "button.Consumer-resultsListItem.is-available",
     # <span> inside a slot button that shows the time text ("5:00 PM")
