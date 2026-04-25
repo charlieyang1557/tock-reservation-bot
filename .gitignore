@@ -37,6 +37,7 @@ run.sh
 # === Bot runtime state (local only) ===
 bot.lock
 bot.log
+bot.log.*
 debug_screenshots/
 session_cookies.json
 slot_tracker.csv

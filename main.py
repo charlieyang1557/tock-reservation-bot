@@ -21,6 +21,7 @@ import asyncio
 import logging
 import sys
 from argparse import ArgumentParser
+from logging.handlers import RotatingFileHandler
 
 from src.testing.booking_flow import test_booking_flow
 from src.testing.sniper_tests import (
@@ -30,15 +31,36 @@ from src.testing.sniper_tests import (
     test_sniper_robustness,
 )
 
+# Rotation policy: 25 MB per file × 5 backups = 125 MB ceiling.
+# Sized to bound disk usage well below the 641 MB observed in production
+# while keeping enough history (~1-2 weeks at single-process write rate)
+# to debug any incident across multiple release windows.
+LOG_MAX_BYTES = 25 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
-def _setup_logging() -> None:
+
+def _setup_logging(
+    log_path: str = "bot.log",
+    max_bytes: int = LOG_MAX_BYTES,
+    backup_count: int = LOG_BACKUP_COUNT,
+) -> None:
     fmt = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     handlers: list[logging.Handler] = [
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        RotatingFileHandler(
+            log_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        ),
     ]
-    logging.basicConfig(level=logging.INFO, format=fmt, datefmt=datefmt, handlers=handlers)
+    # force=True so calling _setup_logging() in tests replaces the prior
+    # handler set (logging.basicConfig is otherwise a no-op after first call).
+    logging.basicConfig(
+        level=logging.INFO, format=fmt, datefmt=datefmt,
+        handlers=handlers, force=True,
+    )
     # Suppress noisy third-party loggers
     logging.getLogger("playwright").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
