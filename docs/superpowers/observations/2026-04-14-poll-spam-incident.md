@@ -19,12 +19,21 @@ rate.
 
 ## Root cause
 
-Root cause not determinable from available logs.
+**Duplicate `python main.py` process — confirmed by direct evidence on the production Mac mini, 2026-04-24.**
 
-However, the observed pattern — hundreds of `Poll #N` lines in ~13 seconds
-accompanied only by `No available slots found this cycle.` — is structurally
-impossible from a single legitimate `monitor.run()` loop.  Evidence from code
-inspection rules out two of the four hypotheses:
+Live `ps` output captured at 2026-04-24 21:43 PT showed two simultaneous bot processes:
+
+```
+  PID  PPID  STARTED                       ELAPSED        COMMAND
+41763 97609  Sun Apr 12 03:57:14 2026    12-17:45:58    /Users/openclaw/miniconda3/bin/python /Users/openclaw/tock-reservation-bot/main.py
+41961     1  Sun Apr 12 03:57:17 2026    12-17:45:55    python main.py
+```
+
+Two `python main.py` instances started **3 seconds apart on 2026-04-12** and have been running concurrently for ~12 days. PID 41961 is reparented to PID 1 (orphaned/detached), suggesting it lost its launching shell. Both processes append to the same `bot.log` via Python's `logging.FileHandler` with no cross-process locking on macOS — `bot.log` had grown to **641 MB** by the time of inspection, consistent with dual-process write amplification.
+
+The original 2026-04-14 20:14 burst could not be reconstructed from the live log slice (the wider `2026-04-14 20:1[34]` grep returned no lines on either `bot.log` or `logs/bot.log` — the 641MB log may have rotated past it, or the timestamp recorded by the user was approximate). However, the duplicate-process state confirmed at the time of investigation makes that historical burst structurally explainable: any time both processes happen to call `notifier.poll_start()` close together, the log shows interleaved `Poll #N` lines at sub-second intervals, which is exactly the pattern reported on 04-14.
+
+Code inspection independently rules out the other three hypotheses:
 
 - **Hypothesis (c) eliminated by code**: `notifier.poll_start()` is called
   exactly once per iteration of `monitor.run()`, immediately before `await
@@ -41,32 +50,17 @@ inspection rules out two of the four hypotheses:
 - **Hypothesis (d) not applicable**: No shell wrapper or subprocess spawner
   exists in the codebase; `main.py` uses a direct `asyncio.run(main())` call.
 
-- **Hypothesis (a) — duplicate process — is the most consistent explanation**:
-  Two simultaneous `python main.py` processes both append to the same
-  `bot.log` file via Python's `logging.FileHandler` (no cross-process locking
-  on macOS).  Their output would interleave, producing bursts of `Poll #N`
-  lines appearing far faster than any single process could generate them.
-  The two processes would each have their own `_poll_count` (e.g. Process A
-  at poll #1168835 and Process B at poll #N), and their interleaved lines
-  would look like sequential but impossibly fast polls from a single source.
-
-  The high poll number (~1.17 million) is consistent with approximately
-  272 days of continuous uptime at one poll per 20 seconds.  The bot has
-  been running since at least 2026-03-10 (earliest log entry), supporting
-  that the production process could have reached that count.
-
-  The most probable trigger: the user manually started a second
-  `python main.py` instance (e.g., to test a change) without first killing
-  the production process — a scenario that leaves no distinguishing log
-  marker because Python's default logger does not include the OS PID.
-
 ## Implication for Task 2 (watchdog + lock)
 
-Singleton lock alone would have prevented this (duplicate process).
+Singleton lock alone would have prevented this (duplicate process). **This is now a critical, not theoretical, fix** — the production system has been running with two competing bot instances for ~12 days as of 2026-04-24.
 
-A `bot.lock` / `fcntl.flock` pidfile acquired at startup would cause the
-second process to detect the running instance and exit immediately, preventing
-the interleaved-log spam and any risk of a double booking.  The watchdog
-(poll-rate monitor) would catch a future re-entrancy or pathological spin, but
-for the duplicate-process hypothesis a singleton lock is the primary and
-sufficient defense.
+A `bot.lock` / `fcntl.flock` pidfile acquired at startup would cause the second process to detect the running instance and exit immediately, preventing the interleaved-log spam, any risk of a double booking, and the 641MB log-write amplification observed in production.
+
+The watchdog (poll-rate monitor) would catch a future re-entrancy or pathological in-process spin, which the singleton lock cannot detect — both layers remain warranted, but for this specific incident the singleton lock is the primary and sufficient defense.
+
+## Production cleanup needed (independent of code fix)
+
+After Task 2 ships and is deployed to the Mac mini, the operator must:
+1. Kill both running instances (`kill 41763 41961`).
+2. Restart the bot once; the singleton lock will refuse any future second start until the holder exits.
+3. Truncate or rotate the 641 MB `bot.log` (consider adding `RotatingFileHandler` in a follow-up — out of scope for Phase A).
