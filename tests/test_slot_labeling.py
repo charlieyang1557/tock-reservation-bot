@@ -170,7 +170,14 @@ async def test_no_slot_n_label_in_output():
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17), 'button:visible:has-text("Book")'
     )
+    # Primary assertion: with no extractable time on any button, no slots emit.
+    # The "Slot N" fallback would have produced 3 slots — its absence is a 0-len list.
+    assert slots == [], (
+        f"Expected no slots when no time is extractable; got {slots}"
+    )
+    # Defense in depth: even if a future regression emits placeholder slots,
+    # they must never start with 'slot' or 'slot' (with or without space).
     for s in slots:
-        assert not s.slot_time.lower().startswith("slot "), (
-            f"'Slot N' fallback must not appear; got {s.slot_time!r}"
+        assert "slot" not in s.slot_time.lower(), (
+            f"Placeholder label leaked: {s.slot_time!r}"
         )

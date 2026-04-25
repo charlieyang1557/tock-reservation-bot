@@ -15,11 +15,12 @@ import asyncio
 import glob as _glob
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
-from playwright.async_api import Page
+from playwright.async_api import Locator, Page
 
 import src.selectors as sel
 from src.config import Config, parse_time
@@ -760,8 +761,6 @@ class AvailabilityChecker:
         the 'Slot N' fallback is forbidden because the booker cannot match
         a slot without a real time string (Apr 17 root cause).
         """
-        import re
-
         time_re = re.compile(r'\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b')
 
         slots: list[AvailableSlot] = []
@@ -810,7 +809,9 @@ class AvailabilityChecker:
             )
         return slots
 
-    async def _extract_slot_time(self, element, time_re) -> str | None:
+    async def _extract_slot_time(
+        self, element: Locator, time_re: re.Pattern[str]
+    ) -> str | None:
         """Try sources 1-5 (see docstring of _collect_slots_multi).
         Returns the extracted time string, or None when no source matches.
         """
@@ -831,7 +832,7 @@ class AvailabilityChecker:
             parent_text = (await parent.text_content() or "").strip()
             m = time_re.search(parent_text)
             if m:
-                return m.group(1)
+                return re.sub(r"\s+", " ", m.group(1)).strip()
         except Exception:
             pass
 
@@ -843,7 +844,7 @@ class AvailabilityChecker:
                 anc_text = (await ancestor.text_content() or "").strip()
                 m = time_re.search(anc_text)
                 if m:
-                    return m.group(1)
+                    return re.sub(r"\s+", " ", m.group(1)).strip()
         except Exception:
             pass
 
@@ -854,20 +855,22 @@ class AvailabilityChecker:
                 if val:
                     m = time_re.search(val)
                     if m:
-                        return m.group(1)
+                        return re.sub(r"\s+", " ", m.group(1)).strip()
             except Exception:
                 continue
 
-        # Source 5: Button's own text content, only if not a bare 'Book'
+        # Source 5: Button's own text content, only if not a bare 'Book'.
+        # Note: the regex already accepts the no-space "5:00pm" form because
+        # \s* allows zero whitespace. We do NOT fall back to raw text — a
+        # string like "Dinner 5:00" or "5:00 guests" would pass a digit/colon
+        # heuristic but would not match against actual slot button text in
+        # the booker, reintroducing the Apr 17 failure mode.
         try:
             btn_text = (await element.text_content() or "").strip()
             if btn_text and btn_text.lower() not in ("book", "book now"):
                 m = time_re.search(btn_text)
                 if m:
-                    return m.group(1)
-                # Some restaurants use "5:00pm" without a space — accept raw text
-                if any(c.isdigit() for c in btn_text) and ":" in btn_text:
-                    return btn_text
+                    return re.sub(r"\s+", " ", m.group(1)).strip()
         except Exception:
             pass
 
