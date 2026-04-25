@@ -23,7 +23,12 @@ logger = logging.getLogger(__name__)
 
 
 class LockAcquisitionError(SystemExit):
-    """Raised (as SystemExit) when the lock cannot be acquired."""
+    """Raised when the singleton lock cannot be acquired.
+
+    Subclasses ``SystemExit`` so the exception propagates cleanly through
+    ``asyncio.run()`` and ``except Exception`` handlers without being
+    swallowed — the bot exits with the documented status code (default 2).
+    """
 
 
 def _pid_alive(pid: int) -> bool:

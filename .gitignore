@@ -35,11 +35,12 @@ start-claude.sh
 run.sh
 
 # === Bot runtime state (local only) ===
-session_cookies.json
-slot_tracker.json
-slot_tracker.csv
+bot.lock
 bot.log
 debug_screenshots/
+session_cookies.json
+slot_tracker.csv
+slot_tracker.json
 
 # === Debug artifacts (authenticated page captures) ===
 page_debug*.png

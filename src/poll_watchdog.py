@@ -40,7 +40,7 @@ class PollWatchdog:
         window_sec: float = 5.0,
         escalation_window_sec: float = 60.0,
         throttle_sec: float = 2.0,
-    ):
+    ) -> None:
         self._burst_threshold = burst_threshold
         self._window_sec = window_sec
         self._escalation_window_sec = escalation_window_sec

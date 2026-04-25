@@ -112,10 +112,12 @@ monitor.run()
 | `src/config.py` | Single `Config` dataclass; only file that reads `os.getenv` |
 | `src/selectors.py` | All DOM selectors in one `SELECTORS` dict + `--verify` logic |
 | `src/browser.py` | Launch Chromium with stealth, login, cookie persistence, `warm_session()` |
-| `src/checker.py` | Date scanning, calendar interaction, page reuse (`_sniper_pages`) |
+| `src/checker.py` | Date scanning, calendar interaction, page reuse (`_sniper_pages`) + container-scoped slot collection, strict time extraction (no Slot N fallback), sniper_scan_weeks cap |
 | `src/booker.py` | Slot click → checkout → CVC fill → confirm, with retry logic |
-| `src/monitor.py` | Polling loop, sniper scheduling, adaptive mode switching, pre-warm timing |
+| `src/monitor.py` | Polling loop, sniper scheduling, adaptive mode switching, pre-warm timing + poll-rate watchdog escalation |
 | `src/notifier.py` | Console logs + Discord webhook embeds (fire-and-forget async tasks) |
+| `src/poll_watchdog.py` | 3-strike escalation watchdog detecting pathological poll bursts (Apr 14 incident class) |
+| `src/process_lock.py` | Singleton fcntl lock; refuses second instance, reclaims stale locks (PID dead) |
 | `src/release_detector.py` | Scrapes restaurant page for "New reservations will be released on…" text; auto-updates sniper schedule |
 | `src/tracker.py` | Appends detected slots to `slot_tracker.json`/`.csv` for pattern analysis |
 
