@@ -1,7 +1,7 @@
 """Tests for target-date page prewarm (Phase A+2 Task 2)."""
 import asyncio
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.checker import AvailabilityChecker
