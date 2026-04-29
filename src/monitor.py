@@ -29,7 +29,7 @@ All times are evaluated in America/Los_Angeles (PT/PDT automatically).
 
 import asyncio
 import logging
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytz
 
@@ -202,6 +202,23 @@ class TockMonitor:
                 success = await self.browser.warm_session()
                 if success:
                     self._session_prewarmed_for = prewarm_target
+                    # Phase A+2: also pre-open target-date pages so the first
+                    # sniper poll after the window opens does a fast reload()
+                    # instead of a fresh goto() per date.
+                    try:
+                        prewarm_dates = self._get_prewarm_dates()
+                        if prewarm_dates:
+                            logger.info(
+                                f"[monitor] Pre-opening {len(prewarm_dates)} "
+                                f"target-date page(s) for {prewarm_target}"
+                            )
+                            await self.checker.prewarm_target_dates(
+                                prewarm_dates, stagger_sec=30.0
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[monitor] Target-date prewarm failed (non-critical): {e}"
+                        )
                 else:
                     logger.error(
                         f"[monitor] Pre-warm failed for {prewarm_target} — "
@@ -574,6 +591,36 @@ class TockMonitor:
                 return f"{day_name}@{start_str}"
 
         return None
+
+    def _get_prewarm_dates(self) -> list[date]:
+        """Return up to 7 target dates within the next ~10 days to prewarm.
+
+        A single Fuhuihua Friday release covers the upcoming calendar week's
+        active days. If today is Friday T, those are roughly T+5 (Wed) through
+        T+9 (Sun). We extend the lookahead to 10 days so the targeted Fri/Sat/Sun
+        are captured even when the prewarm fires from a non-Friday day.
+
+        Combines preferred_days + fallback_days. Sorted by proximity (closest
+        first) so when the cap of 7 is hit, we naturally take next-week's
+        slots before two-weeks-out slots — those belong to the FOLLOWING
+        Friday's release window, not this one.
+        """
+        days = list(self.config.preferred_days) + list(self.config.fallback_days)
+        if not days:
+            return []
+        today = date.today()
+        # 10-day horizon: covers the upcoming calendar week's release targets
+        # (Wed T+5 through Sun T+9 when prewarm fires on Friday at T-5min).
+        # Beyond 10 days = next release's territory; not this one.
+        end = today + timedelta(days=10)
+        result: list[date] = []
+        current = today + timedelta(days=1)
+        while current <= end:
+            if current.strftime("%A") in days:
+                result.append(current)
+            current += timedelta(days=1)
+        # Cap at 7 (closest first — list is already chronologically sorted)
+        return result[:7]
 
 
 def _sniper_start_dt(now: datetime, start_str: str) -> datetime:

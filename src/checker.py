@@ -191,6 +191,53 @@ class AvailabilityChecker:
         self._skip_dates.clear()
         logger.debug("[check] Sniper pages closed.")
 
+    async def prewarm_target_dates(
+        self,
+        target_dates: list[date],
+        stagger_sec: float = 30.0,
+    ) -> None:
+        """Open one Playwright page per target_date, parked at CALENDAR_LOADED.
+
+        Pages are stored in self._sniper_pages so the existing sniper-poll path
+        picks them up. The first poll after the sniper window opens uses
+        page.reload() (cached), saving ~1-2s vs. a fresh page.goto().
+
+        Pages are opened ONE AT A TIME with stagger_sec between starts to
+        keep the prewarm gentle on Cloudflare/Turnstile (vs. opening all
+        N pages concurrently). Failures on individual dates are logged but
+        do not abort the rest.
+        """
+        for i, target_date in enumerate(target_dates):
+            date_str = target_date.isoformat()
+            url = (
+                f"{BASE_URL}/{self.config.restaurant_slug}/search"
+                f"?date={date_str}"
+                f"&size={self.config.party_size}"
+                f"&time={self.config.preferred_time}"
+            )
+            try:
+                page = await self.browser.new_page()
+                logger.info(f"[prewarm] {date_str} → {url}")
+                await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                # Park at CALENDAR_LOADED (calendar widget rendered)
+                await page.wait_for_selector(
+                    sel.get("calendar_container"), timeout=10000
+                )
+                self._sniper_pages[date_str] = page
+                logger.info(
+                    f"[prewarm] {date_str} parked at CALENDAR_LOADED"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[prewarm] {date_str} failed: {type(e).__name__}: {e}"
+                )
+                # Don't store the failed page — sniper-poll will fall back to
+                # fresh goto() for this date
+
+            # Stagger between page opens (skip after the last one)
+            if i < len(target_dates) - 1 and stagger_sec > 0:
+                await asyncio.sleep(stagger_sec)
+
     async def check_all(
         self,
         concurrent: bool = False,

@@ -1,0 +1,142 @@
+"""Tests for target-date page prewarm (Phase A+2 Task 2)."""
+import asyncio
+from datetime import date
+from unittest.mock import AsyncMock, MagicMock, call, patch
+import pytest
+
+from src.checker import AvailabilityChecker
+
+
+def _make_checker():
+    from src.config import Config
+    config = Config(
+        tock_email="t@t.com", tock_password="pw", restaurant_slug="test",
+        party_size=2, preferred_days=["Friday"], fallback_days=[],
+        preferred_time="17:00", scan_weeks=2, dry_run=True, headless=True,
+        sniper_days=["Friday"], sniper_times=["19:59"], sniper_duration_min=11,
+        sniper_interval_sec=3, release_window_days=["Monday"],
+        release_window_start="09:00", release_window_end="11:00",
+        debug_screenshots=False, discord_webhook_url="", card_cvc="",
+    )
+    browser = MagicMock()
+    browser.new_page = AsyncMock()
+    return AvailabilityChecker(config, browser, MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_prewarm_opens_one_page_per_date():
+    """prewarm_target_dates opens exactly N pages and stores them in _sniper_pages."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3)]
+
+    pages = []
+    async def make_page():
+        p = AsyncMock()
+        p.is_closed = MagicMock(return_value=False)
+        p.goto = AsyncMock()
+        p.wait_for_selector = AsyncMock()
+        pages.append(p)
+        return p
+    checker.browser.new_page = make_page
+
+    # Use stagger=0 to keep the test fast
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+
+    assert len(pages) == 3
+    assert set(checker._sniper_pages.keys()) == {
+        "2026-05-01", "2026-05-02", "2026-05-03"
+    }
+
+
+@pytest.mark.asyncio
+async def test_prewarm_navigates_to_correct_url():
+    """Each prewarmed page navigates to the per-date Tock search URL."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1)]
+    page = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    page.goto = AsyncMock()
+    page.wait_for_selector = AsyncMock()
+    checker.browser.new_page = AsyncMock(return_value=page)
+
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+
+    page.goto.assert_called_once()
+    args = page.goto.call_args
+    url = args.args[0] if args.args else args.kwargs.get("url")
+    assert "date=2026-05-01" in url
+    assert "size=2" in url
+
+
+@pytest.mark.asyncio
+async def test_prewarm_waits_for_calendar_container():
+    """After goto, prewarm waits for the calendar to render (parks at CALENDAR_LOADED)."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1)]
+    page = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    page.goto = AsyncMock()
+    page.wait_for_selector = AsyncMock()
+    checker.browser.new_page = AsyncMock(return_value=page)
+
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+
+    # Confirm wait_for_selector was called (parked at calendar render)
+    assert page.wait_for_selector.called
+
+
+@pytest.mark.asyncio
+async def test_prewarm_failure_does_not_break_other_dates():
+    """If one prewarm fails, others still complete."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3)]
+
+    page_count = [0]
+    pages = []
+    async def make_page():
+        page_count[0] += 1
+        p = AsyncMock()
+        p.is_closed = MagicMock(return_value=False)
+        p.wait_for_selector = AsyncMock()
+        if page_count[0] == 2:
+            p.goto = AsyncMock(side_effect=Exception("fake CF error"))
+        else:
+            p.goto = AsyncMock()
+        pages.append(p)
+        return p
+    checker.browser.new_page = make_page
+
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+
+    # Two pages successfully prewarmed (1st and 3rd); 2nd failed but didn't kill the others
+    assert len(checker._sniper_pages) == 2
+    assert "2026-05-01" in checker._sniper_pages
+    assert "2026-05-03" in checker._sniper_pages
+    assert "2026-05-02" not in checker._sniper_pages
+
+
+@pytest.mark.asyncio
+async def test_prewarm_respects_stagger():
+    """Pages open spread across `stagger_sec` intervals."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3)]
+    page = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    page.goto = AsyncMock()
+    page.wait_for_selector = AsyncMock()
+    checker.browser.new_page = AsyncMock(return_value=page)
+
+    sleep_calls = []
+    real_sleep = asyncio.sleep
+    async def fake_sleep(secs):
+        sleep_calls.append(secs)
+        # Don't actually sleep — keep the test fast
+        await real_sleep(0)
+
+    with patch("src.checker.asyncio.sleep", new=fake_sleep):
+        await checker.prewarm_target_dates(dates, stagger_sec=30)
+
+    # Between 3 dates we expect 2 stagger sleeps of ~30s
+    assert any(s == 30 for s in sleep_calls), (
+        f"Expected at least one stagger sleep of 30s; got {sleep_calls}"
+    )
