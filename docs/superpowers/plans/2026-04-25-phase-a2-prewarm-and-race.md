@@ -14,6 +14,12 @@
 
 **Double-booking:** User explicitly accepts rare double-booking risk to maximize hit rate. The existing `asyncio.Lock` + `asyncio.Event` in `book_best_slot_race` already serializes confirm clicks across all attempted slots — the only way to get a true double-booking is if two confirms succeed before either sets the event, which is a sub-millisecond window.
 
+**Restaurant-specific calibration (Fuhuihua):**
+- Closed Mon/Tue — never prewarm those days.
+- Active days: Wed/Thu/Fri/Sat/Sun.
+- Friday release pattern (per user 2026-04-29): a single Friday-evening release covers the *next calendar week*'s active days. If today is Friday T, the targets are: Wed (T+5), Thu (T+6), Fri (T+7), Sat (T+8), Sun (T+9). Wed/Thu *after* the targeted Friday (T+12, T+13) are NOT in this release — they drop on the FOLLOWING Friday.
+- Empirical check (screenshots 2026-04-29): the search URL `/<slug>/search?date=<future-date>&size=2&time=17:00` renders the calendar widget even for unreleased / sold-out dates (modal shows "not offering reservations" / "sold out" but `calendar_container` selector matches). This makes parking-at-CALENDAR_LOADED reliable for prewarm.
+
 ---
 
 ## File structure
@@ -460,25 +466,35 @@ Add a new method to `TockMonitor` (after `_get_prewarm_target`):
 
 ```python
     def _get_prewarm_dates(self) -> list[date]:
-        """Return up to 7 target dates within the next week to prewarm.
+        """Return up to 7 target dates within the next ~10 days to prewarm.
 
-        Combines preferred_days + fallback_days, capped at 7 entries to keep
-        prewarm under ~3.5 minutes (one page per 30s).
+        A single Fuhuihua Friday release covers the upcoming calendar week's
+        active days. If today is Friday T, those are roughly T+5 (Wed) through
+        T+9 (Sun). We extend the lookahead to 10 days so the targeted Fri/Sat/Sun
+        are captured even when the prewarm fires from a non-Friday day.
+
+        Combines preferred_days + fallback_days. Sorted by proximity (closest
+        first) so when the cap of 7 is hit, we naturally take next-week's
+        slots before two-weeks-out slots — those belong to the FOLLOWING
+        Friday's release window, not this one.
         """
         from datetime import date as _date, timedelta as _td
         days = list(self.config.preferred_days) + list(self.config.fallback_days)
         if not days:
             return []
-        # One week ahead is enough for a single Friday release
         today = _date.today()
-        end = today + _td(weeks=1)
+        # 10-day horizon: covers the upcoming calendar week's release targets
+        # (Wed T+5 through Sun T+9 when prewarm fires on Friday at T-5min).
+        # Beyond 10 days = next release's territory; not this one.
+        end = today + _td(days=10)
         result: list[_date] = []
         current = today + _td(days=1)
-        while current <= end and len(result) < 7:
+        while current <= end:
             if current.strftime("%A") in days:
                 result.append(current)
             current += _td(days=1)
-        return result
+        # Cap at 7 (closest first — list is already chronologically sorted)
+        return result[:7]
 ```
 
 Add `from datetime import date` to the existing `from datetime import datetime, time, timedelta` import in monitor.py if not already present.
@@ -489,8 +505,17 @@ In `.env.example`, find the line `FALLBACK_DAYS=` (or the section for fallback).
 
 ```
 # Fallback days (booked only if no preferred_days slots found).
-# To enable weekday prewarm coverage when releases include Mon-Thu, set:
-# FALLBACK_DAYS=Monday,Tuesday,Wednesday,Thursday
+# Setting fallback days ALSO enables prewarm coverage for those weekdays.
+#
+# Fuhuihua-specific: the restaurant is closed Mon/Tue, so only Wed/Thu are
+# meaningful weekday targets. A single Friday release covers next week's
+# Wed/Thu/Fri/Sat/Sun — Wed/Thu BEFORE the targeted Friday, not after
+# (after = two weeks out, not in this release).
+#
+# Recommended: leave empty for the first observation window so the first
+# run prewarms only the 3 weekend dates (low CF risk). After confirming
+# clean behavior on a real release window, opt in to weekday prewarm:
+#   FALLBACK_DAYS=Wednesday,Thursday
 FALLBACK_DAYS=
 ```
 
