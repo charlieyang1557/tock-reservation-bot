@@ -38,6 +38,7 @@ run.sh
 bot.lock
 bot.log
 bot.log.*
+booking_uncertain.json
 debug_screenshots/
 session_cookies.json
 slot_tracker.csv

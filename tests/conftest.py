@@ -1,5 +1,25 @@
 """Shared pytest fixtures and helpers for Tock bot tests."""
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+_UNCERTAIN_FILE = Path("booking_uncertain.json")
+
+
+@pytest.fixture(autouse=True)
+def _clean_booking_uncertain_file():
+    """Remove booking_uncertain.json before and after every test.
+
+    The disk-persistent soft-win guard (Codex pass 3 fix) writes to this
+    file in the cwd. Without cleanup it would leak between tests and cause
+    book_best_slot_race to refuse to race in tests that don't expect that.
+    Tests that specifically need to test disk persistence use tmp_path and
+    explicitly pass the path; they do not depend on the cwd file.
+    """
+    _UNCERTAIN_FILE.unlink(missing_ok=True)
+    yield
+    _UNCERTAIN_FILE.unlink(missing_ok=True)
 
 
 def _zero_count_locator() -> MagicMock:

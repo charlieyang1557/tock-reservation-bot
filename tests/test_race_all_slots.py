@@ -344,3 +344,147 @@ async def test_real_book_single_confirm_attempted_blocks_second_call():
     assert outcome == BookingOutcome.UNVERIFIED_CONFIRM, (
         f"Soft-win must produce UNVERIFIED_CONFIRM outcome; got {outcome}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex pass 3: HIGH fix regressions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_warm_page_closed_after_booking_failure():
+    """After pop_warm_page transfers ownership to booker, the booker MUST
+    close the page on failure paths — otherwise it leaks (Codex pass 3)."""
+    booker = _make_booker()
+    booker.config.dry_run = False
+
+    fake_page = AsyncMock()
+    fake_page.is_closed = MagicMock(return_value=False)
+    fake_page.close = AsyncMock()
+    fake_page.evaluate = AsyncMock()
+
+    slot = AvailableSlot(
+        slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"
+    )
+
+    # Simulate a warm-page handoff that fails before reaching confirm
+    async def _fake_click_slot_returns_false(page, slot_arg):
+        return False  # _book_single returns False after this
+
+    booker.browser = MagicMock()
+    booker.browser.new_page = AsyncMock()  # not used — warm path
+
+    booking_won = asyncio.Event()
+    with patch.object(booker, "_click_time_slot", side_effect=_fake_click_slot_returns_false), \
+         patch.object(booker, "_booking_screenshot", AsyncMock()):
+        await booker._book_single(slot, booking_won, warm_page=fake_page)
+
+    # The popped warm page MUST be closed
+    fake_page.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_unverified_confirm_persists_across_booker_instances():
+    """A soft-win writes booking_uncertain.json. A NEW TockBooker (simulating
+    main.py's auto-restart spawning a fresh booker) must read that file and
+    refuse to start any race — Codex pass 3's HIGH 2 fix.
+
+    Strategy: patch read_uncertain directly so we can inject a pre-built
+    UncertainBooking (simulating the file existing on disk) without relying
+    on filesystem path plumbing. The companion test_uncertain_file_round_trip
+    covers the actual read/write/clear disk mechanics.
+    """
+    from src.booking_uncertain import UncertainBooking
+    from src.booker import BookingOutcome
+    from datetime import datetime as _dt
+
+    persisted_booking = UncertainBooking(
+        slot_date_str="2026-05-01",
+        slot_time="5:00 PM",
+        day_of_week="Friday",
+        detected_at_iso=_dt.now().isoformat(),
+    )
+
+    # Booker 2 = simulated post-auto-restart fresh instance (clean in-memory state)
+    booker2 = _make_booker()
+    assert booker2._unverified_confirm_slot is None
+
+    slots = [AvailableSlot(
+        slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"
+    )]
+
+    attempts = []
+
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        attempts.append(slot)
+        return True
+
+    # Patch read_uncertain to return the persisted snapshot — simulates the
+    # disk file existing from a previous run's soft-win
+    with patch("src.booking_uncertain.read_uncertain", return_value=persisted_booking), \
+         patch.object(booker2, "_book_single", side_effect=fake_book_single):
+        outcome, returned_slot = await booker2.book_best_slot_race(slots)
+
+    # Booker 2 MUST refuse to fire any _book_single because the disk file
+    # exists, even though its own in-memory state is clean
+    assert attempts == [], (
+        f"Fresh booker must refuse to race when booking_uncertain.json "
+        f"exists; got {len(attempts)} attempts. Auto-restart bypass detected."
+    )
+    assert outcome == BookingOutcome.UNVERIFIED_CONFIRM
+    assert returned_slot is not None
+    assert returned_slot.slot_date_str == "2026-05-01"
+    assert returned_slot.slot_time == "5:00 PM"
+
+    # Operator clears the file → next race fires normally.
+    # Patch read_uncertain to return None (simulating cleared/absent file).
+    booker3 = _make_booker()
+    attempts2 = []
+
+    async def fake_book_single_2(slot, booking_won, **_kwargs):
+        attempts2.append(slot)
+        booking_won.set()
+        return True
+
+    with patch("src.booking_uncertain.read_uncertain", return_value=None), \
+         patch.object(booker3, "_book_single", side_effect=fake_book_single_2):
+        outcome2, _ = await booker3.book_best_slot_race(slots)
+
+    assert outcome2 == BookingOutcome.CONFIRMED
+    assert len(attempts2) == 1, (
+        "After clearing booking_uncertain.json, booking should resume normally"
+    )
+
+
+def test_uncertain_file_round_trip(tmp_path):
+    """Sanity check on the booking_uncertain module's read/write/clear."""
+    from src.booking_uncertain import (
+        UncertainBooking, clear_uncertain, read_uncertain, write_uncertain,
+    )
+    fake_path = tmp_path / "test.json"
+
+    booking = UncertainBooking(
+        slot_date_str="2026-05-01",
+        slot_time="5:00 PM",
+        day_of_week="Friday",
+        detected_at_iso="2026-04-29T20:00:00",
+    )
+    write_uncertain(booking, path=fake_path)
+    assert fake_path.exists()
+
+    loaded = read_uncertain(path=fake_path)
+    assert loaded == booking
+
+    clear_uncertain(path=fake_path)
+    assert not fake_path.exists()
+    assert read_uncertain(path=fake_path) is None
+
+
+def test_uncertain_file_corrupt_returns_none(tmp_path):
+    """A corrupt booking_uncertain.json doesn't brick the bot — read_uncertain
+    returns None and logs the corruption."""
+    from src.booking_uncertain import read_uncertain
+    fake_path = tmp_path / "test.json"
+    fake_path.write_text("not valid json {{{")
+
+    result = read_uncertain(path=fake_path)
+    assert result is None  # graceful degrade

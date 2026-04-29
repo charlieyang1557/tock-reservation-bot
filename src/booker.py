@@ -133,14 +133,43 @@ class TockBooker:
         if not slots:
             return BookingOutcome.FAILED, None
 
-        # If a previous race already triggered an unverified confirm, do NOT
-        # start another race — that's exactly the double-booking risk Codex
-        # pass 2 caught. The monitor must restart the process to reset.
+        # Persistent uncertain-booking guard. Survives auto-restart, Mac mini
+        # reboots, PM2 restarts. Operator must remove booking_uncertain.json
+        # after verifying on Tock. Codex pass 3 found that the in-memory
+        # _unverified_confirm_slot was erased by main.py's auto-restart loop
+        # (constructs a fresh TockBooker), enabling silent double-booking.
+        from src.booking_uncertain import read_uncertain
+        persisted = read_uncertain()
+        if persisted is not None:
+            logger.warning(
+                f"[book] Refusing to start race — booking_uncertain.json "
+                f"records an unverifiable confirm for "
+                f"{persisted.slot_date_str} ({persisted.day_of_week}) @ "
+                f"{persisted.slot_time}. Verify at "
+                "https://www.exploretock.com/account/reservations and "
+                "remove the file before running again."
+            )
+            from src.checker import AvailableSlot as _AvailableSlot
+            from datetime import date as _date_cls
+            try:
+                slot_date = _date_cls.fromisoformat(persisted.slot_date_str)
+            except ValueError:
+                slot_date = _date_cls.today()  # corrupt; degrade gracefully
+            return (
+                BookingOutcome.UNVERIFIED_CONFIRM,
+                _AvailableSlot(
+                    slot_date=slot_date,
+                    slot_time=persisted.slot_time,
+                    day_of_week=persisted.day_of_week,
+                ),
+            )
+
+        # Fall through: also check the in-memory guard (race within same
+        # process where the file write may have failed).
         if self._unverified_confirm_slot is not None:
             logger.warning(
-                f"[book] Refusing to start race — previous race had "
-                f"unverified confirm for {self._unverified_confirm_slot}. "
-                "Operator must restart the bot after verifying."
+                f"[book] Refusing to start race — previous race in this "
+                f"process had unverified confirm for {self._unverified_confirm_slot}."
             )
             return BookingOutcome.UNVERIFIED_CONFIRM, self._unverified_confirm_slot
 
@@ -209,7 +238,7 @@ class TockBooker:
 
         # Use warm page from checker (sniper mode) or create fresh
         page = warm_page if warm_page and not warm_page.is_closed() else None
-        owns_page = page is None  # only close pages we created
+        owns_page = page is None  # noqa: F841 — kept for readability; close is now unconditional
         if page is None:
             page = await self.browser.new_page()
 
@@ -323,23 +352,35 @@ class TockBooker:
                     return True
 
                 # Click happened but verification failed. Tock may have
-                # accepted the booking silently. Set the session-level flag
-                # AND booking_won so:
-                #   - this race aborts other concurrent slot attempts
-                #   - the next monitor poll sees _unverified_confirm_slot
-                #     and refuses to start another race (Codex pass 2 HIGH)
+                # accepted the booking silently. Set BOTH the in-memory flag
+                # AND write the disk file. The disk file survives main.py's
+                # auto-restart loop (Codex pass 3 finding); the in-memory
+                # flag covers the same-process case where disk write fails.
                 self._unverified_confirm_slot = slot
+                from src.booking_uncertain import (
+                    UncertainBooking, write_uncertain
+                )
+                from datetime import datetime as _dt
+                write_uncertain(UncertainBooking(
+                    slot_date_str=slot.slot_date_str,
+                    slot_time=slot.slot_time,
+                    day_of_week=slot.day_of_week,
+                    detected_at_iso=_dt.now().isoformat(),
+                ))
                 logger.error(
                     f"[book] Confirm clicked for {slot} but verification "
-                    "failed. Possible silent success — operator must verify."
+                    "failed. Possible silent success — operator must verify "
+                    "AND remove booking_uncertain.json before next run."
                 )
                 self.notifier.error(
-                    "Booking confirmation unverifiable",
+                    "⚠️ Booking confirmation unverifiable",
                     f"Clicked confirm for {slot} but could not verify success. "
-                    "Tock MAY have accepted the booking. Check your reservations "
-                    "at https://www.exploretock.com/account/reservations. "
-                    "Bot will idle until you restart the process — even within "
-                    "the current session, no more booking attempts will fire.",
+                    "Tock MAY have accepted the booking. "
+                    "1) Check https://www.exploretock.com/account/reservations "
+                    "2) If no reservation: rm booking_uncertain.json then restart "
+                    "3) If reservation present: keep the file in place; the bot "
+                    "will refuse all future booking attempts. "
+                    "This guard now SURVIVES restart (Codex pass 3 fix).",
                 )
                 booking_won.set()
                 return False
@@ -348,9 +389,16 @@ class TockBooker:
             logger.error(f"[book] Error booking {slot}: {e}")
             return False
         finally:
-            if owns_page:
-                await page.close()
-            # Don't close warm pages — checker manages their lifecycle
+            # After Phase A+2: warm pages are popped from checker ownership
+            # via pop_warm_page() and transferred to this method. The booker
+            # is now responsible for closing them after every attempt — success
+            # OR failure — to prevent the leak Codex pass 3 caught.
+            if page is not None:
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Step helpers
