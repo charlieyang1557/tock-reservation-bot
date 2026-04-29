@@ -46,6 +46,13 @@ MAX_DEBUG_SCREENSHOTS = 50
 # spending ~15s per "day not visible" date on every normal poll cycle.
 NORMAL_SKIP_TTL_SEC = 1200  # 20 minutes
 
+# Cloudflare challenge alert threshold. Strictly greater-than: a rate of
+# exactly 5% (e.g. 1-in-20) does NOT alert; 6%+ does. In a production
+# 7-page prewarm window the smallest non-zero rate is 1/7 ≈ 14% so the
+# strict-vs-equal distinction is academic, but the constant clarifies
+# intent for future maintainers.
+_CF_CHALLENGE_ALERT_THRESHOLD = 0.05
+
 logger = logging.getLogger(__name__)
 
 
@@ -202,7 +209,7 @@ class AvailabilityChecker:
         logger.debug("[check] Sniper pages closed.")
 
     @staticmethod
-    def _is_cloudflare_challenge_page(page) -> bool:
+    def _is_cloudflare_challenge_page(page: Page) -> bool:
         """Return True iff `page.url` looks like a Cloudflare challenge.
 
         Detection signals (any one is sufficient):
@@ -313,11 +320,13 @@ class AvailabilityChecker:
         # Alert via Discord if rate exceeded threshold
         if attempted > 0 and notifier is not None:
             rate = cf_challenges / attempted
-            if rate > 0.05:
+            if rate > _CF_CHALLENGE_ALERT_THRESHOLD:
                 try:
                     notifier.cf_challenge_warning(rate=rate, count=cf_challenges)
                 except Exception as e:
-                    logger.debug(f"[prewarm] cf_challenge_warning failed: {e}")
+                    logger.warning(
+                        f"[prewarm] cf_challenge_warning failed (alert lost): {e}"
+                    )
 
     async def check_all(
         self,

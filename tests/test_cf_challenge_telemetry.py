@@ -20,16 +20,18 @@ def _make_checker():
     return AvailabilityChecker(config, MagicMock(), MagicMock())
 
 
-def _make_page(url: str, has_turnstile: bool = False, is_closed: bool = False):
+def _make_page(url: str):
+    """Build a mock Playwright Page with the given URL.
+
+    Used to test _is_cloudflare_challenge_page (URL-only detection) and
+    the prewarm flow's CF-detection branch.
+    """
     page = AsyncMock()
     page.url = url
     page.goto = AsyncMock()
     page.wait_for_selector = AsyncMock()
-    page.is_closed = MagicMock(return_value=is_closed)
+    page.is_closed = MagicMock(return_value=False)
     page.close = AsyncMock()
-    page.query_selector = AsyncMock(
-        return_value=MagicMock() if has_turnstile else None
-    )
     return page
 
 
@@ -129,8 +131,10 @@ async def test_no_alert_when_challenge_rate_below_threshold():
     notifier = MagicMock()
     checker = _make_checker()
 
-    # 1 challenge out of 30 = ~3.3%, below threshold
-    dates = [date(2026, 5, i + 1) for i in range(30)]
+    # 1 challenge out of 25 = 4.0%, comfortably below the 5% threshold.
+    # 25 still exceeds the production cap of 7, but is closer to a realistic
+    # diagnostic batch a developer might use to verify alert suppression.
+    dates = [date(2026, 5, i + 1) for i in range(25)]
 
     page_count = [0]
     async def make_page():
@@ -142,4 +146,31 @@ async def test_no_alert_when_challenge_rate_below_threshold():
 
     await checker.prewarm_target_dates(dates, stagger_sec=0, notifier=notifier)
 
+    notifier.cf_challenge_warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_alert_at_exactly_5_percent_boundary():
+    """Threshold is strict (> 0.05) — a rate of exactly 5.0% must NOT alert.
+
+    Pins the boundary semantics so a future change from `>` to `>=` (or
+    vice versa) is caught by the test suite.
+    """
+    notifier = MagicMock()
+    checker = _make_checker()
+
+    # 1 challenge in 20 dates = 5.0% exactly
+    dates = [date(2026, 5, i + 1) for i in range(20)]
+
+    page_count = [0]
+    async def make_page():
+        page_count[0] += 1
+        if page_count[0] == 1:
+            return _make_page("https://www.exploretock.com/challenge?ray=z")
+        return _make_page("https://www.exploretock.com/test/search?date=X")
+    checker.browser.new_page = make_page
+
+    await checker.prewarm_target_dates(dates, stagger_sec=0, notifier=notifier)
+
+    # rate == 0.05 exactly; threshold is strict `> 0.05` → NOT an alert
     notifier.cf_challenge_warning.assert_not_called()
