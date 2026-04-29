@@ -87,3 +87,48 @@ async def test_lock_still_prevents_double_confirm():
     assert len(winners) == 1, (
         f"Lock+event must serialize confirm to exactly one winner; got {winners}"
     )
+
+
+@pytest.mark.asyncio
+async def test_warm_page_claimed_by_only_one_task():
+    """When 2 slots on the same date race, the warm page is given to exactly
+    one task; the other falls through to a fresh page.
+
+    This prevents DOM state corruption that happened pre-fix when both tasks
+    clicked slot buttons on the same shared Page object.
+    """
+    booker = _make_booker()
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="8:00 PM", day_of_week="Friday"),
+    ]
+
+    # Sentinel object — both tasks must NOT receive the same instance
+    warm_page_sentinel = MagicMock(name="warm_page_for_2026_05_01")
+    warm_pages = {"2026-05-01": warm_page_sentinel}
+
+    received_warm_pages = []
+
+    async def fake_book_single(slot, booking_won, warm_page=None):
+        received_warm_pages.append(warm_page)
+        await asyncio.sleep(0)  # yield so both tasks have a chance to read warm_pages
+        if not booking_won.is_set():
+            booking_won.set()
+            return True
+        return False
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        await booker.book_best_slot_race(slots, warm_pages=warm_pages)
+
+    # Exactly one task got the warm page; the other got None (fresh page path)
+    sentinel_count = received_warm_pages.count(warm_page_sentinel)
+    none_count = received_warm_pages.count(None)
+    assert sentinel_count == 1, (
+        f"Expected exactly 1 task to claim the warm page; got {sentinel_count} "
+        f"(received: {received_warm_pages})"
+    )
+    assert none_count == 1, (
+        f"Expected exactly 1 task to fall through to fresh page (None); got {none_count}"
+    )
+    # warm_pages dict was emptied by .pop() — the same date_str shouldn't be there anymore
+    assert "2026-05-01" not in warm_pages

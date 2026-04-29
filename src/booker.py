@@ -83,11 +83,20 @@ class TockBooker:
         warm_pages: dict[str, Page] | None = None,
     ) -> AvailableSlot | None:
         """
-        Pick the best slot per calendar date, then attempt all of them
-        concurrently. Returns the first successfully booked slot, or None.
+        Race ALL provided slots concurrently — one asyncio task per slot,
+        even multiple times on the same calendar date (e.g. Friday 5pm AND
+        Friday 8pm). The first task to clear the confirm-lock and succeed
+        is the winner; all others see ``booking_won`` set and abort.
 
-        "Best" = closest to config.preferred_time (checker already sorts them,
-        so the first entry per date is the best).
+        Phase A+2 changed this from "pick best slot per date" to "race all"
+        because slots disappear within ~5s of release on competitive
+        restaurants — racing both 5pm and 8pm of the same Friday roughly
+        doubles the hit chance.
+
+        Warm pages are claimed via pop(), so each warm page is owned by
+        exactly one task. Additional same-date tasks open fresh pages.
+
+        Returns the AvailableSlot that booked successfully, or None.
         """
         if not slots:
             return None
@@ -97,7 +106,7 @@ class TockBooker:
         # 5pm AND 8pm of the same Friday concurrently still produces at most
         # one booking. Maximizes hit rate when releases drop multiple times
         # on the same date.
-        candidates = list(slots)
+        candidates = list(slots)  # shallow copy so caller mutations during the race are isolated
         logger.info(
             f"Starting concurrent booking race for {len(candidates)} slot(s): "
             + " | ".join(str(s) for s in candidates)
@@ -108,7 +117,13 @@ class TockBooker:
 
         async def attempt(slot: AvailableSlot) -> None:
             self.notifier.booking_attempting(slot)
-            page = warm_pages.get(slot.slot_date_str) if warm_pages else None
+            # Use pop() so each warm page is claimed by exactly ONE task. After
+            # Phase A+2's race-all-slots change, multiple slots on the same date
+            # can race concurrently — without pop(), both tasks would grab the
+            # same Page object and corrupt each other's DOM state. Subsequent
+            # tasks for the same date fall through to new_page() (slower but
+            # state-isolated; only the loser pays the cost).
+            page = warm_pages.pop(slot.slot_date_str, None) if warm_pages else None
             try:
                 success = await self._book_single(slot, booking_won, warm_page=page)
                 if success:
