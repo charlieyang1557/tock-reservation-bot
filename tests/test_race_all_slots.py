@@ -8,7 +8,7 @@ both attempted instead of just 5pm).
 """
 import asyncio
 from datetime import date
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 import pytest
 
 from src.checker import AvailableSlot
@@ -43,7 +43,7 @@ async def test_races_all_slots_including_same_date():
 
     attempted = []
 
-    async def fake_book_single(slot, booking_won, warm_page=None):
+    async def fake_book_single(slot, booking_won, **_kwargs):
         attempted.append(slot)
         if not booking_won.is_set():
             booking_won.set()
@@ -73,7 +73,7 @@ async def test_lock_still_prevents_double_confirm():
 
     winners = []
 
-    async def fake_book_single(slot, booking_won, warm_page=None):
+    async def fake_book_single(slot, booking_won, **_kwargs):
         await asyncio.sleep(0)  # yield to other tasks
         if booking_won.is_set():
             return False  # respects the event
