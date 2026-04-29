@@ -81,8 +81,16 @@ async def test_prewarm_waits_for_calendar_container():
 
     await checker.prewarm_target_dates(dates, stagger_sec=0)
 
-    # Confirm wait_for_selector was called (parked at calendar render)
-    assert page.wait_for_selector.called
+    # Confirm wait_for_selector was called with the calendar_container
+    # selector — not just any selector. Tight assertion catches a future
+    # refactor that swaps in a different (incorrect) wait target.
+    import src.selectors as sel_mod
+    page.wait_for_selector.assert_called_once()
+    called_selector = page.wait_for_selector.call_args.args[0]
+    assert called_selector == sel_mod.SELECTORS["calendar_container"], (
+        f"Expected wait_for_selector to receive calendar_container "
+        f"({sel_mod.SELECTORS['calendar_container']!r}); got {called_selector!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -136,7 +144,41 @@ async def test_prewarm_respects_stagger():
     with patch("src.checker.asyncio.sleep", new=fake_sleep):
         await checker.prewarm_target_dates(dates, stagger_sec=30)
 
-    # Between 3 dates we expect 2 stagger sleeps of ~30s
-    assert any(s == 30 for s in sleep_calls), (
-        f"Expected at least one stagger sleep of 30s; got {sleep_calls}"
+    # 3 dates → exactly 2 stagger sleeps (no trailing sleep after last date).
+    # Tight assertion catches both off-by-one regressions and missing-stagger
+    # regressions (a single `any()` would mask either of those).
+    stagger_30_count = sum(1 for s in sleep_calls if s == 30)
+    assert stagger_30_count == len(dates) - 1, (
+        f"Expected exactly {len(dates) - 1} stagger sleeps of 30s; "
+        f"got {stagger_30_count} (sleep_calls={sleep_calls})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_prewarm_all_dates_fail_returns_cleanly():
+    """If EVERY date's prewarm fails, _sniper_pages stays empty and no
+    exception propagates. Sniper-poll falls back to cold goto() for all."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3)]
+
+    pages = []
+    async def make_page():
+        p = AsyncMock()
+        p.is_closed = MagicMock(return_value=False)
+        p.goto = AsyncMock(side_effect=Exception("simulated CF challenge"))
+        p.wait_for_selector = AsyncMock()
+        p.close = AsyncMock()
+        pages.append(p)
+        return p
+    checker.browser.new_page = make_page
+
+    # Must not raise even when every date fails
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+
+    assert checker._sniper_pages == {}, (
+        f"All-fail must leave _sniper_pages empty; got {checker._sniper_pages}"
+    )
+    # All 3 leaked pages should have been closed by the new finally block (Fix 1)
+    assert all(p.close.called for p in pages), (
+        "Failed pages must be closed to prevent leak across release windows"
     )

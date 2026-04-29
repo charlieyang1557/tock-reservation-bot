@@ -50,6 +50,13 @@ PT = pytz.timezone("America/Los_Angeles")
 # the pre-warm fires at the poll just before the window opens.
 PREWARM_BEFORE_MIN = 15
 
+# Target-date prewarm: how far ahead to look for prewarm candidates and how
+# many pages to open at most. 10 days covers next-week's release targets
+# (Wed-Sun) when prewarm fires from a Friday; 7 dates fits in ~3.5 min at
+# 30s stagger, well under the 11.5-min idle budget before the window opens.
+PREWARM_LOOKAHEAD_DAYS = 10
+PREWARM_DATE_CAP = 7
+
 # If a sniper window opens within this many seconds, skip the regular poll and
 # wait so the first sniper poll fires right at the window start.  A full scan
 # takes ~100-120s, so holding when we're within 120s prevents a slow regular
@@ -201,10 +208,10 @@ class TockMonitor:
                 )
                 success = await self.browser.warm_session()
                 if success:
-                    self._session_prewarmed_for = prewarm_target
                     # Phase A+2: also pre-open target-date pages so the first
                     # sniper poll after the window opens does a fast reload()
                     # instead of a fresh goto() per date.
+                    prewarm_failed = False
                     try:
                         prewarm_dates = self._get_prewarm_dates()
                         if prewarm_dates:
@@ -216,8 +223,19 @@ class TockMonitor:
                                 prewarm_dates, stagger_sec=30.0
                             )
                     except Exception as e:
+                        prewarm_failed = True
                         logger.warning(
                             f"[monitor] Target-date prewarm failed (non-critical): {e}"
+                        )
+                    # Mark the window as prewarmed regardless of page-prewarm
+                    # outcome — failure here degrades to cold goto() at release,
+                    # which is acceptable. We don't want to retry the prewarm
+                    # in tight loops if it's failing for a structural reason.
+                    self._session_prewarmed_for = prewarm_target
+                    if prewarm_failed:
+                        logger.info(
+                            f"[monitor] {prewarm_target} marked as prewarmed; "
+                            "page-prewarm degraded — first sniper poll will use cold goto()"
                         )
                 else:
                     logger.error(
@@ -609,18 +627,18 @@ class TockMonitor:
         if not days:
             return []
         today = date.today()
-        # 10-day horizon: covers the upcoming calendar week's release targets
-        # (Wed T+5 through Sun T+9 when prewarm fires on Friday at T-5min).
-        # Beyond 10 days = next release's territory; not this one.
-        end = today + timedelta(days=10)
+        # PREWARM_LOOKAHEAD_DAYS horizon: covers the upcoming calendar week's
+        # release targets (Wed T+5 through Sun T+9 when prewarm fires on
+        # Friday at T-5min). Beyond this = next release's territory.
+        end = today + timedelta(days=PREWARM_LOOKAHEAD_DAYS)
         result: list[date] = []
         current = today + timedelta(days=1)
         while current <= end:
             if current.strftime("%A") in days:
                 result.append(current)
             current += timedelta(days=1)
-        # Cap at 7 (closest first — list is already chronologically sorted)
-        return result[:7]
+        # Cap at PREWARM_DATE_CAP (closest first — list is already chronologically sorted)
+        return result[:PREWARM_DATE_CAP]
 
 
 def _sniper_start_dt(now: datetime, start_str: str) -> datetime:

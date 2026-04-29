@@ -215,6 +215,7 @@ class AvailabilityChecker:
                 f"&size={self.config.party_size}"
                 f"&time={self.config.preferred_time}"
             )
+            page = None
             try:
                 page = await self.browser.new_page()
                 logger.info(f"[prewarm] {date_str} → {url}")
@@ -224,6 +225,7 @@ class AvailabilityChecker:
                     sel.get("calendar_container"), timeout=10000
                 )
                 self._sniper_pages[date_str] = page
+                page = None  # ownership transferred to _sniper_pages — don't close in finally
                 logger.info(
                     f"[prewarm] {date_str} parked at CALENDAR_LOADED"
                 )
@@ -233,6 +235,15 @@ class AvailabilityChecker:
                 )
                 # Don't store the failed page — sniper-poll will fall back to
                 # fresh goto() for this date
+            finally:
+                # Close any page we still own (failure path) so it doesn't
+                # leak across release windows. On the success path `page` was
+                # set to None after handing ownership to _sniper_pages.
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
 
             # Stagger between page opens (skip after the last one)
             if i < len(target_dates) - 1 and stagger_sec > 0:
