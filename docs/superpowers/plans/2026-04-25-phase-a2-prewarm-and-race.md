@@ -827,3 +827,75 @@ chance to get past CF on the live release.
 **Interaction check:** Task 3 modifies `prewarm_target_dates` (added in Task 2). The instructions explicitly handle the interleave — Task 3's Step 3 shows the FULL replacement signature including Task 2's parameters.
 
 **Total scope:** ~250 LOC, ~11 tests, 3 commits. Fits in 1-2 working days.
+
+---
+
+## Final Step — Codex Adversarial Code Review
+
+After all 3 tasks are implemented, spec-reviewed, code-quality-reviewed, and the per-task fix-up commits have landed, dispatch the **`codex:codex-rescue`** agent for an adversarial review of the entire branch. Rationale: Codex is a different model family (OpenAI) than Claude, so it provides genuinely independent perspective on code Claude wrote and reviewed — catching cognitive blind spots that Claude-on-Claude review can miss.
+
+- [ ] **Step 1: Confirm all per-task reviews have passed**
+
+```bash
+cd /Users/yutianyang/tock-bot-phase-a2
+git log --oneline b691a66..HEAD     # should show 3 feat + N chore (fix-up) commits
+python -m pytest tests/ -q          # full suite must be green
+```
+
+- [ ] **Step 2: Compute the cumulative diff range for Codex**
+
+```bash
+BASE_SHA=$(git rev-parse b691a66)        # plan commit
+HEAD_SHA=$(git rev-parse HEAD)
+echo "Codex review range: $BASE_SHA..$HEAD_SHA"
+git -C /Users/yutianyang/tock-bot-phase-a2 diff $BASE_SHA..$HEAD_SHA --stat
+```
+
+- [ ] **Step 3: Dispatch the `codex:codex-rescue` agent with adversarial framing**
+
+The controller (Claude) dispatches a Codex subagent. Brief Codex specifically as an adversary, not a reviewer-in-agreement: ask it to find bugs, hallucinated assumptions, and missed risks — not to confirm what's already there.
+
+The dispatch prompt should include:
+- Working directory `/Users/yutianyang/tock-bot-phase-a2`
+- BASE_SHA and HEAD_SHA from Step 2
+- This plan file path: `docs/superpowers/plans/2026-04-25-phase-a2-prewarm-and-race.md`
+- The Phase A+1 spec for context: `docs/superpowers/specs/2026-04-24-tock-bot-architecture-redesign-design.md`
+- Explicit adversarial framing: "Find what we missed. Don't confirm what we got right unless it changes a verdict. We expect you to disagree with at least one design choice."
+
+Specific concerns to surface to Codex:
+- **Race-all-slots double-booking risk**: even with the lock+event, can two confirms succeed in the sub-millisecond window between the lock acquisition and `booking_won.set()`? Walk the code path.
+- **CF challenge detection accuracy**: is URL-signature detection (`'challenge' in url`) sufficient, or does Tock use a different challenge pattern (interstitial iframe, JS-injected overlay, status code 403 without redirect)?
+- **Prewarm timing race**: what happens if `_get_prewarm_dates()` returns dates the operator's `.env` has not configured for sniper coverage? E.g., Wednesday in `FALLBACK_DAYS` but not in `SNIPER_DAYS` — do we waste prewarm on dates the bot will never sniper-scan?
+- **Page lifetime invariants**: prewarm puts pages in `_sniper_pages`, but the existing `close_sniper_pages()` is called at end of sniper window. Does our prewarm run BEFORE or AFTER the window opens, and is the close path guaranteed to fire even if the window never properly engages?
+- **Telemetry false positives**: any normal Tock URL pattern that happens to contain the substring `challenge`? (e.g., a restaurant named "Challenger"?)
+- **Test fidelity**: the new tests mock `browser.new_page` — do they still exercise enough of the real code path that a regression in `prewarm_target_dates` would actually fail?
+
+- [ ] **Step 4: Triage Codex's findings**
+
+Codex returns Critical / Important / Minor / Notes. Apply the same triage as for Claude reviewers:
+- **Critical** → fix before merge. Dispatch a fix-up subagent (Claude) with explicit instructions tied to Codex's findings.
+- **Important** → fix on this branch unless cost is high (then defer to Phase A+3 follow-up doc).
+- **Minor** → defer to Phase A+3 follow-up doc.
+- **Notes / observations** → just acknowledge.
+
+If Codex finds Critical issues, document them in this plan as a new "Codex Findings" section and re-dispatch implementer for fixes. Re-run Codex after fixes if any Critical was identified.
+
+- [ ] **Step 5: Acknowledge Codex review in a final commit**
+
+After all Codex Critical/Important issues are addressed:
+
+```bash
+cd /Users/yutianyang/tock-bot-phase-a2
+git add -A   # only doc updates, if any
+git -c commit.gpgsign=false commit --allow-empty -m "chore: Phase A+2 Codex adversarial review complete
+
+Codex findings: <summary — N Critical addressed, N Important addressed,
+N Minor deferred to Phase A+3 follow-up doc>.
+
+Cumulative diff reviewed: <BASE_SHA>..<HEAD_SHA>.
+"
+```
+
+If Codex returned no Critical / Important, the empty commit just records that the review happened. If Codex returned issues that were all addressed, list them in the commit body.
+
+This step is the gate before merging the branch back to `main` via the `superpowers:finishing-a-development-branch` skill.
