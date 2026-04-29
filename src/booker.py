@@ -92,7 +92,12 @@ class TockBooker:
         if not slots:
             return None
 
-        candidates = self._best_per_date(slots)
+        # Phase A+2: race ALL slots, not just one per date. The asyncio.Lock +
+        # booking_won.Event serialize the actual confirm click — so attempting
+        # 5pm AND 8pm of the same Friday concurrently still produces at most
+        # one booking. Maximizes hit rate when releases drop multiple times
+        # on the same date.
+        candidates = list(slots)
         logger.info(
             f"Starting concurrent booking race for {len(candidates)} slot(s): "
             + " | ".join(str(s) for s in candidates)
