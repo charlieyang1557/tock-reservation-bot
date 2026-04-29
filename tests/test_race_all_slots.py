@@ -118,7 +118,9 @@ async def test_warm_page_claimed_by_only_one_task():
         return False
 
     with patch.object(booker, "_book_single", side_effect=fake_book_single):
-        await booker.book_best_slot_race(slots, warm_pages=warm_pages)
+        # MagicMock duck-types as Page in the mock chain — runtime is fine,
+        # but Pyright's dict invariance flags the value type.
+        await booker.book_best_slot_race(slots, warm_pages=warm_pages)  # type: ignore[arg-type]
 
     # Exactly one task got the warm page; the other got None (fresh page path)
     sentinel_count = received_warm_pages.count(warm_page_sentinel)
