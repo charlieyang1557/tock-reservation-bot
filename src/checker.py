@@ -20,11 +20,16 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+from typing import TYPE_CHECKING
+
 from playwright.async_api import Locator, Page
 
 import src.selectors as sel
 from src.config import Config, parse_time
 from src.tracker import SlotTracker
+
+if TYPE_CHECKING:
+    from src.notifier import Notifier
 
 # Debug screenshot directories
 _SCREENSHOT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "debug_screenshots")
@@ -114,6 +119,11 @@ class AvailabilityChecker:
         # Track count of existing normal screenshots for rotation.
         # Populated from disk by refresh_screenshot_count() before sniper.
         self._screenshot_count: int = 0
+        # Telemetry from the most recent prewarm_target_dates() call.
+        # Set to 0 here so they're always present regardless of whether
+        # prewarm has run yet.
+        self._last_prewarm_cf_challenges: int = 0
+        self._last_prewarm_attempts: int = 0
 
     # ------------------------------------------------------------------
     # Public
@@ -191,10 +201,34 @@ class AvailabilityChecker:
         self._skip_dates.clear()
         logger.debug("[check] Sniper pages closed.")
 
+    @staticmethod
+    def _is_cloudflare_challenge_page(page) -> bool:
+        """Return True iff `page.url` looks like a Cloudflare challenge.
+
+        Detection signals (any one is sufficient):
+          - URL contains 'challenge' (typical CF redirect path)
+          - URL contains '__cf_chl' (CF challenge query param)
+
+        Returns False on any error (including non-string page.url in tests).
+        """
+        try:
+            raw = page.url
+            if not isinstance(raw, str):
+                return False
+            url = raw.lower()
+        except Exception:
+            return False
+        if "challenge" in url:
+            return True
+        if "__cf_chl" in url:
+            return True
+        return False
+
     async def prewarm_target_dates(
         self,
         target_dates: list[date],
         stagger_sec: float = 30.0,
+        notifier: "Notifier | None" = None,
     ) -> None:
         """Open one Playwright page per target_date, parked at CALENDAR_LOADED.
 
@@ -206,7 +240,16 @@ class AvailabilityChecker:
         keep the prewarm gentle on Cloudflare/Turnstile (vs. opening all
         N pages concurrently). Failures on individual dates are logged but
         do not abort the rest.
+
+        CF challenge detection: if a navigated page's URL looks like a
+        Cloudflare/Turnstile challenge, the page is NOT parked in
+        _sniper_pages — the sniper-poll falls back to a fresh goto() for
+        that date. Challenge count is recorded in _last_prewarm_cf_challenges;
+        if the rate exceeds 5%, a Discord alert fires via notifier.
         """
+        cf_challenges = 0
+        attempted = 0
+
         for i, target_date in enumerate(target_dates):
             date_str = target_date.isoformat()
             url = (
@@ -215,11 +258,25 @@ class AvailabilityChecker:
                 f"&size={self.config.party_size}"
                 f"&time={self.config.preferred_time}"
             )
+            attempted += 1
             page = None
             try:
                 page = await self.browser.new_page()
                 logger.info(f"[prewarm] {date_str} → {url}")
                 await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+                # Detect CF challenge BEFORE waiting for calendar — a challenged
+                # page never renders calendar_container, so the wait would just
+                # time out wastefully. Skip parking; sniper-poll will fall back
+                # to a fresh goto() at release time.
+                if self._is_cloudflare_challenge_page(page):
+                    cf_challenges += 1
+                    logger.warning(
+                        f"[prewarm] {date_str} hit CF challenge "
+                        f"(url={page.url}); not parking this page"
+                    )
+                    continue  # finally block closes the page
+
                 # Park at CALENDAR_LOADED (calendar widget rendered)
                 await page.wait_for_selector(
                     sel.get("calendar_container"), timeout=10000
@@ -236,9 +293,9 @@ class AvailabilityChecker:
                 # Don't store the failed page — sniper-poll will fall back to
                 # fresh goto() for this date
             finally:
-                # Close any page we still own (failure path) so it doesn't
-                # leak across release windows. On the success path `page` was
-                # set to None after handing ownership to _sniper_pages.
+                # Close any page we still own (failure path or CF challenge path)
+                # so it doesn't leak across release windows. On the success path
+                # `page` was set to None after handing ownership to _sniper_pages.
                 if page is not None:
                     try:
                         await page.close()
@@ -248,6 +305,19 @@ class AvailabilityChecker:
             # Stagger between page opens (skip after the last one)
             if i < len(target_dates) - 1 and stagger_sec > 0:
                 await asyncio.sleep(stagger_sec)
+
+        # Expose telemetry on the instance for tests / introspection
+        self._last_prewarm_cf_challenges = cf_challenges
+        self._last_prewarm_attempts = attempted
+
+        # Alert via Discord if rate exceeded threshold
+        if attempted > 0 and notifier is not None:
+            rate = cf_challenges / attempted
+            if rate > 0.05:
+                try:
+                    notifier.cf_challenge_warning(rate=rate, count=cf_challenges)
+                except Exception as e:
+                    logger.debug(f"[prewarm] cf_challenge_warning failed: {e}")
 
     async def check_all(
         self,

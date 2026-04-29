@@ -184,6 +184,21 @@ class Notifier:
         logger.error(f"[error] {context}: {detail}")
         self._fire(title="⚠️ Bot Error", description=msg, color=_RED)
 
+    def cf_challenge_warning(self, rate: float, count: int) -> None:
+        """Alert on elevated Cloudflare challenge rate during prewarm."""
+        msg = (
+            f"Cloudflare challenge rate {rate:.0%} during target-date prewarm "
+            f"({count} challenge(s) detected). Bot may be losing the prewarm "
+            "edge for this release window. Consider running --verify and "
+            "rotating session cookies if rate stays elevated."
+        )
+        logger.warning(f"[cf-challenge] {msg}")
+        self._fire(
+            title="⚠️ Cloudflare Challenge Rate Elevated",
+            description=msg,
+            color=_RED,
+        )
+
     # ------------------------------------------------------------------
     # Discord delivery (fire-and-forget)
     # ------------------------------------------------------------------

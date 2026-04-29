@@ -220,7 +220,8 @@ class TockMonitor:
                                 f"target-date page(s) for {prewarm_target}"
                             )
                             await self.checker.prewarm_target_dates(
-                                prewarm_dates, stagger_sec=30.0
+                                prewarm_dates, stagger_sec=30.0,
+                                notifier=self.notifier,
                             )
                     except Exception as e:
                         prewarm_failed = True
