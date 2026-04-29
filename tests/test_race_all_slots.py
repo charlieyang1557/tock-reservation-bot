@@ -8,10 +8,16 @@ both attempted instead of just 5pm).
 
 Also covers Fix 1 from Codex adversarial review: confirm-uncertainty kills
 the race (prevents sequential double-booking on verification failure).
+
+Codex pass 2 additions:
+  - test_unverified_confirm_persists_across_races
+  - test_confirmed_outcome_returned_for_clean_win
+  - test_failed_outcome_returned_when_no_winner
+  - test_real_book_single_confirm_attempted_blocks_second_call
 """
 import asyncio
 from datetime import date
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.checker import AvailableSlot
@@ -54,7 +60,7 @@ async def test_races_all_slots_including_same_date():
         return False
 
     with patch.object(booker, "_book_single", side_effect=fake_book_single):
-        booked = await booker.book_best_slot_race(slots)
+        outcome, booked = await booker.book_best_slot_race(slots)
 
     # All 3 slots must be attempted (concurrent race)
     attempted_keys = {(s.slot_date_str, s.slot_time) for s in attempted}
@@ -181,9 +187,12 @@ async def test_confirm_uncertainty_kills_race():
 
 @pytest.mark.asyncio
 async def test_confirm_attempted_resets_per_race():
-    """Each call to book_best_slot_race starts with a clean _confirm_attempted."""
+    """Each call to book_best_slot_race starts with a clean _confirm_attempted,
+    BUT only when _unverified_confirm_slot is NOT set (no prior soft-win)."""
     booker = _make_booker()
     booker._confirm_attempted.set()  # simulate stale state from prior race
+    # No unverified confirm from a previous race — clean state
+    booker._unverified_confirm_slot = None
 
     slots = [AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday")]
 
@@ -196,6 +205,142 @@ async def test_confirm_attempted_resets_per_race():
         return True
 
     with patch.object(booker, "_book_single", side_effect=fake_book_single):
-        result = await booker.book_best_slot_race(slots)
+        outcome, result = await booker.book_best_slot_race(slots)
 
     assert result is not None
+
+
+# ---------------------------------------------------------------------------
+# Codex pass 2: tri-state BookingOutcome tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unverified_confirm_persists_across_races():
+    """After a soft-win (unverified confirm), subsequent calls to
+    book_best_slot_race must REFUSE to start a new race even though
+    _confirm_attempted is cleared per-race. This was Codex pass 2's
+    HIGH finding: the original fix scoped the guard to one race,
+    enabling sequential double-booking within the same process."""
+    from src.booker import BookingOutcome
+
+    booker = _make_booker()
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+    ]
+
+    # Simulate first race ending in unverified confirm
+    booker._unverified_confirm_slot = slots[0]
+
+    attempts = []
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        attempts.append(slot)
+        return True
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        outcome, returned_slot = await booker.book_best_slot_race(slots)
+
+    # New race REFUSED — _book_single was never called
+    assert attempts == [], (
+        f"Subsequent race must refuse to fire _book_single after unverified confirm; "
+        f"got {len(attempts)} attempts"
+    )
+    assert outcome == BookingOutcome.UNVERIFIED_CONFIRM
+    assert returned_slot == slots[0]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_outcome_returned_for_clean_win():
+    """Happy path: a verified booking returns BookingOutcome.CONFIRMED."""
+    from src.booker import BookingOutcome
+
+    booker = _make_booker()
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+    ]
+
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        booking_won.set()
+        return True
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        outcome, returned_slot = await booker.book_best_slot_race(slots)
+
+    assert outcome == BookingOutcome.CONFIRMED
+    assert returned_slot == slots[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_outcome_returned_when_no_winner():
+    """All slot attempts return False → outcome is FAILED."""
+    from src.booker import BookingOutcome
+
+    booker = _make_booker()
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+    ]
+
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        return False  # all attempts fail
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        outcome, returned_slot = await booker.book_best_slot_race(slots)
+
+    assert outcome == BookingOutcome.FAILED
+    assert returned_slot is None
+
+
+@pytest.mark.asyncio
+async def test_real_book_single_confirm_attempted_blocks_second_call():
+    """Real _book_single (not a fake): two concurrent invocations on
+    the SAME booker. First reaches _confirm_booking and returns False;
+    second sees _confirm_attempted set and aborts BEFORE _confirm_booking.
+
+    This catches regressions like moving _confirm_attempted.set() to
+    after _confirm_booking() — which the fake-based test would miss.
+    """
+    from src.booker import BookingOutcome
+
+    booker = _make_booker()
+    booker.config.dry_run = False  # we want the confirm-lock path
+
+    # Track real calls to _confirm_booking
+    confirm_booking_calls = []
+
+    async def fake_confirm_booking(page, slot):
+        confirm_booking_calls.append(slot)
+        # First attempt: simulate verification failure → soft-win path
+        return False
+
+    fake_page = AsyncMock()
+    fake_page.is_closed = MagicMock(return_value=False)
+    fake_page.evaluate = AsyncMock()
+    fake_page.url = "https://www.exploretock.com/test/search?date=2026-05-01"
+
+    booker.browser = MagicMock()
+    booker.browser.new_page = AsyncMock(return_value=fake_page)
+
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="8:00 PM", day_of_week="Friday"),
+    ]
+
+    # Patch external Playwright primitives only — NOT the lock/event/_confirm_attempted code
+    with patch.object(booker, "_click_calendar_day", AsyncMock(return_value=True)), \
+         patch.object(booker, "_click_time_slot", AsyncMock(return_value=True)), \
+         patch.object(booker, "_wait_for_checkout", AsyncMock(return_value=True)), \
+         patch.object(booker, "_booking_screenshot", AsyncMock()), \
+         patch.object(booker, "_confirm_booking", side_effect=fake_confirm_booking):
+        outcome, returned_slot = await booker.book_best_slot_race(slots)
+
+    # _confirm_booking must be called EXACTLY ONCE — even though both
+    # tasks raced to it, _confirm_attempted blocked the second.
+    assert len(confirm_booking_calls) == 1, (
+        f"_confirm_booking must run exactly once; ran {len(confirm_booking_calls)} times. "
+        "If >1: _confirm_attempted is not blocking concurrent confirms in production code. "
+        "If 0: a different bug — _book_single never reached the lock path."
+    )
+
+    # Result must be UNVERIFIED_CONFIRM (the soft-win path)
+    assert outcome == BookingOutcome.UNVERIFIED_CONFIRM, (
+        f"Soft-win must produce UNVERIFIED_CONFIRM outcome; got {outcome}"
+    )

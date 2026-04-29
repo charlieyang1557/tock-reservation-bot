@@ -32,6 +32,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from enum import Enum
 
 from playwright.async_api import Page
 
@@ -45,6 +46,19 @@ from src.selectors import get_slot_button_selectors
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.exploretock.com"
+
+
+class BookingOutcome(Enum):
+    """Result of a booking race.
+
+    CONFIRMED           — slot booked and verified
+    UNVERIFIED_CONFIRM  — confirm clicked but verification timed out;
+                          Tock MAY have accepted. Operator must verify.
+    FAILED              — no confirm clicked, or click verifiably failed
+    """
+    CONFIRMED = "confirmed"
+    UNVERIFIED_CONFIRM = "unverified_confirm"
+    FAILED = "failed"
 
 _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "debug_screenshots"
@@ -79,6 +93,14 @@ class TockBooker:
         # Prevents sequential double-booking from the confirm-uncertainty
         # window identified by Codex's adversarial review of Phase A+2.
         self._confirm_attempted = asyncio.Event()
+        # Slot whose confirm click was attempted but could not be verified.
+        # Set by _book_single's soft-win path. Read by book_best_slot_race
+        # to return UNVERIFIED_CONFIRM. Only a process restart clears this —
+        # NOT .clear() at the start of book_best_slot_race like
+        # _confirm_attempted. This is the session-level guard that prevents
+        # the next monitor poll from starting another race after a soft-win
+        # (Codex pass 2 HIGH finding).
+        self._unverified_confirm_slot: AvailableSlot | None = None
 
     # ------------------------------------------------------------------
     # Public: race multiple slots
@@ -87,7 +109,7 @@ class TockBooker:
     async def book_best_slot_race(
         self, slots: list[AvailableSlot],
         warm_pages: dict[str, Page] | None = None,
-    ) -> AvailableSlot | None:
+    ) -> tuple[BookingOutcome, AvailableSlot | None]:
         """
         Race ALL provided slots concurrently — one asyncio task per slot,
         even multiple times on the same calendar date (e.g. Friday 5pm AND
@@ -102,13 +124,29 @@ class TockBooker:
         Warm pages are claimed via pop(), so each warm page is owned by
         exactly one task. Additional same-date tasks open fresh pages.
 
-        Returns the AvailableSlot that booked successfully, or None.
+        Returns a (BookingOutcome, slot_or_none) tuple:
+          CONFIRMED          — slot booked and verified; slot is the winner
+          UNVERIFIED_CONFIRM — confirm clicked but unverifiable; slot is the
+                               attempted slot. Bot must idle until restart.
+          FAILED             — all attempts failed; slot is None.
         """
         if not slots:
-            return None
+            return BookingOutcome.FAILED, None
 
-        # Reset the confirm-attempted gate for this race. Fresh sniper window
-        # = fresh attempt; the gate only persists within a single race call.
+        # If a previous race already triggered an unverified confirm, do NOT
+        # start another race — that's exactly the double-booking risk Codex
+        # pass 2 caught. The monitor must restart the process to reset.
+        if self._unverified_confirm_slot is not None:
+            logger.warning(
+                f"[book] Refusing to start race — previous race had "
+                f"unverified confirm for {self._unverified_confirm_slot}. "
+                "Operator must restart the bot after verifying."
+            )
+            return BookingOutcome.UNVERIFIED_CONFIRM, self._unverified_confirm_slot
+
+        # Reset the confirm-attempted gate for this race only. The
+        # _unverified_confirm_slot above persists across races within
+        # the same process — only a restart clears it.
         self._confirm_attempted.clear()
 
         # Phase A+2: race ALL slots, not just one per date. The asyncio.Lock +
@@ -144,7 +182,11 @@ class TockBooker:
         tasks = [asyncio.create_task(attempt(s)) for s in candidates]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        return winner[0] if winner else None
+        if winner:
+            return BookingOutcome.CONFIRMED, winner[0]
+        if self._unverified_confirm_slot is not None:
+            return BookingOutcome.UNVERIFIED_CONFIRM, self._unverified_confirm_slot
+        return BookingOutcome.FAILED, None
 
     # ------------------------------------------------------------------
     # Internal: book one slot
@@ -281,8 +323,12 @@ class TockBooker:
                     return True
 
                 # Click happened but verification failed. Tock may have
-                # accepted the booking silently. Alert the operator instead
-                # of releasing the race for another slot.
+                # accepted the booking silently. Set the session-level flag
+                # AND booking_won so:
+                #   - this race aborts other concurrent slot attempts
+                #   - the next monitor poll sees _unverified_confirm_slot
+                #     and refuses to start another race (Codex pass 2 HIGH)
+                self._unverified_confirm_slot = slot
                 logger.error(
                     f"[book] Confirm clicked for {slot} but verification "
                     "failed. Possible silent success — operator must verify."
@@ -291,11 +337,10 @@ class TockBooker:
                     "Booking confirmation unverifiable",
                     f"Clicked confirm for {slot} but could not verify success. "
                     "Tock MAY have accepted the booking. Check your reservations "
-                    "at https://www.exploretock.com/account/reservations BEFORE "
-                    "running the bot again. Bot will idle from now on.",
+                    "at https://www.exploretock.com/account/reservations. "
+                    "Bot will idle until you restart the process — even within "
+                    "the current session, no more booking attempts will fire.",
                 )
-                # Treat as a "soft win" for race-control purposes: set
-                # booking_won so the monitor stops trying other slots.
                 booking_won.set()
                 return False
 

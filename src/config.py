@@ -48,6 +48,7 @@ class Config:
     sniper_duration_min: int         # how long each sniper window lasts
     sniper_interval_sec: int         # sleep between polls in sniper mode
     sniper_scan_weeks: int = 2       # scan-range cap during sniper mode (Tock releases ≤2 wks)
+    prewarm_min_days_out: int = 5    # skip dates closer than this during target-date prewarm
 
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
@@ -100,6 +101,7 @@ def load_config() -> Config:
         sniper_duration_min=int(os.getenv("SNIPER_DURATION_MIN", "11")),
         sniper_interval_sec=int(os.getenv("SNIPER_INTERVAL_SEC", "3")),
         sniper_scan_weeks=int(os.getenv("SNIPER_SCAN_WEEKS", "2")),
+        prewarm_min_days_out=int(os.getenv("PREWARM_MIN_DAYS_OUT", "5")),
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 

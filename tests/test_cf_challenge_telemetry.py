@@ -174,3 +174,53 @@ async def test_no_alert_at_exactly_5_percent_boundary():
 
     # rate == 0.05 exactly; threshold is strict `> 0.05` → NOT an alert
     notifier.cf_challenge_warning.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Codex pass 2: sniper-phase CF telemetry
+# ---------------------------------------------------------------------------
+
+def test_cf_challenge_warning_distinguishes_phase():
+    """The Discord alert title differs for prewarm vs sniper phase."""
+    from src.notifier import Notifier
+    config = MagicMock()
+    config.discord_webhook_url = ""  # Discord disabled — _fire is a no-op
+    notifier = Notifier(config)
+    fired = []
+    notifier._fire = lambda **kwargs: fired.append(kwargs)
+
+    notifier.cf_challenge_warning(rate=0.1, count=1, phase="prewarm")
+    notifier.cf_challenge_warning(rate=0.5, count=2, phase="sniper")
+
+    titles = [f["title"] for f in fired]
+    assert any("Cloudflare Challenge Rate Elevated" in t for t in titles), (
+        f"Expected prewarm title not found in: {titles}"
+    )
+    assert any("Sniper Window Challenged" in t for t in titles), (
+        f"Expected sniper title not found in: {titles}"
+    )
+    assert any("URGENT" in t for t in titles), (
+        f"Expected URGENT in sniper title not found in: {titles}"
+    )
+
+
+def test_sniper_cf_counters_initialize_to_zero():
+    """AvailabilityChecker starts with _sniper_cf_challenges and
+    _sniper_cf_attempts both zero."""
+    checker = _make_checker()
+    assert checker._sniper_cf_challenges == 0
+    assert checker._sniper_cf_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_close_sniper_pages_resets_sniper_cf_counters():
+    """close_sniper_pages() resets the sniper CF counters so they don't
+    bleed across release windows."""
+    checker = _make_checker()
+    checker._sniper_cf_challenges = 3
+    checker._sniper_cf_attempts = 5
+
+    await checker.close_sniper_pages()
+
+    assert checker._sniper_cf_challenges == 0
+    assert checker._sniper_cf_attempts == 0

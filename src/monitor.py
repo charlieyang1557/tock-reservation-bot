@@ -63,11 +63,6 @@ PREWARM_DATES_BEFORE_MIN = 5
 PREWARM_LOOKAHEAD_DAYS = 10
 PREWARM_DATE_CAP = 7
 
-# Skip dates closer than this — they belong to the PRIOR release cycle.
-# On a Friday release at T, the new release covers T+5 (next Wed) onward.
-# Earlier dates (T+1 Sat, T+2 Sun of this week) are stale leftovers.
-PREWARM_MIN_DAYS_OUT = 5
-
 # If a sniper window opens within this many seconds, skip the regular poll and
 # wait so the first sniper poll fires right at the window start.  A full scan
 # takes ~100-120s, so holding when we're within 120s prevents a slow regular
@@ -355,6 +350,7 @@ class TockMonitor:
                 keep_pages=self._sniper_active,
                 sniper_window_age_sec=sniper_age,
                 bypass_normal_skip=bypass_normal_skip,
+                notifier=self.notifier,
             )
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
@@ -381,12 +377,20 @@ class TockMonitor:
             return
 
         # --- Attempt booking ---
-        # Pass warm sniper pages to booker (avoids re-navigation)
+        # Pass warm sniper pages to booker (avoids re-navigation).
+        # Use pop_warm_page so the booker takes OWNERSHIP — checker no longer
+        # holds a Page that the booker may navigate to checkout.
+        # Codex pass 2 HIGH: prevents next sniper poll's reload() from
+        # reloading a checkout page and poisoning the date.
         warm_pages = None
         if self._sniper_active:
             warm_pages = {}
+            seen: set[str] = set()
             for s in slots:
-                wp = self.checker.get_warm_page(s.slot_date_str)
+                if s.slot_date_str in seen:
+                    continue  # multiple slots per date share one warm page
+                seen.add(s.slot_date_str)
+                wp = self.checker.pop_warm_page(s.slot_date_str)
                 if wp is not None:
                     warm_pages[s.slot_date_str] = wp
             if warm_pages:
@@ -394,14 +398,28 @@ class TockMonitor:
             else:
                 warm_pages = None
 
-        booked = await self.booker.book_best_slot_race(slots, warm_pages=warm_pages)
-        if booked:
+        from src.booker import BookingOutcome
+        outcome, booked_slot = await self.booker.book_best_slot_race(
+            slots, warm_pages=warm_pages
+        )
+        if outcome == BookingOutcome.CONFIRMED:
             self._booking_secured = True
             logger.info(
-                f"[monitor] *** Booking secured: {booked} ***\n"
+                f"[monitor] *** Booking secured: {booked_slot} ***\n"
                 "Bot will idle from now on. Safe to Ctrl+C."
             )
-        else:
+        elif outcome == BookingOutcome.UNVERIFIED_CONFIRM:
+            # Codex pass 2 HIGH: confirm click happened but verification
+            # failed. Tock MAY have accepted. We MUST idle this session — do
+            # not try another slot or another release window. Operator must
+            # restart after verifying manually on Tock's website.
+            self._booking_secured = True
+            logger.error(
+                f"[monitor] *** Unverified confirm for {booked_slot} ***\n"
+                "Bot will idle until restart. Verify manually at "
+                "https://www.exploretock.com/account/reservations."
+            )
+        else:  # FAILED
             logger.warning(
                 "[monitor] All booking attempts failed this cycle. Will retry."
             )
@@ -666,13 +684,14 @@ class TockMonitor:
         today = date.today()
         # PREWARM_LOOKAHEAD_DAYS horizon: covers the upcoming calendar week's
         # release targets (Wed T+5 through Sun T+9 when prewarm fires on
-        # Friday at T-5min). Beyond this = next release's territory.
+        # Friday at T-5min, per config.prewarm_min_days_out=5).
+        # Beyond this = next release's territory.
         end = today + timedelta(days=PREWARM_LOOKAHEAD_DAYS)
         result: list[date] = []
-        # Start at PREWARM_MIN_DAYS_OUT to skip dates from the prior release.
-        # On a Fuhuihua Friday release, today+5 = next Wednesday (the earliest
-        # date in the new release window).
-        current = today + timedelta(days=PREWARM_MIN_DAYS_OUT)
+        # Start at config.prewarm_min_days_out to skip dates from the prior
+        # release. On a Fuhuihua Friday release, today+5 = next Wednesday
+        # (the earliest date in the new release window).
+        current = today + timedelta(days=self.config.prewarm_min_days_out)
         while current <= end:
             if current.strftime("%A") in days:
                 result.append(current)

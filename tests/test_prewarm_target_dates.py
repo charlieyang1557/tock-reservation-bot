@@ -312,12 +312,23 @@ def test_get_prewarm_dates_skips_current_release_dates(monkeypatch):
     assert _date(2026, 5, 10) in dates, f"Sun 2026-05-10 (T+9) must be prewarmed. Got: {dates}"
 
 
-def test_get_prewarm_dates_min_days_constant_is_5():
-    """PREWARM_MIN_DAYS_OUT must be 5 — documented behavior for Friday releases."""
-    import src.monitor as monitor_mod
-    assert monitor_mod.PREWARM_MIN_DAYS_OUT == 5, (
-        f"PREWARM_MIN_DAYS_OUT must be 5; got {monitor_mod.PREWARM_MIN_DAYS_OUT}"
-    )
+def test_default_prewarm_min_days_out_is_5():
+    """Default config value still matches Fuhuihua's Friday release cadence.
+
+    PREWARM_MIN_DAYS_OUT was promoted from a monitor module constant to
+    Config.prewarm_min_days_out (Codex pass 2 MEDIUM). The dataclass default
+    must remain 5 so existing deployments without PREWARM_MIN_DAYS_OUT in
+    .env continue to behave correctly.
+    """
+    from dataclasses import fields
+    from src.config import Config
+    for f in fields(Config):
+        if f.name == "prewarm_min_days_out":
+            assert f.default == 5, (
+                f"Config.prewarm_min_days_out default must be 5; got {f.default}"
+            )
+            return
+    raise AssertionError("Config has no prewarm_min_days_out field")
 
 
 # ---------------------------------------------------------------------------
@@ -360,3 +371,40 @@ async def test_prewarm_closes_old_page_before_overwriting():
     assert checker._sniper_pages["2026-05-01"] is pages[1], (
         "Dict must hold the new page after overwrite"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex pass 2: pop_warm_page transfers ownership
+# ---------------------------------------------------------------------------
+
+def test_pop_warm_page_removes_from_sniper_pages():
+    """pop_warm_page transfers ownership: the page leaves _sniper_pages."""
+    checker = _make_checker()
+    page = AsyncMock()
+    page.is_closed = MagicMock(return_value=False)
+    checker._sniper_pages["2026-05-01"] = page
+
+    popped = checker.pop_warm_page("2026-05-01")
+
+    assert popped is page
+    assert "2026-05-01" not in checker._sniper_pages, (
+        "pop_warm_page must remove the entry — checker no longer owns this page"
+    )
+
+
+def test_pop_warm_page_returns_none_if_closed():
+    """A closed page returns None (defensive against booker side-effects)."""
+    checker = _make_checker()
+    page = AsyncMock()
+    page.is_closed = MagicMock(return_value=True)
+    checker._sniper_pages["2026-05-01"] = page
+
+    popped = checker.pop_warm_page("2026-05-01")
+
+    assert popped is None
+
+
+def test_pop_warm_page_returns_none_if_missing():
+    """Missing date returns None without raising."""
+    checker = _make_checker()
+    assert checker.pop_warm_page("2026-05-01") is None

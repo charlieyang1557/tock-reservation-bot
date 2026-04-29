@@ -131,6 +131,11 @@ class AvailabilityChecker:
         # prewarm has run yet.
         self._last_prewarm_cf_challenges: int = 0
         self._last_prewarm_attempts: int = 0
+        # Sniper-phase CF challenge counters. Reset per sniper window via
+        # close_sniper_pages(). Tracked separately from prewarm counters
+        # because they signal different operational risks.
+        self._sniper_cf_challenges: int = 0
+        self._sniper_cf_attempts: int = 0
 
     # ------------------------------------------------------------------
     # Public
@@ -197,6 +202,22 @@ class AvailabilityChecker:
             return page
         return None
 
+    def pop_warm_page(self, date_str: str) -> "Page | None":
+        """Remove and return the warm page for a date — ownership transfers
+        to the caller.
+
+        After Phase A+2's race-all-slots change, the booker may navigate
+        the warm page to a checkout/error URL. If checker still owned it,
+        the next sniper poll's reload() would reload that wrong URL and
+        poison the date. Codex pass 2 caught this; pop_warm_page transfers
+        ownership atomically so the booker is responsible for closing or
+        re-parking the page.
+        """
+        page = self._sniper_pages.pop(date_str, None)
+        if page and page.is_closed():
+            return None
+        return page
+
     async def close_sniper_pages(self) -> None:
         """Close all pages kept open during sniper mode. Call when window ends."""
         for page in list(self._sniper_pages.values()):
@@ -206,6 +227,8 @@ class AvailabilityChecker:
                 pass
         self._sniper_pages.clear()
         self._skip_dates.clear()
+        self._sniper_cf_challenges = 0
+        self._sniper_cf_attempts = 0
         logger.debug("[check] Sniper pages closed.")
 
     @staticmethod
@@ -333,7 +356,9 @@ class AvailabilityChecker:
             rate = cf_challenges / attempted
             if rate > _CF_CHALLENGE_ALERT_THRESHOLD:
                 try:
-                    notifier.cf_challenge_warning(rate=rate, count=cf_challenges)
+                    notifier.cf_challenge_warning(
+                        rate=rate, count=cf_challenges, phase="prewarm"
+                    )
                 except Exception as e:
                     logger.warning(
                         f"[prewarm] cf_challenge_warning failed (alert lost): {e}"
@@ -345,6 +370,7 @@ class AvailabilityChecker:
         keep_pages: bool = False,
         sniper_window_age_sec: float = 0,
         bypass_normal_skip: bool = False,
+        notifier: "Notifier | None" = None,
     ) -> list[AvailableSlot]:
         """
         Scan for available slots in two phases:
@@ -480,26 +506,46 @@ class AvailabilityChecker:
                     f"Scan complete — {len(preferred_slots)} slot(s) found "
                     f"across {len(preferred_dates)} preferred date(s)"
                 )
-                return preferred_slots
-
-            if not fallback_dates:
+                result_slots = preferred_slots
+            elif not fallback_dates:
                 self.last_errors = errors[0]
                 self.last_checks = len(preferred_dates)
                 logger.info(
                     f"Scan complete — 0 slot(s) found across "
                     f"{len(preferred_dates)} date(s) (no fallback days configured)"
                 )
-                return []
+                result_slots = []
+            else:
+                fallback_slots = await _scan_dates(fallback_dates)
+                self.last_errors = errors[0]
+                self.last_checks = total_dates
+                logger.info(
+                    f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
+                    f"across {total_dates} date(s) total "
+                    f"(0 preferred + {len(fallback_slots)} fallback)"
+                )
+                result_slots = fallback_slots
 
-            fallback_slots = await _scan_dates(fallback_dates)
-            self.last_errors = errors[0]
-            self.last_checks = total_dates
-            logger.info(
-                f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
-                f"across {total_dates} date(s) total "
-                f"(0 preferred + {len(fallback_slots)} fallback)"
-            )
-            return fallback_slots
+            # Sniper-phase CF alerting (Codex pass 2). Independent of prewarm CF.
+            if (
+                keep_pages
+                and self._sniper_cf_attempts > 0
+                and notifier is not None
+            ):
+                sniper_rate = self._sniper_cf_challenges / max(1, self._sniper_cf_attempts)
+                if sniper_rate > _CF_CHALLENGE_ALERT_THRESHOLD:
+                    try:
+                        notifier.cf_challenge_warning(
+                            rate=sniper_rate,
+                            count=self._sniper_cf_challenges,
+                            phase="sniper",
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[check] sniper cf_challenge_warning failed: {e}"
+                        )
+
+            return result_slots
 
         finally:
             self._wait_for_calendar = original_wait  # type: ignore[method-assign]
@@ -586,11 +632,49 @@ class AvailabilityChecker:
         nav_timeout = 10000 if keep_page else 30000
         try:
             if reusing:
-                logger.debug(f"[check] {date_str} → reload (sniper page reuse)")
-                await page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
+                # Defensive: verify the page is still on the search URL
+                # before reload. Codex pass 2: if the booker navigated the
+                # page to checkout (or an error page) and returned it to
+                # checker ownership in some future code path, reload()
+                # would reload the wrong URL. Fall through to goto() if
+                # the URL has drifted.
+                current_url = ""
+                try:
+                    current_url = page.url or ""
+                except Exception:
+                    current_url = ""
+                if f"date={date_str}" in current_url and "/search" in current_url:
+                    logger.debug(f"[check] {date_str} → reload (sniper page reuse)")
+                    await page.reload(wait_until="domcontentloaded", timeout=nav_timeout)
+                else:
+                    logger.warning(
+                        f"[check] {date_str} — warm page drifted from search URL "
+                        f"(now: {current_url[:80]!r}); forcing fresh goto()"
+                    )
+                    await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
             else:
                 logger.debug(f"[check] {date_str} → {url}")
                 await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
+
+            # Sniper-phase CF detection (Codex pass 2): a challenge during
+            # sniper polling is more critical than during prewarm — it's
+            # consuming critical-path time during a release window.
+            if keep_page:
+                self._sniper_cf_attempts += 1
+                if self._is_cloudflare_challenge_page(page):
+                    self._sniper_cf_challenges += 1
+                    logger.warning(
+                        f"[check] {date_str} hit CF challenge during sniper "
+                        f"poll (url={page.url}); date will fall back next poll"
+                    )
+                    # Drop the page so next poll opens a fresh one
+                    if date_str in self._sniper_pages:
+                        del self._sniper_pages[date_str]
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    return []
 
             # Check abort before expensive calendar work
             if abort_event is not None and abort_event.is_set():

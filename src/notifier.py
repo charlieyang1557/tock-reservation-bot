@@ -184,20 +184,39 @@ class Notifier:
         logger.error(f"[error] {context}: {detail}")
         self._fire(title="⚠️ Bot Error", description=msg, color=_RED)
 
-    def cf_challenge_warning(self, rate: float, count: int) -> None:
-        """Alert on elevated Cloudflare challenge rate during prewarm."""
+    def cf_challenge_warning(
+        self, rate: float, count: int, phase: str = "prewarm"
+    ) -> None:
+        """Alert on elevated Cloudflare challenge rate.
+
+        phase: 'prewarm' (15 min before window) or 'sniper' (during the
+        actual release window — much more urgent because it's burning
+        critical-path time).
+        """
+        urgency = "URGENT " if phase == "sniper" else ""
         msg = (
-            f"Cloudflare challenge rate {rate:.0%} during target-date prewarm "
-            f"({count} challenge(s) detected). Bot may be losing the prewarm "
-            "edge for this release window. Consider running --verify and "
-            "rotating session cookies if rate stays elevated."
+            f"{urgency}Cloudflare challenge rate {rate:.0%} during "
+            f"{phase} ({count} challenge(s) detected). "
         )
+        if phase == "sniper":
+            msg += (
+                "This is during the live release window — every challenged "
+                "page costs you slot detection time. Consider rotating "
+                "session cookies or running --verify in headed mode."
+            )
+        else:
+            msg += (
+                "Bot may be losing the prewarm edge for this release window. "
+                "Consider running --verify and rotating session cookies if "
+                "rate stays elevated."
+            )
         logger.warning(f"[cf-challenge] {msg}")
-        self._fire(
-            title="⚠️ Cloudflare Challenge Rate Elevated",
-            description=msg,
-            color=_RED,
+        title = (
+            "⚠️ Cloudflare URGENT — Sniper Window Challenged"
+            if phase == "sniper"
+            else "⚠️ Cloudflare Challenge Rate Elevated"
         )
+        self._fire(title=title, description=msg, color=_RED)
 
     # ------------------------------------------------------------------
     # Discord delivery (fire-and-forget)
