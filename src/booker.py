@@ -73,6 +73,12 @@ class TockBooker:
         self.notifier = notifier
         # Lock ensures only one concurrent task can execute the confirm step
         self._confirm_lock = asyncio.Lock()
+        # Set the moment ANY task is about to click confirm. Other tasks
+        # see this and abort even if booking_won never gets set (e.g. when
+        # confirm-verification fails but Tock may have accepted the booking).
+        # Prevents sequential double-booking from the confirm-uncertainty
+        # window identified by Codex's adversarial review of Phase A+2.
+        self._confirm_attempted = asyncio.Event()
 
     # ------------------------------------------------------------------
     # Public: race multiple slots
@@ -100,6 +106,10 @@ class TockBooker:
         """
         if not slots:
             return None
+
+        # Reset the confirm-attempted gate for this race. Fresh sniper window
+        # = fresh attempt; the gate only persists within a single race call.
+        self._confirm_attempted.clear()
 
         # Phase A+2: race ALL slots, not just one per date. The asyncio.Lock +
         # booking_won.Event serialize the actual confirm click — so attempting
@@ -249,12 +259,45 @@ class TockBooker:
                         slot, "another slot confirmed while waiting for lock"
                     )
                     return False
+                if self._confirm_attempted.is_set():
+                    # Another task already clicked confirm but couldn't verify.
+                    # Tock may have accepted that booking — do NOT click again.
+                    self.notifier.booking_aborted(
+                        slot,
+                        "another slot has an unverified confirm in flight — "
+                        "skipping to avoid double-booking",
+                    )
+                    return False
+
+                # Mark that we are about to click confirm. From this point on,
+                # no other task can call _confirm_booking even if our own
+                # verification fails — the user must verify manually.
+                self._confirm_attempted.set()
 
                 success = await self._confirm_booking(page, slot)
                 if success:
                     booking_won.set()
                     self.notifier.booking_confirmed(slot)
-                return success
+                    return True
+
+                # Click happened but verification failed. Tock may have
+                # accepted the booking silently. Alert the operator instead
+                # of releasing the race for another slot.
+                logger.error(
+                    f"[book] Confirm clicked for {slot} but verification "
+                    "failed. Possible silent success — operator must verify."
+                )
+                self.notifier.error(
+                    "Booking confirmation unverifiable",
+                    f"Clicked confirm for {slot} but could not verify success. "
+                    "Tock MAY have accepted the booking. Check your reservations "
+                    "at https://www.exploretock.com/account/reservations BEFORE "
+                    "running the bot again. Bot will idle from now on.",
+                )
+                # Treat as a "soft win" for race-control purposes: set
+                # booking_won so the monitor stops trying other slots.
+                booking_won.set()
+                return False
 
         except Exception as e:
             logger.error(f"[book] Error booking {slot}: {e}")

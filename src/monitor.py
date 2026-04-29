@@ -50,12 +50,23 @@ PT = pytz.timezone("America/Los_Angeles")
 # the pre-warm fires at the poll just before the window opens.
 PREWARM_BEFORE_MIN = 15
 
+# Date-page prewarm fires CLOSER to release than session-cookie prewarm
+# so prewarmed pages are at most ~6.5 minutes idle before the sniper
+# window opens (5 min stagger + 1.5 min slack + window duration).
+# Session-cookie prewarm at T-15min remains independent.
+PREWARM_DATES_BEFORE_MIN = 5
+
 # Target-date prewarm: how far ahead to look for prewarm candidates and how
 # many pages to open at most. 10 days covers next-week's release targets
 # (Wed-Sun) when prewarm fires from a Friday; 7 dates fits in ~3.5 min at
 # 30s stagger, well under the 11.5-min idle budget before the window opens.
 PREWARM_LOOKAHEAD_DAYS = 10
 PREWARM_DATE_CAP = 7
+
+# Skip dates closer than this — they belong to the PRIOR release cycle.
+# On a Friday release at T, the new release covers T+5 (next Wed) onward.
+# Earlier dates (T+1 Sat, T+2 Sun of this week) are stale leftovers.
+PREWARM_MIN_DAYS_OUT = 5
 
 # If a sniper window opens within this many seconds, skip the regular poll and
 # wait so the first sniper poll fires right at the window start.  A full scan
@@ -99,6 +110,9 @@ class TockMonitor:
         # Session pre-warm: fire PREWARM_BEFORE_MIN minutes before each sniper window.
         # Track which window we've already warmed for to avoid repeated calls.
         self._session_prewarmed_for: str | None = None  # "DayName@HH:MM"
+        # Date-page prewarm: fires at T-5min (closer than cookie prewarm at T-15min).
+        # Tracked separately so the two timers fire independently.
+        self._session_dates_prewarmed_for: str | None = None  # "DayName@HH:MM"
 
         # Watchdog: detect pathological poll bursts (see Apr 14 20:14 incident).
         # Threshold is well above legitimate sniper rate (~1 poll per 3-4s).
@@ -197,56 +211,58 @@ class TockMonitor:
             "Press Ctrl+C to stop."
         )
         while True:
-            # Pre-warm session BEFORE the window opens (not at window entry).
+            # Cookie prewarm: 15 min before window.
             # Fires when we're within PREWARM_BEFORE_MIN minutes of the next
             # sniper window — giving time to solve CAPTCHA in headed mode.
-            prewarm_target = self._get_prewarm_target()
-            if prewarm_target and prewarm_target != self._session_prewarmed_for:
+            cookie_prewarm_target = self._get_prewarm_target()
+            if cookie_prewarm_target and cookie_prewarm_target != self._session_prewarmed_for:
                 logger.info(
                     f"[monitor] Sniper window within {PREWARM_BEFORE_MIN} min "
-                    f"({prewarm_target}) — pre-warming session cookies…"
+                    f"({cookie_prewarm_target}) — pre-warming session cookies…"
                 )
                 success = await self.browser.warm_session()
                 if success:
-                    # Phase A+2: also pre-open target-date pages so the first
-                    # sniper poll after the window opens does a fast reload()
-                    # instead of a fresh goto() per date.
-                    prewarm_failed = False
-                    try:
-                        prewarm_dates = self._get_prewarm_dates()
-                        if prewarm_dates:
-                            logger.info(
-                                f"[monitor] Pre-opening {len(prewarm_dates)} "
-                                f"target-date page(s) for {prewarm_target}"
-                            )
-                            await self.checker.prewarm_target_dates(
-                                prewarm_dates, stagger_sec=30.0,
-                                notifier=self.notifier,
-                            )
-                    except Exception as e:
-                        prewarm_failed = True
-                        logger.warning(
-                            f"[monitor] Target-date prewarm failed (non-critical): {e}"
-                        )
-                    # Mark the window as prewarmed regardless of page-prewarm
-                    # outcome — failure here degrades to cold goto() at release,
-                    # which is acceptable. We don't want to retry the prewarm
-                    # in tight loops if it's failing for a structural reason.
-                    self._session_prewarmed_for = prewarm_target
-                    if prewarm_failed:
-                        logger.info(
-                            f"[monitor] {prewarm_target} marked as prewarmed; "
-                            "page-prewarm degraded — first sniper poll will use cold goto()"
-                        )
+                    self._session_prewarmed_for = cookie_prewarm_target
                 else:
                     logger.error(
-                        f"[monitor] Pre-warm failed for {prewarm_target} — "
+                        f"[monitor] Pre-warm failed for {cookie_prewarm_target} — "
                         "will retry next poll cycle"
                     )
                     self.notifier.error(
                         "Pre-warm failed",
-                        f"Session warm-up for {prewarm_target} failed. "
-                        "Bot will retry but sniper accuracy may be reduced."
+                        f"Session warm-up for {cookie_prewarm_target} failed. "
+                        "Bot will retry but sniper accuracy may be reduced.",
+                    )
+
+            # Date-page prewarm: 5 min before window (closer than cookie prewarm
+            # so pages don't sit idle for 15+ min before reload).
+            dates_prewarm_target = self._get_dates_prewarm_target()
+            if (
+                dates_prewarm_target
+                and dates_prewarm_target != self._session_dates_prewarmed_for
+            ):
+                prewarm_failed = False
+                try:
+                    prewarm_dates = self._get_prewarm_dates()
+                    if prewarm_dates:
+                        logger.info(
+                            f"[monitor] Pre-opening {len(prewarm_dates)} "
+                            f"target-date page(s) for {dates_prewarm_target}"
+                        )
+                        await self.checker.prewarm_target_dates(
+                            prewarm_dates, stagger_sec=30.0,
+                            notifier=self.notifier,
+                        )
+                except Exception as e:
+                    prewarm_failed = True
+                    logger.warning(
+                        f"[monitor] Target-date prewarm failed (non-critical): {e}"
+                    )
+                self._session_dates_prewarmed_for = dates_prewarm_target
+                if prewarm_failed:
+                    logger.info(
+                        f"[monitor] {dates_prewarm_target} marked as date-prewarmed; "
+                        "page-prewarm degraded — first sniper poll will use cold goto()"
                     )
 
             # If a sniper window is about to open (within SNIPER_HOLD_SEC),
@@ -281,6 +297,7 @@ class TockMonitor:
                 await self.checker.close_sniper_pages()
                 # Reset so pre-warm fires again if sniper re-arms (new window same day)
                 self._session_prewarmed_for = None
+                self._session_dates_prewarmed_for = None
 
             if interval > 0:
                 # Cap sleep so the bot wakes exactly when a sniper window opens
@@ -611,6 +628,25 @@ class TockMonitor:
 
         return None
 
+    def _get_dates_prewarm_target(self) -> str | None:
+        """Return a 'DayName@HH:MM' string if any sniper window starts within
+        the next PREWARM_DATES_BEFORE_MIN minutes. None otherwise.
+
+        Used to fire the target-date PAGE prewarm closer to release than the
+        session-cookie prewarm (PREWARM_BEFORE_MIN), so pages don't sit idle
+        long enough for Cloudflare/SPA state to drift.
+        """
+        now = datetime.now(PT)
+        day_name = now.strftime("%A")
+        if day_name not in self.config.sniper_days:
+            return None
+        for start_str in self.config.sniper_times:
+            start_dt = _sniper_start_dt(now, start_str)
+            delta_sec = (start_dt - now).total_seconds()
+            if 0 < delta_sec <= PREWARM_DATES_BEFORE_MIN * 60:
+                return f"{day_name}@{start_str}"
+        return None
+
     def _get_prewarm_dates(self) -> list[date]:
         """Return up to 7 target dates within the next ~10 days to prewarm.
 
@@ -633,7 +669,10 @@ class TockMonitor:
         # Friday at T-5min). Beyond this = next release's territory.
         end = today + timedelta(days=PREWARM_LOOKAHEAD_DAYS)
         result: list[date] = []
-        current = today + timedelta(days=1)
+        # Start at PREWARM_MIN_DAYS_OUT to skip dates from the prior release.
+        # On a Fuhuihua Friday release, today+5 = next Wednesday (the earliest
+        # date in the new release window).
+        current = today + timedelta(days=PREWARM_MIN_DAYS_OUT)
         while current <= end:
             if current.strftime("%A") in days:
                 result.append(current)

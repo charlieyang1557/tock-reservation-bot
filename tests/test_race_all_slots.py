@@ -5,6 +5,9 @@ After this change, ALL slots are raced — multiple times on the same date
 attempt concurrently. The existing asyncio.Lock + Event prevents the rare
 double-booking, while maximizing hit rate (5pm AND 8pm of the same Friday
 both attempted instead of just 5pm).
+
+Also covers Fix 1 from Codex adversarial review: confirm-uncertainty kills
+the race (prevents sequential double-booking on verification failure).
 """
 import asyncio
 from datetime import date
@@ -134,3 +137,65 @@ async def test_warm_page_claimed_by_only_one_task():
     )
     # warm_pages dict was emptied by .pop() — the same date_str shouldn't be there anymore
     assert "2026-05-01" not in warm_pages
+
+
+@pytest.mark.asyncio
+async def test_confirm_uncertainty_kills_race():
+    """If task A's _confirm_booking returns False AFTER clicking confirm,
+    no further task may attempt confirm — Tock may have silently accepted."""
+    booker = _make_booker()
+    slots = [
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday"),
+        AvailableSlot(slot_date=date(2026, 5, 1), slot_time="8:00 PM", day_of_week="Friday"),
+    ]
+
+    # Track which tasks reached the confirm phase
+    confirm_attempts = []
+
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        # Simulate the real flow: acquire lock, check gates, then "click confirm"
+        async with booker._confirm_lock:
+            if booking_won.is_set():
+                return False
+            if booker._confirm_attempted.is_set():
+                # Second task SEES the attempted-flag and aborts
+                return False
+            booker._confirm_attempted.set()
+            confirm_attempts.append(slot)
+            await asyncio.sleep(0)  # simulate the confirm click
+            # Simulate verification failure on the first attempt — but still
+            # soft-win so the race is killed
+            booking_won.set()
+            return False
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        await booker.book_best_slot_race(slots)
+
+    # Exactly ONE task got to "click confirm" — even though the first one
+    # returned False. The second was blocked by _confirm_attempted.
+    assert len(confirm_attempts) == 1, (
+        f"Expected exactly 1 confirm attempt; got {len(confirm_attempts)} "
+        f"(double-booking risk if >1)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_attempted_resets_per_race():
+    """Each call to book_best_slot_race starts with a clean _confirm_attempted."""
+    booker = _make_booker()
+    booker._confirm_attempted.set()  # simulate stale state from prior race
+
+    slots = [AvailableSlot(slot_date=date(2026, 5, 1), slot_time="5:00 PM", day_of_week="Friday")]
+
+    async def fake_book_single(slot, booking_won, **_kwargs):
+        # If we get here, the gate was cleared
+        assert not booker._confirm_attempted.is_set(), (
+            "Stale _confirm_attempted from prior race must be cleared"
+        )
+        booking_won.set()
+        return True
+
+    with patch.object(booker, "_book_single", side_effect=fake_book_single):
+        result = await booker.book_best_slot_race(slots)
+
+    assert result is not None

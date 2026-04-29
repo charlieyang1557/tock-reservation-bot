@@ -1,4 +1,10 @@
-"""Tests for target-date page prewarm (Phase A+2 Task 2)."""
+"""Tests for target-date page prewarm (Phase A+2 Task 2).
+
+Also covers Codex adversarial review fixes:
+  Fix 2: split prewarm timers (cookies T-15, pages T-5)
+  Fix 3: _get_prewarm_dates skips prior-release-cycle dates
+  Fix 4: close old page before overwriting in _sniper_pages
+"""
 import asyncio
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -181,4 +187,176 @@ async def test_prewarm_all_dates_fail_returns_cleanly():
     # All 3 leaked pages should have been closed by the new finally block (Fix 1)
     assert all(p.close.called for p in pages), (
         "Failed pages must be closed to prevent leak across release windows"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Split prewarm timers — _get_dates_prewarm_target (T-5min)
+# ---------------------------------------------------------------------------
+
+def _make_monitor_with_friday_sniper():
+    """Helper: TockMonitor configured with Friday@19:59 sniper."""
+    from src.monitor import TockMonitor
+    from src.config import Config
+    config = Config(
+        tock_email="t@t.com", tock_password="pw", restaurant_slug="test",
+        party_size=2, preferred_days=["Friday"], fallback_days=[],
+        preferred_time="17:00", scan_weeks=2, dry_run=True, headless=True,
+        sniper_days=["Friday"], sniper_times=["19:59"], sniper_duration_min=11,
+        sniper_interval_sec=3, release_window_days=["Monday"],
+        release_window_start="09:00", release_window_end="11:00",
+        debug_screenshots=False, discord_webhook_url="", card_cvc="",
+    )
+    return TockMonitor(config, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+
+def test_dates_prewarm_target_returns_none_outside_window(monkeypatch):
+    """_get_dates_prewarm_target returns None when no window is in the next 5 min."""
+    import pytz
+    from datetime import datetime
+    import src.monitor as monitor_mod
+
+    mon = _make_monitor_with_friday_sniper()
+
+    # Mock "now" to a Friday at 18:00 PT — sniper at 19:59, 119 minutes away
+    PT = pytz.timezone("America/Los_Angeles")
+    fake_now = PT.localize(datetime(2026, 5, 1, 18, 0))
+
+    fake_dt = MagicMock()
+    fake_dt.now = MagicMock(return_value=fake_now)
+    monkeypatch.setattr(monitor_mod, "datetime", fake_dt)
+
+    assert mon._get_dates_prewarm_target() is None
+
+
+def test_dates_prewarm_target_fires_at_5min_window(monkeypatch):
+    """Within 5 min of sniper window opening, _get_dates_prewarm_target fires."""
+    import pytz
+    from datetime import datetime
+    import src.monitor as monitor_mod
+
+    mon = _make_monitor_with_friday_sniper()
+
+    # Mock "now" to Friday 19:55 PT — sniper at 19:59, 4 minutes away (<=5)
+    PT = pytz.timezone("America/Los_Angeles")
+    fake_now = PT.localize(datetime(2026, 5, 1, 19, 55))
+
+    fake_dt = MagicMock()
+    fake_dt.now = MagicMock(return_value=fake_now)
+    monkeypatch.setattr(monitor_mod, "datetime", fake_dt)
+
+    target = mon._get_dates_prewarm_target()
+    assert target == "Friday@19:59", f"Expected Friday@19:59; got {target}"
+
+
+def test_dates_prewarm_target_none_on_non_sniper_day(monkeypatch):
+    """_get_dates_prewarm_target returns None on a non-sniper day regardless of time."""
+    import pytz
+    from datetime import datetime
+    import src.monitor as monitor_mod
+
+    mon = _make_monitor_with_friday_sniper()
+
+    # Mock "now" to Thursday 19:55 PT — not a sniper day
+    PT = pytz.timezone("America/Los_Angeles")
+    fake_now = PT.localize(datetime(2026, 4, 30, 19, 55))  # Thursday
+
+    fake_dt = MagicMock()
+    fake_dt.now = MagicMock(return_value=fake_now)
+    monkeypatch.setattr(monitor_mod, "datetime", fake_dt)
+
+    assert mon._get_dates_prewarm_target() is None
+
+
+def test_session_dates_prewarmed_for_field_exists():
+    """TockMonitor has _session_dates_prewarmed_for field initialized to None."""
+    mon = _make_monitor_with_friday_sniper()
+    assert hasattr(mon, "_session_dates_prewarmed_for"), (
+        "TockMonitor must have _session_dates_prewarmed_for attribute (Fix 2)"
+    )
+    assert mon._session_dates_prewarmed_for is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: _get_prewarm_dates skips prior-release-cycle dates
+# ---------------------------------------------------------------------------
+
+def test_get_prewarm_dates_skips_current_release_dates(monkeypatch):
+    """On a Friday release, today+1 (Sat) and today+2 (Sun) belong to the
+    PRIOR release and must NOT be prewarmed. Only dates >=5 days out qualify."""
+    from datetime import date as _date
+    import src.monitor as monitor_mod
+
+    mon = _make_monitor_with_friday_sniper()
+    # Use preferred_days with Sat and Sun so they would appear without the fix
+    mon.config.preferred_days = ["Friday", "Saturday", "Sunday"]
+    mon.config.fallback_days = []
+
+    # Mock today to Friday 2026-05-01
+    fake_today = _date(2026, 5, 1)
+    fake_date = MagicMock(wraps=_date)
+    fake_date.today = MagicMock(return_value=fake_today)
+    monkeypatch.setattr(monitor_mod, "date", fake_date)
+
+    dates = mon._get_prewarm_dates()
+    # Skip Sat 2026-05-02 (T+1) and Sun 2026-05-03 (T+2) — prior release
+    assert _date(2026, 5, 2) not in dates, (
+        f"Sat 2026-05-02 (T+1) belongs to PRIOR release; should be skipped. Got: {dates}"
+    )
+    assert _date(2026, 5, 3) not in dates, (
+        f"Sun 2026-05-03 (T+2) belongs to PRIOR release; should be skipped. Got: {dates}"
+    )
+    # Include next-week targets (T+7 and beyond)
+    assert _date(2026, 5, 8) in dates, f"Fri 2026-05-08 (T+7) must be prewarmed. Got: {dates}"
+    assert _date(2026, 5, 9) in dates, f"Sat 2026-05-09 (T+8) must be prewarmed. Got: {dates}"
+    assert _date(2026, 5, 10) in dates, f"Sun 2026-05-10 (T+9) must be prewarmed. Got: {dates}"
+
+
+def test_get_prewarm_dates_min_days_constant_is_5():
+    """PREWARM_MIN_DAYS_OUT must be 5 — documented behavior for Friday releases."""
+    import src.monitor as monitor_mod
+    assert monitor_mod.PREWARM_MIN_DAYS_OUT == 5, (
+        f"PREWARM_MIN_DAYS_OUT must be 5; got {monitor_mod.PREWARM_MIN_DAYS_OUT}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: close old page before overwriting in _sniper_pages
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_prewarm_closes_old_page_before_overwriting():
+    """When prewarm fires twice for the same date in one process, the
+    OLD page is closed before being overwritten. Otherwise it leaks
+    (close_sniper_pages can only see what's currently in the dict)."""
+    checker = _make_checker()
+    dates = [date(2026, 5, 1)]
+
+    pages = []
+    async def make_page():
+        p = AsyncMock()
+        p.is_closed = MagicMock(return_value=False)
+        p.goto = AsyncMock()
+        p.wait_for_selector = AsyncMock()
+        p.close = AsyncMock()
+        pages.append(p)
+        return p
+    checker.browser.new_page = make_page
+
+    # First prewarm
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+    assert "2026-05-01" in checker._sniper_pages
+    first_page = pages[0]
+
+    # Second prewarm — must close the first page before storing the second
+    await checker.prewarm_target_dates(dates, stagger_sec=0)
+    assert "2026-05-01" in checker._sniper_pages
+
+    # The first page must have been closed during the second prewarm
+    assert first_page.close.called, (
+        "Old prewarmed page must be closed before overwrite — otherwise it leaks"
+    )
+    # The dict now contains the SECOND page, not the first
+    assert checker._sniper_pages["2026-05-01"] is pages[1], (
+        "Dict must hold the new page after overwrite"
     )

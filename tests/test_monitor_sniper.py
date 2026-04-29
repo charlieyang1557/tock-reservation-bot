@@ -562,11 +562,13 @@ class TestSniperWorkflowIntegration:
         time_now = [None]
         times = iter([
             # Iteration 1: 19:58:50 — hold guard fires (10s to window)
-            _pt_datetime(2026, 3, 18, 19, 58, 50),  # prewarm check
-            _pt_datetime(2026, 3, 18, 19, 58, 50),  # hold guard
+            _pt_datetime(2026, 3, 18, 19, 58, 50),  # _get_prewarm_target (cookie)
+            _pt_datetime(2026, 3, 18, 19, 58, 50),  # _get_dates_prewarm_target (Fix 2: new call)
+            _pt_datetime(2026, 3, 18, 19, 58, 50),  # _seconds_until_next_sniper (hold guard)
             # After hold sleep, iteration 2: 19:59:00 — sniper mode
-            _pt_datetime(2026, 3, 18, 19, 59, 0),   # prewarm check
-            _pt_datetime(2026, 3, 18, 19, 59, 0),   # hold guard
+            _pt_datetime(2026, 3, 18, 19, 59, 0),   # _get_prewarm_target (cookie; delta=0, None)
+            _pt_datetime(2026, 3, 18, 19, 59, 0),   # _get_dates_prewarm_target (Fix 2: new call)
+            _pt_datetime(2026, 3, 18, 19, 59, 0),   # _seconds_until_next_sniper (hold guard)
             _pt_datetime(2026, 3, 18, 19, 59, 0),   # _get_poll_interval
             _pt_datetime(2026, 3, 18, 19, 59, 0),   # _sniper_window_info inside _get_poll_interval
             # poll() runs here
@@ -575,8 +577,9 @@ class TestSniperWorkflowIntegration:
             _pt_datetime(2026, 3, 18, 19, 59, 30),  # _is_sniper_window
             _pt_datetime(2026, 3, 18, 19, 59, 30),  # _sniper_window_info inside _is_sniper
             # Sniper interval=0, asyncio.sleep(0), iteration 3
-            _pt_datetime(2026, 3, 18, 19, 59, 30),  # prewarm check
-            _pt_datetime(2026, 3, 18, 19, 59, 30),  # hold guard
+            _pt_datetime(2026, 3, 18, 19, 59, 30),  # _get_prewarm_target (cookie; None)
+            _pt_datetime(2026, 3, 18, 19, 59, 30),  # _get_dates_prewarm_target (Fix 2: new call)
+            _pt_datetime(2026, 3, 18, 19, 59, 30),  # _seconds_until_next_sniper (hold guard)
             _pt_datetime(2026, 3, 18, 19, 59, 30),  # _get_poll_interval
             _pt_datetime(2026, 3, 18, 19, 59, 30),  # _sniper_window_info
         ])

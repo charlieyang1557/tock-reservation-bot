@@ -288,6 +288,17 @@ class AvailabilityChecker:
                 await page.wait_for_selector(
                     sel.get("calendar_container"), timeout=10000
                 )
+                # If a previous prewarm parked a page for this date (e.g. a
+                # schedule re-aim or a second sniper window in the same
+                # process), close it before overwriting. Otherwise the old
+                # Page object leaks — never reachable for cleanup since
+                # close_sniper_pages() iterates the current dict.
+                old = self._sniper_pages.pop(date_str, None)
+                if old is not None:
+                    try:
+                        await old.close()
+                    except Exception:
+                        pass
                 self._sniper_pages[date_str] = page
                 page = None  # ownership transferred to _sniper_pages — don't close in finally
                 logger.info(
