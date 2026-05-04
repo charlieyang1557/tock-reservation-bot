@@ -69,6 +69,20 @@ PREWARM_DATE_CAP = 7
 # poll from burning through the critical first seconds of the window.
 _SNIPER_HOLD_SEC = 120
 
+# The sniper window opens this many seconds before actual release.  During
+# that pre-release period checker.check_all() returns immediately with no I/O
+# (see checker.py: "Pre-release phase — skipping calendar scan until release"),
+# so the run loop must sleep instead of spinning at sleep(0) — otherwise the
+# poll-rate watchdog escalates within seconds (2026-05-01 19:44 incident:
+# 120 polls in 60s, 4 watchdog trips, PM2 restart loop).  Must match the
+# threshold used in checker.py:406 — they reference the same release boundary.
+_SNIPER_PRE_RELEASE_SEC = 60.0
+# Cap a single pre-release sleep so the loop wakes promptly to cross the
+# release boundary and so tests stay responsive.  0.5s gives ~120 wakeups
+# across the 60s pre-release period — well below the watchdog's 10/5s burst
+# threshold, with plenty of margin.
+_SNIPER_PRE_RELEASE_TICK_SEC = 0.5
+
 
 class TockMonitor:
     def __init__(
@@ -309,8 +323,17 @@ class TockMonitor:
                 # Re-check release page periodically between polls (not during sniper)
                 await self._refresh_release_schedule()
             else:
-                # Sniper mode: zero sleep — yield control briefly then immediately re-poll
-                await asyncio.sleep(0)
+                # Sniper mode. During the pre-release window the checker
+                # returns instantly with no I/O, so sleep(0) here would spin
+                # the loop and trip the poll-rate watchdog (see 2026-05-01
+                # 19:44 incident: 120 polls in 60s, 4 watchdog trips).
+                # Sleep toward the release boundary; once past it, the
+                # page-load latency rate-limits naturally.
+                pre_sleep = self._pre_release_sleep_sec(datetime.now(PT))
+                if pre_sleep > 0:
+                    await asyncio.sleep(pre_sleep)
+                else:
+                    await asyncio.sleep(0)
 
     async def poll(self) -> None:
         """One full check-and-book cycle."""
@@ -334,14 +357,9 @@ class TockMonitor:
         use_concurrent = self._sniper_active and self._sniper_concurrent
         sniper_age = 0.0
         if self._sniper_active:
-            now_pt = datetime.now(PT)
-            for start_str in self.config.sniper_times:
-                start_dt = _sniper_start_dt(now_pt, start_str)
-                if now_pt >= start_dt:
-                    age = (now_pt - start_dt).total_seconds()
-                    if age < self.config.sniper_duration_min * 60:
-                        sniper_age = age
-                        break
+            age = self._current_sniper_age_sec(datetime.now(PT))
+            if age is not None:
+                sniper_age = age
 
         try:
             bypass_normal_skip = self._sniper_active or self._in_release_window()
@@ -605,6 +623,29 @@ class TockMonitor:
                 return end_dt.strftime("%H:%M")
 
         return None
+
+    def _current_sniper_age_sec(self, now: datetime) -> float | None:
+        """Seconds since the currently active sniper window started, or None
+        if *now* is not within any sniper window today."""
+        day_name = now.strftime("%A")
+        if day_name not in self.config.sniper_days:
+            return None
+        duration = timedelta(minutes=self.config.sniper_duration_min)
+        for start_str in self.config.sniper_times:
+            start_dt = _sniper_start_dt(now, start_str)
+            end_dt = start_dt + duration
+            if start_dt <= now <= end_dt:
+                return (now - start_dt).total_seconds()
+        return None
+
+    def _pre_release_sleep_sec(self, now: datetime) -> float:
+        """How long the sniper run loop should sleep when it's still in the
+        pre-release phase. Returns 0 outside sniper or once release has passed
+        — the page-load latency then rate-limits naturally."""
+        age = self._current_sniper_age_sec(now)
+        if age is None or age >= _SNIPER_PRE_RELEASE_SEC:
+            return 0.0
+        return min(_SNIPER_PRE_RELEASE_SEC - age, _SNIPER_PRE_RELEASE_TICK_SEC)
 
     def _seconds_until_next_sniper(self) -> float | None:
         """
