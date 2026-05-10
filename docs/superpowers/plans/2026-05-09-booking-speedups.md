@@ -180,7 +180,7 @@ Wire into `_book_single` to call `pool.acquire()` instead of `browser.new_page()
 
 This is the headline opportunity but has highest uncertainty. Time-box strictly.
 
-### C.0 — Reconnaissance (≤4 hours)
+### C.0 — Reconnaissance (≤4 hours) ✅ Done 2026-05-10 (CLI `python -m spikes.http_replay.recon --restaurant SLUG --date YYYY-MM-DD --party N`; headed Playwright records every interesting XHR with sensitive header / password / CVC redaction; output `spikes/http_replay/trace.json` gitignored; 7 tests in `test_http_spike_recon.py`)
 **Files:** new `spikes/http_replay/recon.py` (gitignored — exploratory only)
 **Approach:**
 1. Open Tock in headed Playwright; log into the test account.
@@ -194,18 +194,18 @@ This is the headline opportunity but has highest uncertainty. Time-box strictly.
 
 **Done when:** we have a complete trace of the booking API path with field/header names documented.
 
-### C.1 — Cookie harvest from Playwright context
+### C.1 — Cookie harvest from Playwright context ✅ Done 2026-05-10 (CLI `python -m spikes.http_replay.harvest`; reads `session_cookies.json`, drops analytics prefixes (`_ga`, `_fbp`, etc.), conservatively keeps unknown Tock-domain cookies, writes `aiohttp_cookies.json` as `{name: value}` dict ready for `aiohttp.ClientSession`; 7 tests in `test_http_spike_harvest.py`)
 **Files:** new `spikes/http_replay/harvest.py`
 **Approach:** Extract `cf_clearance`, session cookies, and any anti-CSRF token from a logged-in `BrowserContext` and serialize to a format `aiohttp.ClientSession` can consume. Verify against C.0 trace that the cookies are sufficient to authenticate.
 **Tests:** can be deferred; spike-mode allowed.
 
-### C.2 — Read-only HTTP availability probe
+### C.2 — Read-only HTTP availability probe ✅ Done 2026-05-10 — DECISION GATE READY (CLI `python -m spikes.http_replay.probe --url URL`; pure-function `classify_response(status, headers, body) -> Verdict(PASS|BLOCKED|UNCLEAR)`; CF interstitial detection mirrors `_CF_DOM_DETECT_JS`; only ever sends GET — never POSTs; 10 tests in `test_http_spike_probe.py`. **Operator must run end-to-end before C.3 ships.**)
 **Files:** new `spikes/http_replay/probe.py`
 **Approach:** With harvested cookies, fire `GET <availability_url>` via aiohttp. Compare response to what the bot's checker sees via Playwright. If the data matches and CF doesn't block, **the spike is feasible**.
 
 **Decision gate:** if response is blocked (403, CF challenge, anti-bot), abort the spike — DOM path remains the only option. Document findings in this plan and move on. **No code changes to `src/` if the spike fails.**
 
-### C.3 — Hybrid HTTP booker (only if C.2 succeeds)
+### C.3 — Hybrid HTTP booker (only if C.2 succeeds) ⏸ HELD pending operator C.2 result (per the plan: "No code changes to `src/` if the spike fails." Operator must run `recon.py` → `harvest.py` → `probe.py`. If probe returns PASS, request approval before implementing C.3.)
 **Files:** new `src/http_booker.py`, modifications to `src/booker.py` and `src/monitor.py`
 **Approach:**
 - `HttpBooker` wraps the booking POSTs (cart create, confirm).
