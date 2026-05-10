@@ -36,7 +36,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 - `test_wait_for_checkout_cancels_losing_waiters` (no warnings about un-awaited coroutines)
 **Done when:** existing booking flow tests still pass; new tests pass; mean checkout-detection latency drops measurably in `--test-booking-flow` runs.
 
-#### B1.2 — Batch `_click_time_slot` into one `page.evaluate`
+#### B1.2 — Batch `_click_time_slot` into one `page.evaluate` ✅ Done 2026-05-09 (single JS round-trip; 9 new tests in `test_click_time_slot_batched.py`; 4 legacy `test_slot_click.py` + 2 booking-fixes tests + 1 fast-handoff test rewritten to mock `page.evaluate`; `re` import dropped)
 **Saves:** 100–800 ms per booking task.
 **Files:** [src/booker.py:441–595](src/booker.py:441)
 **Approach:** Replace the per-button text_content/click loop with one JS function that takes `(target_time, generic_selectors)` and returns `{clicked: bool, text: str, reason: str}`. JS does substring + regex match in a single round-trip; click happens inside the same evaluate. Keep `strict_time_match` semantics: when True, refuse the first-button fallback in JS.

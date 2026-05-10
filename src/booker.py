@@ -30,7 +30,6 @@ inside the lock is effectively atomic — no double-bookings can occur.
 import asyncio
 import logging
 import os
-import re
 from datetime import datetime
 from enum import Enum
 
@@ -74,6 +73,76 @@ _GENERIC_BOOK_SELECTORS: frozenset[str] = frozenset({
     "button.SearchExperience-bookButton",
     "[data-testid='book-button']",
 })
+
+# Single-evaluate slot-click JS (Phase B1.2). Called from _click_time_slot.
+# Iterates DOM-side and clicks inside the same call, eliminating per-button
+# Python↔browser round-trips. Honors strict_time_match by refusing the
+# first-button fallback (Codex HIGH from Phase A+2).
+_CLICK_TIME_SLOT_JS = r"""
+(args) => {
+  const { selector, targetTime, slotTimeRaw, isGeneric, strictTimeMatch } = args;
+  const buttons = Array.from(document.querySelectorAll(selector));
+  const upperTarget = targetTime;
+  const escapedSlotTime = slotTimeRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const slotWordRe = new RegExp('\\b' + escapedSlotTime + '\\b', 'i');
+  const timeRe = /\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b/i;
+
+  let bestBtn = null;
+  let bestText = null;
+
+  for (const btn of buttons) {
+    const text = (btn.innerText || btn.textContent || '').trim();
+    const upperText = text.toUpperCase();
+
+    if (upperText.includes(upperTarget)) {
+      btn.click();
+      return { clicked: true, text, reason: 'exact' };
+    }
+
+    const m = text.match(timeRe);
+    if (m && m[1].trim().toUpperCase() === upperTarget) {
+      btn.click();
+      return { clicked: true, text, reason: 'regex' };
+    }
+
+    if (isGeneric) {
+      const parent = btn.parentElement;
+      const parentText = parent
+        ? (parent.innerText || parent.textContent || '').trim()
+        : '';
+      const parentUpper = parentText.toUpperCase();
+      if (parentUpper.includes(upperTarget) || slotWordRe.test(parentText)) {
+        btn.click();
+        return {
+          clicked: true,
+          text: parentText.slice(0, 80),
+          reason: 'generic-parent',
+        };
+      }
+      // Generic button without time confirmation in parent — never a fallback
+      continue;
+    }
+
+    if (bestBtn === null) {
+      bestBtn = btn;
+      bestText = text;
+    }
+  }
+
+  if (bestBtn !== null && !strictTimeMatch) {
+    bestBtn.click();
+    return { clicked: true, text: bestText, reason: 'first-fallback' };
+  }
+  if (bestBtn !== null && strictTimeMatch) {
+    return {
+      clicked: false,
+      text: bestText,
+      reason: 'strict-refused-fallback',
+    };
+  }
+  return { clicked: false, text: null, reason: 'no-match' };
+}
+"""
 
 # How long to wait for the user to add a payment card (Tock holds slots ~10 min)
 PAYMENT_WAIT_TIMEOUT_SEC = 540   # 9 minutes
@@ -504,94 +573,67 @@ class TockBooker:
             )
             return False
 
-        # Iterate buttons to find one matching slot.slot_time
-        locator = page.locator(matched_selector)
-        count = await locator.count()
+        # Single browser-side iteration: match + click in one round-trip.
         target_time = slot.slot_time.strip().upper()
         is_generic = matched_selector in _GENERIC_BOOK_SELECTORS
+        try:
+            result = await page.evaluate(
+                _CLICK_TIME_SLOT_JS,
+                {
+                    "selector": matched_selector,
+                    "targetTime": target_time,
+                    "slotTimeRaw": slot.slot_time,
+                    "isGeneric": is_generic,
+                    "strictTimeMatch": strict_time_match,
+                },
+            )
+        except Exception as e:
+            logger.error(f"[book] Slot-click evaluate failed: {type(e).__name__}: {e}")
+            return False
 
-        best_btn = None
-        for i in range(count):
-            btn = locator.nth(i)
-            try:
-                text = (await btn.text_content() or "").strip()
+        if not isinstance(result, dict):
+            logger.error(f"[book] Slot-click JS returned unexpected shape: {result!r}")
+            return False
 
-                # Exact time match in button text → click immediately
-                if target_time in text.upper():
-                    await btn.click()
-                    logger.info(
-                        f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
-                    )
-                    return True
+        clicked = bool(result.get("clicked"))
+        reason = result.get("reason", "")
+        text = result.get("text")
 
-                # Regex time match in button text
-                time_match = re.search(
-                    r'\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b', text, re.IGNORECASE
+        if clicked:
+            if reason == "exact":
+                logger.info(
+                    f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
                 )
-                if time_match and time_match.group(1).strip().upper() == target_time:
-                    await btn.click()
-                    logger.info(f"[book] Clicked slot button (regex match): {text}")
-                    return True
-
-                # Generic "Book" button: only click if parent container has target time.
-                # This prevents clicking the restaurant-level "Book now" button by mistake.
-                if is_generic:
-                    try:
-                        parent_text = (
-                            await btn.locator("..").text_content() or ""
-                        ).strip()
-                    except Exception:
-                        parent_text = ""
-                    if target_time in parent_text.upper() or re.search(
-                        r'\b' + re.escape(slot.slot_time) + r'\b',
-                        parent_text, re.IGNORECASE
-                    ):
-                        await btn.click()
-                        logger.info(
-                            f"[book] Clicked generic 'Book' button — "
-                            f"time confirmed in parent: {parent_text[:80]!r}"
-                        )
-                        return True
-                    logger.debug(
-                        f"[book] Generic button at index {i} skipped — "
-                        f"no time match in parent: {parent_text[:80]!r}"
-                    )
-                    continue  # do NOT set best_btn for unmatched generic buttons
-
-                if best_btn is None:
-                    best_btn = btn
-            except Exception:
-                continue
-
-        # Fallback: click first non-generic button (only reached for specific selectors).
-        # Suppressed in strict mode: a warm/handoff page that no longer shows
-        # the target time means the slot vanished — clicking anything else
-        # would book the wrong time. Returning False instead lets the race
-        # try a different slot or fall back to fresh navigation next poll.
-        if best_btn is not None and not strict_time_match:
-            try:
-                text = (await best_btn.text_content() or "").strip()
-                await best_btn.click()
+            elif reason == "regex":
+                logger.info(f"[book] Clicked slot button (regex match): {text}")
+            elif reason == "generic-parent":
+                logger.info(
+                    f"[book] Clicked generic 'Book' button — "
+                    f"time confirmed in parent: {text!r}"
+                )
+            elif reason == "first-fallback":
                 logger.warning(
                     f"[book] No exact time match for '{slot.slot_time}' — "
                     f"clicked first specific button: {text}"
                 )
-                return True
-            except Exception as e:
-                logger.error(f"[book] Could not click fallback slot button: {e}")
-                return False
-        if best_btn is not None and strict_time_match:
+            else:
+                logger.info(
+                    f"[book] Clicked slot button (reason={reason!r}): {text}"
+                )
+            return True
+
+        if reason == "strict-refused-fallback":
             logger.warning(
                 f"[book] No exact time match for '{slot.slot_time}' on warm "
                 "page; refusing first-button fallback (slot likely vanished) "
                 "— returning False so the race tries another slot or a fresh "
                 "page next poll"
             )
-
-        logger.error(
-            f"[book] No clickable slot button found for '{slot.slot_time}' "
-            f"(selector: {matched_selector!r})"
-        )
+        else:
+            logger.error(
+                f"[book] No clickable slot button found for '{slot.slot_time}' "
+                f"(selector: {matched_selector!r})"
+            )
         return False
 
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:

@@ -1,4 +1,9 @@
-"""Tests for time-slot matching in booker._click_time_slot()."""
+"""Tests for time-slot matching in booker._click_time_slot().
+
+Post-B1.2: the per-button match/click is one page.evaluate call. These
+tests mock that evaluate response and assert the wrapper handles each
+JS outcome correctly. The actual JS algorithm is reviewed inline in
+src/booker.py and exercised end-to-end via --test-booking-flow."""
 import pytest
 from datetime import date
 from unittest.mock import AsyncMock, MagicMock
@@ -24,106 +29,108 @@ def _make_slot(time_str: str = "5:00 PM") -> AvailableSlot:
     return AvailableSlot(slot_date=date(2026, 4, 17), slot_time=time_str, day_of_week="Friday")
 
 
+def _make_page_with_eval(matched_count: int, evaluate_result: dict):
+    """Build a page where the first slot selector matches `matched_count`
+    elements and page.evaluate returns `evaluate_result`."""
+    page = AsyncMock()
+    page.wait_for_selector = AsyncMock(return_value=True)
+    page.evaluate = AsyncMock(return_value=evaluate_result)
+
+    locator_mock = MagicMock()
+    locator_mock.count = AsyncMock(return_value=matched_count)
+    page.locator = MagicMock(return_value=locator_mock)
+    return page
+
+
 class TestClickTimeSlot:
     @pytest.mark.asyncio
     async def test_clicks_matching_time_not_first(self):
-        """When target is '8:00 PM' but '5:00 PM' is first, click '8:00 PM'."""
+        """When target is '8:00 PM' but '5:00 PM' is first, JS must report
+        an exact match on '8:00 PM' (not a fallback to the first button)."""
         booker = TockBooker(_make_config(), MagicMock(), MagicMock())
         slot = _make_slot("8:00 PM")
-
-        btn_5pm = AsyncMock()
-        btn_5pm.text_content = AsyncMock(return_value="5:00 PM\nBook")
-        btn_8pm = AsyncMock()
-        btn_8pm.text_content = AsyncMock(return_value="8:00 PM\nBook")
-        btn_8pm.click = AsyncMock()
-
-        page = AsyncMock()
-        locator_mock = MagicMock()
-        locator_mock.count = AsyncMock(return_value=2)
-        locator_mock.nth = MagicMock(side_effect=lambda i: [btn_5pm, btn_8pm][i])
-        page.locator = MagicMock(return_value=locator_mock)
-        page.wait_for_selector = AsyncMock(return_value=True)
+        # JS does the iteration and reports exact match on the 2nd button
+        page = _make_page_with_eval(
+            matched_count=2,
+            evaluate_result={"clicked": True, "text": "8:00 PM\nBook", "reason": "exact"},
+        )
 
         result = await booker._click_time_slot(page, slot)
         assert result is True
-        btn_8pm.click.assert_awaited_once()
+        # The wrapper passed the right target time; JS returned a non-fallback reason
+        args, _ = page.evaluate.call_args
+        js_arg = args[1] if len(args) > 1 else args[0]
+        assert js_arg["targetTime"] == "8:00 PM"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_first_when_no_match(self):
-        """If no button matches, click first button with warning."""
+        """If no button matches and not strict, JS reports first-fallback
+        clicked → wrapper returns True."""
         booker = TockBooker(_make_config(), MagicMock(), MagicMock())
         slot = _make_slot("9:00 PM")
-
-        btn = AsyncMock()
-        btn.text_content = AsyncMock(return_value="5:00 PM\nBook")
-        btn.click = AsyncMock()
-
-        page = AsyncMock()
-        locator_mock = MagicMock()
-        locator_mock.count = AsyncMock(return_value=1)
-        locator_mock.nth = MagicMock(return_value=btn)
-        page.locator = MagicMock(return_value=locator_mock)
-        page.wait_for_selector = AsyncMock(return_value=True)
+        page = _make_page_with_eval(
+            matched_count=1,
+            evaluate_result={
+                "clicked": True,
+                "text": "5:00 PM\nBook",
+                "reason": "first-fallback",
+            },
+        )
 
         result = await booker._click_time_slot(page, slot)
         assert result is True
-        btn.click.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_case_insensitive_match(self):
-        """Match should be case-insensitive."""
+        """JS does .toUpperCase() on both sides; wrapper trusts the result.
+
+        We assert the wrapper passes the UPPERCASED target_time to JS so
+        the JS-side comparison always matches case-correctly."""
         booker = TockBooker(_make_config(), MagicMock(), MagicMock())
-        slot = _make_slot("5:00 pm")  # lowercase
-
-        btn = AsyncMock()
-        btn.text_content = AsyncMock(return_value="5:00 PM\nBook")
-        btn.click = AsyncMock()
-
-        page = AsyncMock()
-        locator_mock = MagicMock()
-        locator_mock.count = AsyncMock(return_value=1)
-        locator_mock.nth = MagicMock(return_value=btn)
-        page.locator = MagicMock(return_value=locator_mock)
-        page.wait_for_selector = AsyncMock(return_value=True)
+        slot = _make_slot("5:00 pm")  # lowercase input
+        page = _make_page_with_eval(
+            matched_count=1,
+            evaluate_result={"clicked": True, "text": "5:00 PM\nBook", "reason": "exact"},
+        )
 
         result = await booker._click_time_slot(page, slot)
         assert result is True
-        btn.click.assert_awaited_once()
+        args, _ = page.evaluate.call_args
+        js_arg = args[1] if len(args) > 1 else args[0]
+        assert js_arg["targetTime"] == "5:00 PM"  # uppercased
 
     @pytest.mark.asyncio
     async def test_no_buttons_returns_false(self):
-        """If no slot buttons are found at all, return False."""
+        """If no slot buttons are found, wrapper short-circuits without
+        calling page.evaluate at all."""
         booker = TockBooker(_make_config(), MagicMock(), MagicMock())
         slot = _make_slot("5:00 PM")
 
         page = AsyncMock()
+        page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+        page.evaluate = AsyncMock()  # should NOT be called
+
         locator_mock = MagicMock()
         locator_mock.count = AsyncMock(return_value=0)
         page.locator = MagicMock(return_value=locator_mock)
-        page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
 
         result = await booker._click_time_slot(page, slot)
         assert result is False
+        page.evaluate.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_regex_time_match(self):
-        """Match via regex extraction when text has extra content."""
+        """JS reports a regex (not exact substring) match → wrapper returns True."""
         booker = TockBooker(_make_config(), MagicMock(), MagicMock())
         slot = _make_slot("7:30 PM")
-
-        btn_other = AsyncMock()
-        btn_other.text_content = AsyncMock(return_value="Dinner Experience\n$250")
-        btn_target = AsyncMock()
-        btn_target.text_content = AsyncMock(return_value="Dinner Experience 7:30 PM\n$250")
-        btn_target.click = AsyncMock()
-
-        page = AsyncMock()
-        locator_mock = MagicMock()
-        locator_mock.count = AsyncMock(return_value=2)
-        locator_mock.nth = MagicMock(side_effect=lambda i: [btn_other, btn_target][i])
-        page.locator = MagicMock(return_value=locator_mock)
-        page.wait_for_selector = AsyncMock(return_value=True)
+        page = _make_page_with_eval(
+            matched_count=2,
+            evaluate_result={
+                "clicked": True,
+                "text": "Dinner Experience 7:30 PM\n$250",
+                "reason": "regex",
+            },
+        )
 
         result = await booker._click_time_slot(page, slot)
         assert result is True
-        btn_target.click.assert_awaited_once()

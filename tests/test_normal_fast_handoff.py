@@ -766,7 +766,12 @@ class TestStrictTimeMatchOnWarmPage:
     @pytest.mark.asyncio
     async def test_non_strict_default_keeps_existing_fallback(self):
         """Default (no warm page) preserves the existing fallback so
-        fresh-navigation booking continues to work."""
+        fresh-navigation booking continues to work.
+
+        Post-B1.2: the fallback decision is in the JS — when the JS reports
+        a `first-fallback` click, the wrapper returns True and propagates
+        strict_time_match=False to the JS so it knows the fallback is
+        permitted."""
         from src.booker import TockBooker
 
         cfg = _make_config(dry_run=False)
@@ -776,14 +781,14 @@ class TestStrictTimeMatchOnWarmPage:
         page.url = "https://www.exploretock.com/test/search?date=2026-05-08"
         page.is_closed = MagicMock(return_value=False)
         page.wait_for_selector = AsyncMock()
-
-        wrong_btn = AsyncMock()
-        wrong_btn.text_content = AsyncMock(return_value="8:00 PM")
-        wrong_btn.click = AsyncMock()
+        page.evaluate = AsyncMock(return_value={
+            "clicked": True,
+            "text": "8:00 PM",
+            "reason": "first-fallback",
+        })
 
         button_locator = MagicMock()
         button_locator.count = AsyncMock(return_value=1)
-        button_locator.nth = MagicMock(return_value=wrong_btn)
         page.locator = MagicMock(return_value=button_locator)
 
         slot = AvailableSlot(
@@ -794,9 +799,12 @@ class TestStrictTimeMatchOnWarmPage:
 
         result = await booker._click_time_slot(page, slot)
 
-        # Default behavior: clicks the first specific button as fallback
+        # Default behavior: JS-side fallback fires, wrapper accepts it
         assert result is True
-        wrong_btn.click.assert_called_once()
+        # And the JS was told strict mode is off so the fallback was permitted
+        args, _ = page.evaluate.call_args
+        js_arg = args[1] if len(args) > 1 else args[0]
+        assert js_arg["strictTimeMatch"] is False
 
     @pytest.mark.asyncio
     async def test_warm_page_passes_strict_match_to_click_time_slot(self):
