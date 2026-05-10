@@ -141,17 +141,40 @@ class PagePool:
         On the hot path this MUST NOT block waiting for refill — sniper
         polls every 3 s, and we cannot stall for 200 ms.
 
+        Codex B3 review MEDIUM 3: pop-and-discard closed pages until we
+        find a usable one. A pre-warmed page can become unusable if the
+        Chromium process crashed or another code path closed it. Without
+        this check, _book_single would receive a closed page and fail
+        only when trying to navigate during a release window.
+
         Raises whatever ``browser.new_page()`` raises if the pool is empty
         and creating a fresh page fails — callers must handle this.
         """
-        if self._pool:
+        while self._pool:
             page = self._pool.popleft()
-            # Schedule a refill in the background so the next acquire is
-            # also fast. Best-effort; failures are logged but not raised.
+            # Validate the page is still usable. A pre-warmed page may
+            # have crashed or been closed elsewhere.
+            try:
+                if hasattr(page, "is_closed") and page.is_closed():
+                    logger.debug(
+                        "[pool] Discarding closed pre-warmed page; "
+                        "trying next or falling through to new_page()"
+                    )
+                    # Don't count this as a successful acquire — schedule
+                    # a refill so the pool returns to target_size and try
+                    # the next pooled page (or fall through if none left).
+                    self._schedule_refill()
+                    continue
+            except Exception:
+                # If is_closed itself raises, treat the page as unusable.
+                self._schedule_refill()
+                continue
+            # Found a live page — schedule a refill and return it.
             self._schedule_refill()
             return page
 
-        # Pool empty (or disabled). Caller owns the page lifecycle from here.
+        # Pool empty (or all pages were closed). Caller owns the page
+        # lifecycle from here.
         return await self.browser.new_page()
 
     async def release(self, page: Page) -> None:

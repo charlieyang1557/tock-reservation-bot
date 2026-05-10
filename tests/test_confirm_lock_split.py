@@ -89,7 +89,7 @@ async def test_two_tasks_prepare_concurrently_then_one_clicks():
     can_finish_prep = asyncio.Event()
     click_count = 0
 
-    async def fake_prepare(page, slot):
+    async def fake_prepare(page, slot, **_kwargs):
         nonlocal in_prep_count
         in_prep_count += 1
         if in_prep_count >= 2:
@@ -156,7 +156,7 @@ async def test_confirm_attempted_blocks_second_click_after_prep():
     abort_count = 0
 
     # Prep always succeeds for both tasks
-    async def fake_prepare(page, slot):
+    async def fake_prepare(page, slot, **_kwargs):
         return True
 
     # Track who clicked vs aborted
@@ -217,7 +217,7 @@ async def test_no_double_booking_under_high_concurrency():
 
     click_count = 0
 
-    async def fake_prepare(page, slot):
+    async def fake_prepare(page, slot, **_kwargs):
         # Simulate non-trivial prep that yields multiple times
         for _ in range(3):
             await asyncio.sleep(0)
@@ -273,7 +273,7 @@ async def test_prep_failure_returns_false_without_clicking():
 
     click_count = 0
 
-    async def fake_prepare(page, slot):
+    async def fake_prepare(page, slot, **_kwargs):
         return False  # CVC missing, payment never confirmed, etc.
 
     async def fake_click(page, slot):

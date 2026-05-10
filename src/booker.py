@@ -508,7 +508,9 @@ class TockBooker:
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
 
-            prep_ok = await self._prepare_for_confirm(page, slot)
+            prep_ok = await self._prepare_for_confirm(
+                page, slot, booking_won=booking_won
+            )
             if not prep_ok:
                 return False
 
@@ -947,7 +949,10 @@ class TockBooker:
         except Exception as e:
             logger.debug(f"[book] Screenshot failed at step '{step}': {e}")
 
-    async def _prepare_for_confirm(self, page: Page, slot: AvailableSlot) -> bool:
+    async def _prepare_for_confirm(
+        self, page: Page, slot: AvailableSlot,
+        booking_won: asyncio.Event | None = None,
+    ) -> bool:
         """Per-page idempotent preparation for the confirm click. Runs
         WITHOUT the lock so N racing tasks can prep concurrently
         (Phase B3.1).
@@ -958,7 +963,10 @@ class TockBooker:
           - CVC fill on the saved card (if any)
           - wait for the confirm button to be visible
 
-        Returns True iff the page is in a ready-to-click state.
+        Returns True iff the page is in a ready-to-click state. Returns
+        False early if `booking_won` is set during the payment-card
+        wait (Codex B3 review MEDIUM 1: avoids N*4 reloads/min when
+        N racing tasks are all waiting for the same card to appear).
         """
         needs_payment = await self._page_needs_payment(page)
         has_card = await self._has_saved_card(page)
@@ -971,8 +979,21 @@ class TockBooker:
             )
             waited = 0
             while waited < PAYMENT_WAIT_TIMEOUT_SEC:
+                # Codex B3 MEDIUM 1: short-circuit if another racing task
+                # already won — no point reloading our page every 15s.
+                if booking_won is not None and booking_won.is_set():
+                    logger.info(
+                        "[book] Another slot already booked while waiting "
+                        "for payment card. Aborting this task's wait."
+                    )
+                    return False
                 await asyncio.sleep(PAYMENT_POLL_INTERVAL_SEC)
                 waited += PAYMENT_POLL_INTERVAL_SEC
+                if booking_won is not None and booking_won.is_set():
+                    logger.info(
+                        "[book] booking_won fired during sleep; aborting wait."
+                    )
+                    return False
                 await page.reload(wait_until="domcontentloaded")
                 await page.wait_for_timeout(2000)
                 if await self._has_saved_card(page):
@@ -1076,16 +1097,28 @@ class TockBooker:
             return False
 
     async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
-        """Backwards-compat shim: prep + click + verify in one call.
+        """Safe-by-default shim that runs prep + click + verify under
+        the same safety guards as _book_single.
 
-        Phase B3.1 split this into `_prepare_for_confirm` (no lock) and
-        `_execute_confirm_click_and_verify` (under lock). The shim is
-        kept so existing tests / callers that invoke the whole thing
-        still work, but `_book_single` no longer uses it.
+        Codex B3 review HIGH 1: an earlier version of this shim called
+        prep + click directly without acquiring `_confirm_lock` or
+        checking `_confirm_attempted`. Any concurrent caller of the
+        shim could have double-clicked confirm despite the new B3.1
+        safety design. The shim now self-locks so future callers
+        cannot accidentally bypass safety, even though `_book_single`
+        no longer uses it.
         """
         if not await self._prepare_for_confirm(page, slot):
             return False
-        return await self._execute_confirm_click_and_verify(page, slot)
+        async with self._confirm_lock:
+            if self._confirm_attempted.is_set():
+                logger.warning(
+                    f"[book] _confirm_booking shim: another confirm already "
+                    f"attempted; refusing to click again for {slot}"
+                )
+                return False
+            self._confirm_attempted.set()
+            return await self._execute_confirm_click_and_verify(page, slot)
 
     # ------------------------------------------------------------------
     # Payment detection helpers

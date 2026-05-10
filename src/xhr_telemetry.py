@@ -141,13 +141,16 @@ class XhrTelemetryRecorder:
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "a", encoding="utf-8") as f:
+                # Codex B3 review MEDIUM 2: batch all line writes, then ONE
+                # flush + fsync. Per-line fsync was 50–200 ms per flush in
+                # sniper mode and blocked the event loop on the hot path.
                 for rec in to_write:
                     f.write(json.dumps(rec) + "\n")
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except Exception:
-                        pass
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
             logger.debug(
                 f"[xhr-telemetry] flushed {len(to_write)} XHR record(s) "
                 f"to {self.log_path}"
