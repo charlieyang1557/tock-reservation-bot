@@ -73,6 +73,15 @@ class Config:
     # latency in races. 0 disables the pool entirely (operator side switch).
     page_pool_size: int = 4
 
+    # B3.2 fast-path — SPA-header replay (76× detection speedup, empirical).
+    # When True, AvailabilityChecker.check_all uses src/calendar_replay.py
+    # to fetch slot availability via in-browser fetch() with replayed Tock
+    # SPA headers (~160ms per poll vs ~12s today). Falls back to the
+    # existing per-date page-reload path on any failure.
+    # Default OFF — opt in after verifying against benu via
+    # spikes/http_replay/validate_replay.py.
+    use_calendar_replay: bool = False
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -129,6 +138,7 @@ def load_config() -> Config:
         event_driven_detection=os.getenv("EVENT_DRIVEN_DETECTION", "false").lower() == "true",
         event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),
         page_pool_size=int(os.getenv("PAGE_POOL_SIZE", "4")),
+        use_calendar_replay=os.getenv("USE_CALENDAR_REPLAY", "false").lower() == "true",
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 

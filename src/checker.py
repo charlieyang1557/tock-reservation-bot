@@ -270,10 +270,100 @@ class AvailabilityChecker:
         # because they signal different operational risks.
         self._sniper_cf_challenges: int = 0
         self._sniper_cf_attempts: int = 0
+        # B3.2 fast-path (USE_CALENDAR_REPLAY=true). Lazy-initialized on
+        # first call to check_all when the flag is enabled. Auto-invalidated
+        # on fetch failure so the next poll re-initializes.
+        from typing import TYPE_CHECKING
+        if TYPE_CHECKING:
+            from src.calendar_replay import CalendarReplaySession  # noqa: F401
+        self._replay_session = None  # type: ignore[var-annotated]
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
+
+    async def _try_calendar_replay(
+        self, sniper_mode: bool
+    ) -> "list[AvailableSlot] | None":
+        """B3.2 fast-path: fetch + parse Tock's calendar protobuf via
+        in-browser fetch() with replayed SPA headers.
+
+        Returns the list of available slots filtered to preferred + fallback
+        dates, OR None if the path cannot be used this poll (session not yet
+        initialized AND init failed, or fetch returned None, or parse failed).
+        Caller falls back to the legacy per-date scan on None.
+
+        Lazy-initializes `self._replay_session` on first call OR after a
+        prior fetch failed (consecutive_failures > 0). Re-uses the session
+        across polls otherwise — the captured headers are reused indefinitely
+        until they expire (JWT exp is 2027 per recon trace; sniper window
+        is ~11 min, so expiry is not a real concern within a window).
+        """
+        from src.calendar_replay import (
+            initialize_replay_session, fetch_calendar,
+            parse_available_slots, close_session,
+        )
+
+        # Compute the union of dates we care about (preferred + fallback)
+        target_dates = list(self._get_target_dates(
+            self.config.preferred_days, sniper_mode=sniper_mode
+        ))
+        target_dates += list(self._get_target_dates(
+            self.config.fallback_days, sniper_mode=sniper_mode
+        ))
+        if not target_dates:
+            return []
+
+        # Ensure session is alive
+        sess = self._replay_session
+        if sess is None or sess.consecutive_failures >= 1:
+            if sess is not None:
+                # Stale; close and re-init
+                await close_session(sess)
+                self._replay_session = None
+            # Use the first preferred date for navigation; the URL only
+            # affects the initial page load — the captured calendar/full
+            # call returns ALL available dates regardless.
+            init_date = target_dates[0]
+            preferred_time = getattr(self.config, "preferred_time", "17:00")
+            party_size = getattr(self.config, "party_size", 2)
+            sess = await initialize_replay_session(
+                self.browser,
+                self.config.restaurant_slug,
+                init_date,
+                party_size=party_size,
+                preferred_time=preferred_time,
+            )
+            if sess is None:
+                logger.warning(
+                    "[check-replay] initialize_replay_session returned None — "
+                    "calendar/full XHR did not fire within timeout (likely CF "
+                    "challenge or login expired)"
+                )
+                return None
+            self._replay_session = sess
+
+        # Fetch + parse
+        body = await fetch_calendar(sess)
+        if body is None:
+            return None
+        try:
+            slots = parse_available_slots(body, target_dates)
+        except Exception as e:
+            logger.error(
+                f"[check-replay] parse_available_slots raised: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        return slots
+
+    async def close_replay_session(self) -> None:
+        """Close the replay session (best-effort). Called on shutdown
+        OR when sniper window ends (so the next window starts fresh)."""
+        from src.calendar_replay import close_session
+        sess = self._replay_session
+        self._replay_session = None
+        await close_session(sess)
 
     def clear_skip_cache(self) -> None:
         """Clear the sniper-mode skip-date cache. Call at the start of each sniper poll."""
@@ -662,6 +752,46 @@ class AvailabilityChecker:
         self._wait_for_calendar = _counting_wait  # type: ignore[method-assign]
 
         try:
+            # B3.2 fast-path: SPA-header replay (76× detection speedup).
+            # When enabled, fetch the entire calendar via one in-browser
+            # fetch() call (~160ms) instead of N concurrent page reloads.
+            # On any failure (None body, parse exception, session not
+            # initialized): set last_errors=1 to mark the path failed and
+            # fall through to the existing per-date scan.
+            if getattr(self.config, "use_calendar_replay", False):
+                replay_slots = await self._try_calendar_replay(
+                    sniper_mode=keep_pages
+                )
+                if replay_slots is not None:
+                    # Success — track + return without running the
+                    # per-date scan.
+                    for slot in replay_slots:
+                        try:
+                            if keep_pages:
+                                self.tracker.record_deferred(
+                                    slot.slot_date, slot.slot_time
+                                )
+                            else:
+                                self.tracker.record(
+                                    slot.slot_date, slot.slot_time
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                f"[check] tracker.record failed: {e}"
+                            )
+                    self.last_errors = 0
+                    self.last_checks = 1  # one fetch represents the whole scan
+                    logger.info(
+                        f"[check-replay] {len(replay_slots)} slot(s) via "
+                        f"calendar-replay fast-path"
+                    )
+                    return replay_slots
+                # Replay returned None: log and fall through to legacy path
+                logger.warning(
+                    "[check-replay] fast-path failed this poll; falling "
+                    "back to per-date page-reload scan"
+                )
+
             async def _scan_dates(dates: list[date]) -> list[AvailableSlot]:
                 if not dates:
                     return []
