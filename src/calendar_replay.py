@@ -54,6 +54,16 @@ _CALENDAR_URL_FRAGMENT = "consumer/calendar/full"
 # Date marker pattern in the protobuf body (plain ASCII inside binary frame)
 _DATE_RE = re.compile(rb"20\d{2}-\d{2}-\d{2}")
 
+# Codex review HIGH 2: detect non-protobuf 200 responses (CF interstitial,
+# auth-stripped empty body) so the caller can fall back to legacy DOM
+# polling instead of treating the empty parse as "no slots available".
+_HTML_SIGNATURE_BYTES = (b"<!doctype", b"<html", b"<HTML", b"<HEAD", b"<head")
+
+# Below this byte threshold, a 200 response is too small to plausibly be a
+# real calendar with availability AND too small to be a CF interstitial —
+# safer to treat as failure (fall back) than as "no slots success".
+_PROTOBUF_MIN_PLAUSIBLE_BYTES = 20
+
 # Time marker pattern (HH:MM, 24-hour). Note: the body has many "00:00"
 # style framing artifacts (zero offsets in the protobuf wire format) so
 # we filter to plausible booking times (10:00–23:59).
@@ -142,6 +152,25 @@ async def initialize_replay_session(
     )
 
 
+def body_looks_protobuf(body: bytes) -> bool:
+    """Return True if `body` plausibly looks like a Tock calendar/full
+    protobuf response (Codex review HIGH 2 fix).
+
+    Returns False for:
+      - HTML bodies (CF interstitial, error pages)
+      - bodies smaller than _PROTOBUF_MIN_PLAUSIBLE_BYTES
+      - empty bodies
+
+    True signals "ok to parse"; False signals "fall back to legacy".
+    """
+    if not body or len(body) < _PROTOBUF_MIN_PLAUSIBLE_BYTES:
+        return False
+    head = body[:60].lower()
+    if any(sig in head for sig in (b"<!doctype", b"<html", b"<head")):
+        return False
+    return True
+
+
 async def fetch_calendar(session: CalendarReplaySession) -> bytes | None:
     """Fire one fetch() from inside the captured page using replayed
     headers. Returns the protobuf body bytes on success, or None on
@@ -195,8 +224,21 @@ async def fetch_calendar(session: CalendarReplaySession) -> bytes | None:
         )
         return None
 
-    session.consecutive_failures = 0
     body = base64.b64decode(result["body_b64"])
+    # Codex HIGH 2: detect HTML / too-small responses so the caller
+    # falls back to DOM polling instead of treating empty parse as
+    # "no slots available" — that would suppress a real release.
+    if not body_looks_protobuf(body):
+        session.consecutive_failures += 1
+        head_repr = body[:80].decode("utf-8", errors="replace")
+        logger.warning(
+            f"[calendar-replay] {session.restaurant_slug}: 200 OK but body "
+            f"does not look protobuf ({len(body)}b, starts: {head_repr!r}). "
+            "Likely CF interstitial / Tock schema change. Treating as failure."
+        )
+        return None
+
+    session.consecutive_failures = 0
     logger.debug(
         f"[calendar-replay] {session.restaurant_slug}: "
         f"fetched {len(body)}b in {session.last_fetch_ms}ms"
@@ -280,6 +322,54 @@ def parse_available_slots(
                 )
             )
     return result
+
+
+def cap_slots_per_date(
+    slots: list["AvailableSlot"], preferred_time: str = "17:00",
+    per_date_cap: int = 3,
+) -> list["AvailableSlot"]:
+    """Codex HIGH 1 fix: cap replay output to top K slots per date,
+    sorted by closeness to preferred_time. Avoids the booker fanning
+    out into 100+ concurrent booking pages on calendar/full responses
+    that include the whole 14-day calendar.
+
+    Empirical: replay returns 145 slots / cycle on benu (10× more than
+    the per-date DOM scan). Without this cap, book_best_slot_race
+    would race every single slot — Tock ban risk.
+
+    Sort key per date: minutes-distance from preferred_time. Returns
+    a flat list ordered by (date, distance-from-preferred).
+    """
+    # Parse preferred_time once
+    try:
+        pref_h, pref_m = preferred_time.split(":")
+        pref_minutes = int(pref_h) * 60 + int(pref_m)
+    except Exception:
+        pref_minutes = 17 * 60  # 5pm fallback
+
+    def _slot_minutes(s: "AvailableSlot") -> int:
+        m = re.match(r"(\d{1,2}):(\d{2}) (AM|PM)", s.slot_time)
+        if not m:
+            return 9999
+        hh = int(m.group(1)) % 12
+        mm = int(m.group(2))
+        if m.group(3) == "PM":
+            hh += 12
+        return hh * 60 + mm
+
+    # Group by date, sort each group by distance from preferred, keep top K
+    from collections import defaultdict
+    by_date: dict[str, list] = defaultdict(list)
+    for s in slots:
+        by_date[s.slot_date_str].append(s)
+    out: list = []
+    for date_str in sorted(by_date.keys()):
+        ranked = sorted(
+            by_date[date_str],
+            key=lambda s: abs(_slot_minutes(s) - pref_minutes),
+        )
+        out.extend(ranked[:per_date_cap])
+    return out
 
 
 def _format_24h_to_12h(hh: int, mm: int) -> str:

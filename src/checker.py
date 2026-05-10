@@ -277,10 +277,24 @@ class AvailabilityChecker:
         if TYPE_CHECKING:
             from src.calendar_replay import CalendarReplaySession  # noqa: F401
         self._replay_session = None  # type: ignore[var-annotated]
+        # Codex MEDIUM 4: circuit breaker. Track replay failures; once we
+        # exceed _REPLAY_FAILURE_THRESHOLD consecutive failures, stop
+        # attempting replay until the next sniper window starts (i.e.,
+        # close_replay_session() resets us). Avoids hammering Tock with
+        # known-broken auth/headers while the legacy path runs each poll.
+        self._replay_failure_count: int = 0
+        self._replay_circuit_open: bool = False
 
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
+
+    # Circuit-breaker threshold: after this many consecutive replay
+    # failures, stop attempting replay until close_replay_session()
+    # resets us (typically at sniper-window end). 3 = "give it a few
+    # tries in case of transient network blip" without "every poll
+    # incurs init+fetch cost on a known-broken auth path".
+    _REPLAY_FAILURE_THRESHOLD: int = 3
 
     async def _try_calendar_replay(
         self, sniper_mode: bool
@@ -301,8 +315,14 @@ class AvailabilityChecker:
         """
         from src.calendar_replay import (
             initialize_replay_session, fetch_calendar,
-            parse_available_slots, close_session,
+            parse_available_slots, close_session, cap_slots_per_date,
         )
+
+        # Codex MEDIUM 4: circuit breaker — if we've failed enough times
+        # this sniper window, stop trying replay until close_replay_session
+        # resets the breaker (typically at window end).
+        if self._replay_circuit_open:
+            return None
 
         # Compute the union of dates we care about (preferred + fallback)
         target_dates = list(self._get_target_dates(
@@ -340,12 +360,28 @@ class AvailabilityChecker:
                     "calendar/full XHR did not fire within timeout (likely CF "
                     "challenge or login expired)"
                 )
+                self._replay_failure_count += 1
+                if self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD:
+                    self._replay_circuit_open = True
+                    logger.error(
+                        f"[check-replay] CIRCUIT OPEN after "
+                        f"{self._replay_failure_count} consecutive failures. "
+                        "Disabling replay path until close_replay_session() "
+                        "is called (typically at sniper window end)."
+                    )
                 return None
             self._replay_session = sess
 
         # Fetch + parse
         body = await fetch_calendar(sess)
         if body is None:
+            self._replay_failure_count += 1
+            if self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD:
+                self._replay_circuit_open = True
+                logger.error(
+                    f"[check-replay] CIRCUIT OPEN after "
+                    f"{self._replay_failure_count} consecutive failures."
+                )
             return None
         try:
             slots = parse_available_slots(body, target_dates)
@@ -354,15 +390,32 @@ class AvailabilityChecker:
                 f"[check-replay] parse_available_slots raised: "
                 f"{type(e).__name__}: {e}"
             )
+            self._replay_failure_count += 1
             return None
+        # Codex HIGH 1: cap slots before returning so book_best_slot_race
+        # doesn't fan out into 100+ concurrent booking pages on a calendar
+        # response that includes the full 14-day calendar.
+        slots = cap_slots_per_date(
+            slots,
+            preferred_time=getattr(self.config, "preferred_time", "17:00"),
+            per_date_cap=3,
+        )
+        # Success — reset failure count
+        self._replay_failure_count = 0
         return slots
 
     async def close_replay_session(self) -> None:
         """Close the replay session (best-effort). Called on shutdown
-        OR when sniper window ends (so the next window starts fresh)."""
+        OR when sniper window ends (so the next window starts fresh).
+
+        Also resets the circuit-breaker so the next window can attempt
+        replay again (Codex MEDIUM 4)."""
         from src.calendar_replay import close_session
         sess = self._replay_session
         self._replay_session = None
+        # Reset circuit-breaker state for the next sniper window
+        self._replay_failure_count = 0
+        self._replay_circuit_open = False
         await close_session(sess)
 
     def clear_skip_cache(self) -> None:
