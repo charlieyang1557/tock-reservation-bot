@@ -31,6 +31,7 @@ def _make_page(url: str):
     page.goto = AsyncMock()
     page.wait_for_selector = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    page.evaluate = AsyncMock(return_value=False)
     page.close = AsyncMock()
     return page
 

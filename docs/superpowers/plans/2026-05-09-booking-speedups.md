@@ -79,7 +79,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 
 ### B2 — Robustness improvements (target: 2–3 days, can run alongside B1)
 
-#### B2.1 — Expire stale `booking_uncertain.json` by date
+#### B2.1 — Expire stale `booking_uncertain.json` by date ✅ Done 2026-05-10 (read_uncertain archives any file with `slot_date_str` >7 days past or malformed to `<path>.archive/<ts>_<reason>__<basename>`; 7 new tests in `test_uncertain_stale_expiry.py`)
 **Files:** [src/booking_uncertain.py:58](src/booking_uncertain.py:58)
 **Approach:** In `read_uncertain()`, parse `slot_date_str` as `date`. If the date is more than 7 days in the past, log a warning and return None (the file is stale; don't block future races). Auto-archive the file to `booking_uncertain.archive/<timestamp>.json` instead of deleting, so operators can audit.
 **Tests:**
@@ -88,7 +88,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 - `test_read_uncertain_keeps_recent_file`
 **Done when:** old uncertain files don't block today's races; archive directory contains the original.
 
-#### B2.2 — CF challenge detection beyond URL
+#### B2.2 — CF challenge detection beyond URL ✅ Done 2026-05-10 (new async `is_cloudflare_challenge_page` combines URL + DOM iframe/turnstile/interstitial-text via `_CF_DOM_DETECT_JS`; sync `_is_cloudflare_challenge_page` preserved for legacy fast-path callers; 8 new tests in `test_cf_detection_dom.py`; legacy prewarm + CF telemetry tests updated to mock `evaluate=False`)
 **Files:** [src/checker.py:234–256](src/checker.py:234) (`_is_cloudflare_challenge_page`)
 **Approach:** Add a DOM check via `page.evaluate`:
 ```js

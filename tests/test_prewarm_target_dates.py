@@ -39,6 +39,7 @@ async def test_prewarm_opens_one_page_per_date():
     async def make_page():
         p = AsyncMock()
         p.is_closed = MagicMock(return_value=False)
+        p.evaluate = AsyncMock(return_value=False)
         p.goto = AsyncMock()
         p.wait_for_selector = AsyncMock()
         pages.append(p)
@@ -61,6 +62,7 @@ async def test_prewarm_navigates_to_correct_url():
     dates = [date(2026, 5, 1)]
     page = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    page.evaluate = AsyncMock(return_value=False)
     page.goto = AsyncMock()
     page.wait_for_selector = AsyncMock()
     checker.browser.new_page = AsyncMock(return_value=page)
@@ -81,6 +83,7 @@ async def test_prewarm_waits_for_calendar_container():
     dates = [date(2026, 5, 1)]
     page = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    page.evaluate = AsyncMock(return_value=False)
     page.goto = AsyncMock()
     page.wait_for_selector = AsyncMock()
     checker.browser.new_page = AsyncMock(return_value=page)
@@ -111,6 +114,7 @@ async def test_prewarm_failure_does_not_break_other_dates():
         page_count[0] += 1
         p = AsyncMock()
         p.is_closed = MagicMock(return_value=False)
+        p.evaluate = AsyncMock(return_value=False)
         p.wait_for_selector = AsyncMock()
         if page_count[0] == 2:
             p.goto = AsyncMock(side_effect=Exception("fake CF error"))
@@ -136,6 +140,7 @@ async def test_prewarm_respects_stagger():
     dates = [date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3)]
     page = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    page.evaluate = AsyncMock(return_value=False)
     page.goto = AsyncMock()
     page.wait_for_selector = AsyncMock()
     checker.browser.new_page = AsyncMock(return_value=page)
@@ -171,6 +176,7 @@ async def test_prewarm_all_dates_fail_returns_cleanly():
     async def make_page():
         p = AsyncMock()
         p.is_closed = MagicMock(return_value=False)
+        p.evaluate = AsyncMock(return_value=False)
         p.goto = AsyncMock(side_effect=Exception("simulated CF challenge"))
         p.wait_for_selector = AsyncMock()
         p.close = AsyncMock()
@@ -347,6 +353,7 @@ async def test_prewarm_closes_old_page_before_overwriting():
     async def make_page():
         p = AsyncMock()
         p.is_closed = MagicMock(return_value=False)
+        p.evaluate = AsyncMock(return_value=False)
         p.goto = AsyncMock()
         p.wait_for_selector = AsyncMock()
         p.close = AsyncMock()
@@ -382,6 +389,7 @@ def test_pop_warm_page_removes_from_sniper_pages():
     checker = _make_checker()
     page = AsyncMock()
     page.is_closed = MagicMock(return_value=False)
+    page.evaluate = AsyncMock(return_value=False)
     checker._sniper_pages["2026-05-01"] = page
 
     popped = checker.pop_warm_page("2026-05-01")

@@ -80,6 +80,32 @@ def _prune_screenshots(directory: str, max_count: int = MAX_DEBUG_SCREENSHOTS) -
 BASE_URL = "https://www.exploretock.com"
 
 
+# Phase B2.2: DOM-based Cloudflare challenge detection. Returns true when
+# the page contains any of the documented CF challenge markers — used as a
+# second signal alongside URL-based detection so challenges that don't
+# change the URL still get caught.
+_CF_DOM_DETECT_JS = r"""
+() => {
+  // Marker iframes / widgets / interstitial spinners
+  const markers = document.querySelector(
+    'iframe[src*="challenges.cloudflare.com"], '
+    + '.cf-turnstile, '
+    + '#cf-please-wait, '
+    + '#cf-spinner-please-wait'
+  );
+  if (markers) return true;
+  // Interstitial text — must be visible (innerText reflects rendered text)
+  const phraseRe = /verify you are human|just a moment|checking your browser/i;
+  const candidates = document.querySelectorAll('h1, h2, p, div, span');
+  for (const el of candidates) {
+    const t = (el.innerText || '');
+    if (phraseRe.test(t)) return true;
+  }
+  return false;
+}
+"""
+
+
 # Single-evaluate slot-collection JS (Phase B1.3). Called from
 # _collect_slots_multi. Container scoping + 5-source extraction in one
 # round-trip, replacing the per-button locator chain. Returns
@@ -373,13 +399,16 @@ class AvailabilityChecker:
 
     @staticmethod
     def _is_cloudflare_challenge_page(page: Page) -> bool:
-        """Return True iff `page.url` looks like a Cloudflare challenge.
+        """Sync URL-only Cloudflare check (cheap, non-blocking).
 
         Detection signals (any one is sufficient):
           - URL contains 'challenge' (typical CF redirect path)
           - URL contains '__cf_chl' (CF challenge query param)
 
         Returns False on any error (including non-string page.url in tests).
+        Most callers should prefer `is_cloudflare_challenge_page` (async)
+        which adds a DOM check for challenges that don't change the URL
+        — Phase B2.2.
         """
         try:
             raw = page.url
@@ -393,6 +422,29 @@ class AvailabilityChecker:
         if "__cf_chl" in url:
             return True
         return False
+
+    async def is_cloudflare_challenge_page(self, page: Page) -> bool:
+        """Combined URL + DOM Cloudflare check (Phase B2.2).
+
+        Returns True if either:
+          - the URL signals a CF challenge (sync helper above), OR
+          - the page DOM contains a CF iframe / Turnstile widget /
+            "verify you are human" interstitial text
+
+        DOM check is one `page.evaluate` call (cheap). On any DOM-check
+        exception (page closed, exec context destroyed), falls back to
+        the URL signal — never raises out of detection.
+        """
+        if self._is_cloudflare_challenge_page(page):
+            return True
+        try:
+            return bool(await page.evaluate(_CF_DOM_DETECT_JS))
+        except Exception as e:
+            logger.debug(
+                f"[cf-detect] DOM check raised "
+                f"{type(e).__name__}: {e}; falling back to URL-only result"
+            )
+            return False
 
     async def prewarm_target_dates(
         self,
@@ -439,7 +491,9 @@ class AvailabilityChecker:
                 # page never renders calendar_container, so the wait would just
                 # time out wastefully. Skip parking; sniper-poll will fall back
                 # to a fresh goto() at release time.
-                if self._is_cloudflare_challenge_page(page):
+                # B2.2: combined URL+DOM check catches challenges that don't
+                # change the URL (interstitial overlays, Turnstile widgets).
+                if await self.is_cloudflare_challenge_page(page):
                     cf_challenges += 1
                     logger.warning(
                         f"[prewarm] {date_str} hit CF challenge "
@@ -830,9 +884,11 @@ class AvailabilityChecker:
             # Sniper-phase CF detection (Codex pass 2): a challenge during
             # sniper polling is more critical than during prewarm — it's
             # consuming critical-path time during a release window.
+            # B2.2: combined URL+DOM check catches challenges that don't
+            # change the URL.
             if keep_page:
                 self._sniper_cf_attempts += 1
-                if self._is_cloudflare_challenge_page(page):
+                if await self.is_cloudflare_challenge_page(page):
                     self._sniper_cf_challenges += 1
                     logger.warning(
                         f"[check] {date_str} hit CF challenge during sniper "

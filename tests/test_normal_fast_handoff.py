@@ -299,7 +299,14 @@ def _make_mock_page(date_str: str = "2026-05-08") -> AsyncMock:
     page.goto = AsyncMock()
     page.reload = AsyncMock()
     page.close = AsyncMock()
-    page.evaluate = AsyncMock(return_value={"index": 0, "count": 1})
+    # B2.2: distinguish the CF DOM-detect JS (must return False so the
+    # sniper-poll path doesn't treat the test page as challenged) from
+    # the slot-detect JS (returns {index, count}).
+    async def _eval(js, *args, **kwargs):
+        if "challenges.cloudflare.com" in js or "cf-turnstile" in js:
+            return False
+        return {"index": 0, "count": 1}
+    page.evaluate = AsyncMock(side_effect=_eval)
     page.wait_for_selector = AsyncMock()
     page.screenshot = AsyncMock()
     return page
