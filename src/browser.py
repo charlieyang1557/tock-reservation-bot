@@ -81,6 +81,14 @@ class TockBrowser:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        # Phase B2.3: per-selector cache of the iframe URL host that last
+        # matched. Lets find_in_frames try matching frames first instead
+        # of iterating in document order on every CVC interaction.
+        self._frame_url_cache: dict[str, str] = {}
+        # Phase B3.3: lazy page pool. Set in start() so test code that
+        # constructs TockBrowser directly without calling start() (e.g. unit
+        # tests with all-mock dependencies) doesn't trip on a missing pool.
+        self.page_pool = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -128,7 +136,21 @@ class TockBrowser:
             except Exception as e:
                 logger.warning(f"Could not restore session cookies: {e}")
 
+        # Phase B3.3: pre-warm page pool. Reduces cold-task latency in races.
+        # Import here (not at module top) to avoid a circular import path
+        # if PagePool ever needs TockBrowser typing.
+        from src.page_pool import PagePool
+        self.page_pool = PagePool(
+            self, target_size=self.config.page_pool_size,
+        )
+        await self.page_pool.start()
+
     async def close(self) -> None:
+        if self.page_pool is not None:
+            try:
+                await self.page_pool.close_all()
+            except Exception as e:
+                logger.debug(f"[browser] page_pool close failed (non-critical): {e}")
         if self._context:
             await self._context.close()
         if self._browser:
@@ -258,11 +280,23 @@ class TockBrowser:
             page = await self.new_page()
             logger.info(f"[warm] Refreshing session: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            # Wait for network to settle (Cloudflare JS runs after domcontentloaded)
+            # Phase B1.4: dropped wait_for_load_state("networkidle"). Tock's
+            # restaurant page never reaches networkidle (analytics + CF
+            # beacons keep firing) so the 5-s timeout was guaranteed waste
+            # every cycle.
+            #
+            # Codex MEDIUM 3: replace it with a bounded wait_for_selector on
+            # the logged_in_indicator. If hydrated quickly, _is_logged_in
+            # below returns True immediately; if it times out, we still fall
+            # through to _is_logged_in which can trigger re-login. Net
+            # ceiling ~2 s vs the old 5 s, with a real signal instead of an
+            # arbitrary network silence wait.
             try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
+                await page.wait_for_selector(
+                    sel.get("logged_in_indicator"), timeout=2000
+                )
             except Exception:
-                pass  # networkidle timeout is fine; proceed with current state
+                pass
 
             if not await self._is_logged_in(page):
                 logger.warning(
@@ -304,19 +338,72 @@ class TockBrowser:
         """Return all cookies in the current browser context."""
         return await self._context.cookies()
 
-    @staticmethod
-    async def find_in_frames(page: Page, selector: str):
+    async def find_in_frames(self, page: Page, selector: str):
         """
         Search the main frame and all child iframes for *selector*.
         Returns the first matching element, or None.
 
         Tock embeds some inputs (e.g. CVC) inside Stripe iframes, so a plain
         page.query_selector() misses them.
+
+        Phase B2.3: per-selector iframe URL host cache. On the first
+        successful match for a selector, the matching frame's URL host
+        is recorded; subsequent calls try frames matching that host
+        first, then fall through to a full scan if needed. Saves
+        75–400 ms on the CVC interaction (Stripe iframe usually isn't
+        first in document order).
         """
-        for frame in [page.main_frame] + [f for f in page.frames if f != page.main_frame]:
+        from urllib.parse import urlparse
+        cached_host = self._frame_url_cache.get(selector)
+
+        def _frame_host(frame) -> str:
+            try:
+                return urlparse(getattr(frame, "url", "") or "").netloc
+            except Exception:
+                return ""
+
+        all_frames = [page.main_frame] + [
+            f for f in page.frames if f != page.main_frame
+        ]
+
+        # First pass: cached-matching frames (skipping detached ones).
+        # Codex B2 fix: use EXACT netloc equality, not substring match.
+        # Substring `cached_host in frame.url` could prefer an attacker
+        # iframe whose URL embeds the cached host string in its path.
+        if cached_host:
+            preferred = []
+            others = []
+            for f in all_frames:
+                try:
+                    if hasattr(f, "is_detached") and f.is_detached():
+                        continue
+                except Exception:
+                    pass
+                if _frame_host(f) == cached_host:
+                    preferred.append(f)
+                else:
+                    others.append(f)
+            for frame in preferred:
+                try:
+                    el = await frame.query_selector(selector)
+                    if el:
+                        return el
+                except Exception:
+                    continue
+            # Cache miss in preferred frames → fall through to a fresh
+            # full-scan (others_first) below
+            scan_order = others
+        else:
+            scan_order = all_frames
+
+        for frame in scan_order:
             try:
                 el = await frame.query_selector(selector)
                 if el:
+                    # Cache the matching netloc for next time
+                    host = _frame_host(frame)
+                    if host:
+                        self._frame_url_cache[selector] = host
                     return el
             except Exception:
                 continue

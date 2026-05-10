@@ -1,7 +1,12 @@
 """Tests for container-scoped slot collection (A5 fix).
 
-When `slots_container` selector matches, slot lookups must be scoped to
-that container. A `Book` button outside the container must NOT be collected.
+Post-B1.3: the container scoping happens inside one page.evaluate call.
+The JS reports `container_used: bool` to indicate whether the container
+was found and used. These tests now assert the wrapper passes the right
+selector to JS and respects the container_used signal in its logging
+(but the actual button-vs-non-button discrimination is enforced by the
+JS scoping `root.querySelectorAll(matchedSelector)` inside the container
+when present, document-wide otherwise).
 """
 import pytest
 from datetime import date
@@ -26,96 +31,53 @@ def _make_checker():
 
 @pytest.mark.asyncio
 async def test_collect_only_buttons_inside_container(monkeypatch):
-    """If slots_container is present, only buttons inside it are collected."""
+    """When the JS reports container_used=True, the slots returned were
+    scoped to the container (the JS does `root.querySelectorAll(matched)`
+    where root = container element when present)."""
     checker = _make_checker()
 
-    # in_container: parent has time text → should be collected
-    in_container_btn = AsyncMock()
-    in_container_btn.text_content = AsyncMock(return_value="Book")
-    in_container_btn.get_attribute = AsyncMock(return_value=None)
+    page = AsyncMock()
+    page.evaluate = AsyncMock(return_value={
+        "container_used": True,
+        "button_count": 1,
+        "slots": [{"time": "5:00 PM", "source": 2}],
+    })
 
-    parent_in = AsyncMock()
-    parent_in.text_content = AsyncMock(return_value="5:00 PM   2 guests")
-    parent_in.locator = MagicMock(return_value=AsyncMock(
-        text_content=AsyncMock(return_value="")
-    ))
-
-    in_container_btn.locator = MagicMock(side_effect=lambda s: (
-        parent_in if s == ".." else AsyncMock(count=AsyncMock(return_value=0))
-    ))
-
-    # Container locator (page-level): find -> exists, then locator(button…) returns 1
-    container = MagicMock()
-    container_buttons = MagicMock()
-    container_buttons.count = AsyncMock(return_value=1)
-    container_buttons.nth = MagicMock(return_value=in_container_btn)
-    container.locator = MagicMock(return_value=container_buttons)
-
-    page = MagicMock()
-    container_finder = MagicMock()
-    container_finder.count = AsyncMock(return_value=1)
-    container_finder.first = container
-
-    def page_locator(sel):
-        if "slots_container" in sel or "results-list" in sel:
-            return container_finder
-        # Anything else returning 1 button means the test misconfigured scoping
-        page_wide = MagicMock()
-        page_wide.count = AsyncMock(return_value=99)  # noisy false positive
-        return page_wide
-
-    page.locator = MagicMock(side_effect=page_locator)
-
-    # Pre-resolve the container-finder selector by registering it
     import src.selectors as sel_mod
     monkeypatch.setitem(sel_mod.SELECTORS, "slots_container", "div.results-list")
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
-        'button:visible:has-text("Book")'
+        'button.Consumer-resultsListItem.is-available'
     )
-    assert len(slots) == 1, (
-        f"Expected exactly 1 slot from inside the container, got {len(slots)}: {slots}"
-    )
+    assert len(slots) == 1
+    # The wrapper passed both the matched selector and the container selector
+    args, _ = page.evaluate.call_args
+    js_arg = args[1] if len(args) > 1 else args[0]
+    assert js_arg["containerSelector"] == "div.results-list"
+    assert js_arg["matchedSelector"] == 'button.Consumer-resultsListItem.is-available'
 
 
 @pytest.mark.asyncio
 async def test_falls_back_to_page_when_container_missing(monkeypatch):
-    """If slots_container is not present, falls back to page-wide collection."""
+    """When the JS reports container_used=False (the slots_container
+    wasn't in the DOM), the wrapper logs the fallback and still returns
+    the slots that were collected document-wide."""
     checker = _make_checker()
 
-    # Container selector returns 0 → falls back to page-level
-    container_finder = MagicMock()
-    container_finder.count = AsyncMock(return_value=0)
-
-    page_wide_btn = AsyncMock()
-    page_wide_btn.text_content = AsyncMock(return_value="Book")
-    page_wide_btn.get_attribute = AsyncMock(return_value=None)
-    page_wide_btn.locator = MagicMock(return_value=AsyncMock(
-        text_content=AsyncMock(return_value="5:00 PM   table"),
-        count=AsyncMock(return_value=0),
-    ))
-
-    page_wide_locator = MagicMock()
-    page_wide_locator.count = AsyncMock(return_value=1)
-    page_wide_locator.nth = MagicMock(return_value=page_wide_btn)
-
-    page = MagicMock()
-    def page_locator(sel):
-        if "slots_container" in sel or "results-list" in sel:
-            return container_finder
-        return page_wide_locator
-    page.locator = MagicMock(side_effect=page_locator)
+    page = AsyncMock()
+    page.evaluate = AsyncMock(return_value={
+        "container_used": False,
+        "button_count": 1,
+        "slots": [{"time": "5:00 PM", "source": 2}],
+    })
 
     import src.selectors as sel_mod
     monkeypatch.setitem(sel_mod.SELECTORS, "slots_container", "div.results-list")
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
-        'button:visible:has-text("Book")'
+        'button.Consumer-resultsListItem.is-available'
     )
-    # Falls back to page-wide collection when container missing
-    assert len(slots) == 1, (
-        f"Expected fallback path to yield 1 slot from page-wide collection; got {slots}"
-    )
+    assert len(slots) == 1
     assert slots[0].slot_time.upper() == "5:00 PM"

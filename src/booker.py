@@ -37,11 +37,16 @@ from enum import Enum
 from playwright.async_api import Page
 
 import src.selectors as sel
+from src import selector_metrics
 from src.browser import TockBrowser
 from src.checker import AvailableSlot
 from src.config import Config
 from src.notifier import Notifier
-from src.selectors import get_slot_button_selectors
+from src.selectors import (
+    get_slot_button_selectors,
+    is_generic_slot_selector,
+    is_playwright_selector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +69,124 @@ _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "debug_screenshots"
 )
 
-# Selectors that match generic "Book" buttons (restaurant/experience level, not time-slot).
-# These must only be clicked if surrounding context confirms the target time.
-_GENERIC_BOOK_SELECTORS: frozenset[str] = frozenset({
-    'button:visible:has-text("Book")',
-    'button:text("Book now")',
-    'a:text("Book now")',
-    '[data-testid="book-now"]',
-    "button.SearchExperience-bookButton",
-    "[data-testid='book-button']",
-})
+# Codex MEDIUM 1: classification of "generic Book" selectors (vs.
+# specific per-time-slot selectors) now lives in src/selectors.py
+# alongside `get_slot_button_selectors` so the two cannot drift apart.
+# Use `is_generic_slot_selector(s)` for membership tests.
+
+# Codex LOW 1 + B2 review MEDIUM: match the actual checkout-style URL
+# path segment, not the full URL. Substrings in query string or
+# fragment (e.g., `/search?next=/checkout/abc`) must NOT match.
+_CHECKOUT_PATH_RE = re.compile(
+    r"/(checkout|reservation|book)(?:/|$)", re.IGNORECASE
+)
+
+
+def _checkout_url_matches(url: str) -> bool:
+    """Return True iff the URL's PATH (not query, not fragment) contains
+    a checkout/reservation/book segment. Parses with urllib so query
+    strings and fragments can never produce a false positive."""
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path or ""
+    except Exception:
+        return False
+    return bool(_CHECKOUT_PATH_RE.search(path))
+
+
+# Codex LOW 2: payment-visible JS includes a URL precondition so
+# `/account/payment-methods` (which contains identical "Add card" text)
+# cannot false-trigger checkout detection while the bot is on the wrong
+# page. The URL check happens INSIDE the page context, not just in
+# Python — so the JS sees the live page state at the moment it runs.
+_PAYMENT_VISIBLE_JS_SOURCE = (
+    "() => {"
+    "  const path = (window.location && window.location.pathname || '').toLowerCase();"
+    "  if (!/\\/(checkout|reservation|book)(\\/|$)/.test(path)) return false;"
+    "  const card = document.querySelector("
+    "    '[data-testid=\"saved-card\"], .SavedCard, "
+    ".PaymentMethod--saved, [data-testid=\"payment-card\"]'"
+    "  );"
+    "  if (card) return true;"
+    "  const ctrls = Array.from(document.querySelectorAll('button, a'));"
+    "  return ctrls.some(el => "
+    "    /add (payment|card|a card)/i.test(el.innerText || '')"
+    "  );"
+    "}"
+)
+
+
+# Single-evaluate slot-click JS (Phase B1.2). Called from _click_time_slot.
+# Iterates DOM-side and clicks inside the same call, eliminating per-button
+# Python↔browser round-trips. Honors strict_time_match by refusing the
+# first-button fallback (Codex HIGH from Phase A+2).
+_CLICK_TIME_SLOT_JS = r"""
+(args) => {
+  const { selector, targetTime, slotTimeRaw, isGeneric, strictTimeMatch } = args;
+  const buttons = Array.from(document.querySelectorAll(selector));
+  const upperTarget = targetTime;
+  const escapedSlotTime = slotTimeRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const slotWordRe = new RegExp('\\b' + escapedSlotTime + '\\b', 'i');
+  const timeRe = /\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b/i;
+
+  let bestBtn = null;
+  let bestText = null;
+
+  for (const btn of buttons) {
+    const text = (btn.textContent || btn.innerText || '').trim();
+    const upperText = text.toUpperCase();
+
+    if (upperText.includes(upperTarget)) {
+      btn.click();
+      return { clicked: true, text, reason: 'exact' };
+    }
+
+    const m = text.match(timeRe);
+    if (m && m[1].trim().toUpperCase() === upperTarget) {
+      btn.click();
+      return { clicked: true, text, reason: 'regex' };
+    }
+
+    if (isGeneric) {
+      const parent = btn.parentElement;
+      const parentText = parent
+        ? (parent.textContent || parent.innerText || '').trim()
+        : '';
+      const parentUpper = parentText.toUpperCase();
+      if (parentUpper.includes(upperTarget) || slotWordRe.test(parentText)) {
+        btn.click();
+        return {
+          clicked: true,
+          text: parentText.slice(0, 80),
+          reason: 'generic-parent',
+        };
+      }
+      // Generic button without time confirmation in parent — never a fallback
+      continue;
+    }
+
+    if (bestBtn === null) {
+      bestBtn = btn;
+      bestText = text;
+    }
+  }
+
+  if (bestBtn !== null && !strictTimeMatch) {
+    bestBtn.click();
+    return { clicked: true, text: bestText, reason: 'first-fallback' };
+  }
+  if (bestBtn !== null && strictTimeMatch) {
+    return {
+      clicked: false,
+      text: bestText,
+      reason: 'strict-refused-fallback',
+    };
+  }
+  return { clicked: false, text: null, reason: 'no-match' };
+}
+"""
 
 # How long to wait for the user to add a payment card (Tock holds slots ~10 min)
 PAYMENT_WAIT_TIMEOUT_SEC = 540   # 9 minutes
@@ -236,11 +349,34 @@ class TockBooker:
             self.notifier.dry_run_would_book(slot)
             return False
 
-        # Use warm page from checker (sniper mode) or create fresh
+        # Use warm page from checker (sniper warm or normal-mode handoff) or
+        # create fresh. A page is considered usable only if it's still open;
+        # a closed handoff is logged so operators can distinguish between
+        # "no warm page provided" and "provided but stale".
+        warm_page_unusable = warm_page is not None and warm_page.is_closed()
+        if warm_page_unusable:
+            logger.warning(
+                f"[book] {slot} — warm page provided but already closed; "
+                "falling back to fresh navigation"
+            )
         page = warm_page if warm_page and not warm_page.is_closed() else None
-        owns_page = page is None  # noqa: F841 — kept for readability; close is now unconditional
+        owns_page = page is None  # True ⇒ booker created a fresh page; False ⇒ using warm
+        # Phase B3.3: when we need a fresh page, prefer the pre-warmed pool
+        # so we don't pay full new_page() launch cost on cold race tasks.
+        # Falls through to new_page() when the pool is empty.
+        # Use isinstance(PagePool) — not getattr(...) is not None — because
+        # tests construct browser via MagicMock() where every attribute
+        # auto-resolves to another MagicMock. PagePool is the only valid
+        # source of pre-warmed pages, so isinstance is the safe sentinel.
+        from src.page_pool import PagePool  # local import: avoids cycle
+        from_pool = False
         if page is None:
-            page = await self.browser.new_page()
+            page_pool = getattr(self.browser, "page_pool", None)
+            if isinstance(page_pool, PagePool):
+                page = await page_pool.acquire()
+                from_pool = True
+            else:
+                page = await self.browser.new_page()
 
         try:
             if owns_page:
@@ -259,31 +395,47 @@ class TockBooker:
                 ):
                     return False
 
-                # Wait for day buttons to render inside the calendar.
-                try:
-                    await page.wait_for_selector(
-                        sel.get("all_day_button"), timeout=5000
-                    )
-                except Exception:
-                    pass  # calendar may still be loading; proceed anyway
-
-                # ── Step 2: click the calendar day ────────────────────────
-                if booking_won.is_set():
-                    self.notifier.booking_aborted(slot, "another slot already booked")
-                    return False
-
-                if not await self._click_calendar_day(page, slot):
-                    return False
-
-                # Wait reactively for slot buttons after day click
-                for try_sel in get_slot_button_selectors()[:2]:
+                # B1.5: when skip_day_click_check is True, defer the calendar-day
+                # click until after we try the time-slot click — Tock's
+                # `?date=YYYY-MM-DD` URL may already select the date in the
+                # SPA so the click is redundant. If the time-slot click finds
+                # no buttons, we fall back to clicking the day and retrying
+                # once.
+                skip_click = self.config.skip_day_click_check
+                day_clicked = False
+                if not skip_click:
+                    # Wait for day buttons to render inside the calendar.
                     try:
-                        await page.wait_for_selector(try_sel, timeout=2000)
-                        break
+                        await page.wait_for_selector(
+                            sel.get("all_day_button"), timeout=5000
+                        )
                     except Exception:
-                        continue
+                        pass  # calendar may still be loading; proceed anyway
+
+                    # ── Step 2: click the calendar day ────────────────────
+                    if booking_won.is_set():
+                        self.notifier.booking_aborted(slot, "another slot already booked")
+                        return False
+
+                    if not await self._click_calendar_day(page, slot):
+                        return False
+                    day_clicked = True
+
+                    # Wait reactively for slot buttons after day click
+                    for try_sel in get_slot_button_selectors()[:2]:
+                        try:
+                            await page.wait_for_selector(try_sel, timeout=2000)
+                            break
+                        except Exception:
+                            continue
             else:
                 logger.info(f"[book] {slot} → using warm page (skipping navigation)")
+                # No skip-day-click decision needed when the booker reuses a
+                # warm page — the checker already had the correct date
+                # selected. Initialize so the post-Step-3 fallback below
+                # never trips for warm-page bookings.
+                skip_click = False
+                day_clicked = True
 
             await self._booking_screenshot(page, "01_booking_start")
 
@@ -292,7 +444,37 @@ class TockBooker:
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
 
-            if not await self._click_time_slot(page, slot):
+            # When operating on a warm/handoff page, demand an exact time match.
+            # The page was last touched by the checker, which detected this exact
+            # slot — if it's no longer visible, the slot vanished and the
+            # first-button fallback would book the wrong time (Codex review).
+            using_warm_page = not owns_page
+            slot_clicked = await self._click_time_slot(
+                page, slot, strict_time_match=using_warm_page
+            )
+            if not slot_clicked and skip_click and not day_clicked:
+                # B1.5 fallback: skip-mode found no slot buttons; click the
+                # calendar day and retry the time-slot click once.
+                logger.debug(
+                    f"[book] {slot} — skip-mode found no slot buttons; "
+                    "falling back to click_calendar_day + re-click"
+                )
+                if booking_won.is_set():
+                    self.notifier.booking_aborted(slot, "another slot already booked")
+                    return False
+                if not await self._click_calendar_day(page, slot):
+                    return False
+                day_clicked = True
+                for try_sel in get_slot_button_selectors()[:2]:
+                    try:
+                        await page.wait_for_selector(try_sel, timeout=2000)
+                        break
+                    except Exception:
+                        continue
+                slot_clicked = await self._click_time_slot(
+                    page, slot, strict_time_match=using_warm_page
+                )
+            if not slot_clicked:
                 return False
 
             # Scroll to bottom so the confirm button (which may be below the fold
@@ -317,7 +499,22 @@ class TockBooker:
             if not checkout_ok:
                 return False
 
-            # ── Step 5: confirm (locked — only one task proceeds) ─────
+            # ── Step 5a: prep (NO lock — concurrent across tasks) ─────
+            # Phase B3.1: payment detection, CVC fill, and wait-for-confirm-
+            # button used to all run under the lock, serializing every
+            # racing task. They're idempotent per-page, so we run them
+            # without the lock to maximize concurrency.
+            if booking_won.is_set():
+                self.notifier.booking_aborted(slot, "another slot already booked")
+                return False
+
+            prep_ok = await self._prepare_for_confirm(
+                page, slot, booking_won=booking_won
+            )
+            if not prep_ok:
+                return False
+
+            # ── Step 5b: confirm click + verify (locked — only one wins) ─
             if booking_won.is_set():
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
@@ -341,11 +538,11 @@ class TockBooker:
                     return False
 
                 # Mark that we are about to click confirm. From this point on,
-                # no other task can call _confirm_booking even if our own
-                # verification fails — the user must verify manually.
+                # no other task can click even if our own verification fails
+                # — the user must verify manually.
                 self._confirm_attempted.set()
 
-                success = await self._confirm_booking(page, slot)
+                success = await self._execute_confirm_click_and_verify(page, slot)
                 if success:
                     booking_won.set()
                     self.notifier.booking_confirmed(slot)
@@ -393,9 +590,15 @@ class TockBooker:
             # via pop_warm_page() and transferred to this method. The booker
             # is now responsible for closing them after every attempt — success
             # OR failure — to prevent the leak Codex pass 3 caught.
+            #
+            # Phase B3.3: pages obtained from the page pool go through
+            # pool.release() (which closes them — DOM is dirty after a race
+            # attempt). All other booker-owned pages still close directly.
             if page is not None:
                 try:
-                    if not page.is_closed():
+                    if from_pool:
+                        await self.browser.page_pool.release(page)
+                    elif not page.is_closed():
                         await page.close()
                 except Exception:
                     pass
@@ -438,11 +641,25 @@ class TockBooker:
         )
         return False
 
-    async def _click_time_slot(self, page: Page, slot: AvailableSlot) -> bool:
+    async def _click_time_slot(
+        self, page: Page, slot: AvailableSlot,
+        strict_time_match: bool = False,
+    ) -> bool:
         """Find the time slot matching slot.slot_time and click it.
 
         Iterates all matching buttons and compares text content to find the
-        correct time. Falls back to first button if no text match is found.
+        correct time.
+
+        strict_time_match=False (default): if no exact match is found, falls
+          back to clicking the first non-generic button. Acceptable for fresh
+          navigation where the page state was just established and a missing
+          exact time often means the button text format changed slightly.
+
+        strict_time_match=True: refuse the fallback. Used when the booker
+          is operating on a warm/handoff page that was last touched by the
+          checker — if the target time isn't visible now, the slot likely
+          vanished and clicking any other button would book the wrong time
+          (Codex adversarial review HIGH finding).
         """
         slot_selectors = get_slot_button_selectors()
 
@@ -474,37 +691,128 @@ class TockBooker:
             )
             return False
 
-        # Iterate buttons to find one matching slot.slot_time
-        locator = page.locator(matched_selector)
-        count = await locator.count()
+        # B2.4: telemetry for selector hit-rate analysis. Best-effort —
+        # never let a metrics bug break the booking flow.
+        try:
+            selector_metrics.record_match("slot_button_book", matched_selector)
+        except Exception as exc:
+            logger.debug(f"[book] selector_metrics.record_match failed: {exc}")
+
+        # Single browser-side iteration: match + click in one round-trip.
         target_time = slot.slot_time.strip().upper()
-        is_generic = matched_selector in _GENERIC_BOOK_SELECTORS
+        is_generic = is_generic_slot_selector(matched_selector)
+
+        # Codex HIGH 2: Playwright-only selectors (`:has-text`, `:text`,
+        # `:visible`) cannot be passed to document.querySelectorAll —
+        # fall back to a Python locator iteration for those, preserving
+        # the JS fast path for plain CSS selectors.
+        if is_playwright_selector(matched_selector):
+            return await self._click_time_slot_locator_loop(
+                page, slot, matched_selector, is_generic, strict_time_match
+            )
+
+        try:
+            result = await page.evaluate(
+                _CLICK_TIME_SLOT_JS,
+                {
+                    "selector": matched_selector,
+                    "targetTime": target_time,
+                    "slotTimeRaw": slot.slot_time,
+                    "isGeneric": is_generic,
+                    "strictTimeMatch": strict_time_match,
+                },
+            )
+        except Exception as e:
+            logger.error(f"[book] Slot-click evaluate failed: {type(e).__name__}: {e}")
+            return False
+
+        if not isinstance(result, dict):
+            logger.error(f"[book] Slot-click JS returned unexpected shape: {result!r}")
+            return False
+
+        clicked = bool(result.get("clicked"))
+        reason = result.get("reason", "")
+        text = result.get("text")
+
+        if clicked:
+            if reason == "exact":
+                logger.info(
+                    f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
+                )
+            elif reason == "regex":
+                logger.info(f"[book] Clicked slot button (regex match): {text}")
+            elif reason == "generic-parent":
+                logger.info(
+                    f"[book] Clicked generic 'Book' button — "
+                    f"time confirmed in parent: {text!r}"
+                )
+            elif reason == "first-fallback":
+                logger.warning(
+                    f"[book] No exact time match for '{slot.slot_time}' — "
+                    f"clicked first specific button: {text}"
+                )
+            else:
+                logger.info(
+                    f"[book] Clicked slot button (reason={reason!r}): {text}"
+                )
+            return True
+
+        if reason == "strict-refused-fallback":
+            logger.warning(
+                f"[book] No exact time match for '{slot.slot_time}' on warm "
+                "page; refusing first-button fallback (slot likely vanished) "
+                "— returning False so the race tries another slot or a fresh "
+                "page next poll"
+            )
+        else:
+            logger.error(
+                f"[book] No clickable slot button found for '{slot.slot_time}' "
+                f"(selector: {matched_selector!r})"
+            )
+        return False
+
+    async def _click_time_slot_locator_loop(
+        self, page: Page, slot: AvailableSlot,
+        matched_selector: str, is_generic: bool, strict_time_match: bool,
+    ) -> bool:
+        """Locator-based fallback for Playwright-only matched selectors
+        (`:has-text`, `:text(`, `:visible`) which can't be passed to
+        document.querySelectorAll. Mirrors the pre-B1.2 algorithm but
+        runs on the slow path only when the JS fast path is unsafe.
+        """
+        target_time = slot.slot_time.strip().upper()
+        slot_word_re = re.compile(
+            r"\b" + re.escape(slot.slot_time) + r"\b", re.IGNORECASE
+        )
+        time_re = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b", re.IGNORECASE)
+
+        locator = page.locator(matched_selector)
+        try:
+            count = await locator.count()
+        except Exception as e:
+            logger.error(f"[book] PW-locator count failed: {type(e).__name__}: {e}")
+            return False
 
         best_btn = None
         for i in range(count):
             btn = locator.nth(i)
             try:
                 text = (await btn.text_content() or "").strip()
-
-                # Exact time match in button text → click immediately
-                if target_time in text.upper():
+                upper = text.upper()
+                # Exact substring match
+                if target_time in upper:
                     await btn.click()
                     logger.info(
                         f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
                     )
                     return True
-
-                # Regex time match in button text
-                time_match = re.search(
-                    r'\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b', text, re.IGNORECASE
-                )
-                if time_match and time_match.group(1).strip().upper() == target_time:
+                # Regex time match
+                m = time_re.search(text)
+                if m and m.group(1).strip().upper() == target_time:
                     await btn.click()
                     logger.info(f"[book] Clicked slot button (regex match): {text}")
                     return True
-
-                # Generic "Book" button: only click if parent container has target time.
-                # This prevents clicking the restaurant-level "Book now" button by mistake.
+                # Generic 'Book' button: only click if parent has the time
                 if is_generic:
                     try:
                         parent_text = (
@@ -512,9 +820,9 @@ class TockBooker:
                         ).strip()
                     except Exception:
                         parent_text = ""
-                    if target_time in parent_text.upper() or re.search(
-                        r'\b' + re.escape(slot.slot_time) + r'\b',
-                        parent_text, re.IGNORECASE
+                    if (
+                        target_time in parent_text.upper()
+                        or slot_word_re.search(parent_text)
                     ):
                         await btn.click()
                         logger.info(
@@ -522,19 +830,13 @@ class TockBooker:
                             f"time confirmed in parent: {parent_text[:80]!r}"
                         )
                         return True
-                    logger.debug(
-                        f"[book] Generic button at index {i} skipped — "
-                        f"no time match in parent: {parent_text[:80]!r}"
-                    )
-                    continue  # do NOT set best_btn for unmatched generic buttons
-
+                    continue  # never set best_btn for unmatched generic
                 if best_btn is None:
                     best_btn = btn
             except Exception:
                 continue
 
-        # Fallback: click first non-generic button (only reached for specific selectors)
-        if best_btn is not None:
+        if best_btn is not None and not strict_time_match:
             try:
                 text = (await best_btn.text_content() or "").strip()
                 await best_btn.click()
@@ -546,7 +848,13 @@ class TockBooker:
             except Exception as e:
                 logger.error(f"[book] Could not click fallback slot button: {e}")
                 return False
-
+        if best_btn is not None and strict_time_match:
+            logger.warning(
+                f"[book] No exact time match for '{slot.slot_time}' on warm "
+                "page; refusing first-button fallback (slot likely vanished) "
+                "— returning False so the race tries another slot or a fresh "
+                "page next poll"
+            )
         logger.error(
             f"[book] No clickable slot button found for '{slot.slot_time}' "
             f"(selector: {matched_selector!r})"
@@ -556,53 +864,67 @@ class TockBooker:
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
         """Return True when the checkout/booking-details page is detected.
 
-        Polls every 2s for up to 30s, checking three signals in order:
-          1. checkout_container selector present
-          2. URL contains /checkout, /reservation, or /book
-          3. Any payment-related element present (saved card or add-card prompt)
+        Race three Playwright waiters concurrently and return True on the
+        first success, cutting 0–1900 ms off the old 2-s polling tick:
+
+          1. wait_for_selector(checkout_container)
+          2. wait_for_url(predicate)        — URL has /checkout/, /reservation/, /book/
+          3. wait_for_function(payment_visible_js) — payment form visible
+                                                     AND URL precondition
+
+        Returns False after a 30 s overall timeout (all three waiters
+        either raised or did not resolve). Losing waiters are cancelled and
+        awaited so Python doesn't warn about un-awaited coroutines.
         """
         key = "checkout_container"
         selector = sel.get(key)
-        no_pay_sel = sel.get("no_payment_indicator")
-        saved_card_sel = sel.get("saved_payment_card")
         total_wait = 30
-        interval = 2
+        timeout_ms = total_wait * 1000
 
-        for elapsed in range(0, total_wait, interval):
-            # 1. Checkout container selector
-            try:
-                await page.wait_for_selector(selector, timeout=interval * 1000)
-                logger.info(
-                    f"[book] Checkout page loaded for {slot.slot_date_str} "
-                    f"(+{elapsed}s)"
-                )
-                return True
-            except Exception:
-                pass
+        async def _via_selector():
+            await page.wait_for_selector(selector, timeout=timeout_ms)
+            return "selector"
 
-            # 2. URL-based detection
-            url = page.url
-            if any(p in url for p in ("/checkout", "/reservation", "/book")):
-                logger.info(f"[book] Checkout detected via URL: {url}")
-                return True
+        async def _via_url():
+            await page.wait_for_url(_checkout_url_matches, timeout=timeout_ms)
+            return "url"
 
-            # 3. Payment element detection
-            try:
-                pay_el = await page.query_selector(no_pay_sel)
-                if pay_el is None:
-                    pay_el = await page.query_selector(saved_card_sel)
-                if pay_el:
-                    logger.info(
-                        f"[book] Checkout detected via payment element "
-                        f"at +{elapsed + interval}s"
+        async def _via_function():
+            await page.wait_for_function(_PAYMENT_VISIBLE_JS_SOURCE, timeout=timeout_ms)
+            return "function"
+
+        tasks = [
+            asyncio.create_task(_via_selector(), name="wait_for_checkout::selector"),
+            asyncio.create_task(_via_url(), name="wait_for_checkout::url"),
+            asyncio.create_task(_via_function(), name="wait_for_checkout::function"),
+        ]
+        won_via: str | None = None
+        try:
+            for fut in asyncio.as_completed(tasks, timeout=total_wait):
+                try:
+                    label = await fut
+                except Exception as e:
+                    logger.debug(
+                        f"[book] checkout waiter raised: {type(e).__name__}: {e}"
                     )
-                    return True
-            except Exception:
-                pass
+                    continue
+                won_via = label
+                break
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Drain cancellations so Python doesn't warn about un-awaited
+            # coroutines and so any stray Playwright cleanup runs.
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.debug(
-                f"[book] Waiting for checkout… {elapsed + interval}s / {total_wait}s"
+        if won_via:
+            logger.info(
+                f"[book] Checkout detected via {won_via} for {slot.slot_date_str}"
             )
+            return True
 
         url = page.url
         await self._booking_screenshot(page, "checkout_timeout_final")
@@ -627,16 +949,24 @@ class TockBooker:
         except Exception as e:
             logger.debug(f"[book] Screenshot failed at step '{step}': {e}")
 
-    async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
-        """
-        Handle payment validation and click the confirm button.
+    async def _prepare_for_confirm(
+        self, page: Page, slot: AvailableSlot,
+        booking_won: asyncio.Event | None = None,
+    ) -> bool:
+        """Per-page idempotent preparation for the confirm click. Runs
+        WITHOUT the lock so N racing tasks can prep concurrently
+        (Phase B3.1).
 
-        Payment flow:
-        ┌─ Is there a payment section on the page?
-        │   NO  → free reservation; go straight to confirm
-        │   YES ─┬─ Saved card found → proceed to confirm
-        │         └─ No card found   → pause, notify user, wait up to 9 min
-        └─ Click confirm → wait for confirmation page → return True/False
+        Steps:
+          - payment detection
+          - wait up to 9 min for the operator to add a card if missing
+          - CVC fill on the saved card (if any)
+          - wait for the confirm button to be visible
+
+        Returns True iff the page is in a ready-to-click state. Returns
+        False early if `booking_won` is set during the payment-card
+        wait (Codex B3 review MEDIUM 1: avoids N*4 reloads/min when
+        N racing tasks are all waiting for the same card to appear).
         """
         needs_payment = await self._page_needs_payment(page)
         has_card = await self._has_saved_card(page)
@@ -649,8 +979,21 @@ class TockBooker:
             )
             waited = 0
             while waited < PAYMENT_WAIT_TIMEOUT_SEC:
+                # Codex B3 MEDIUM 1: short-circuit if another racing task
+                # already won — no point reloading our page every 15s.
+                if booking_won is not None and booking_won.is_set():
+                    logger.info(
+                        "[book] Another slot already booked while waiting "
+                        "for payment card. Aborting this task's wait."
+                    )
+                    return False
                 await asyncio.sleep(PAYMENT_POLL_INTERVAL_SEC)
                 waited += PAYMENT_POLL_INTERVAL_SEC
+                if booking_won is not None and booking_won.is_set():
+                    logger.info(
+                        "[book] booking_won fired during sleep; aborting wait."
+                    )
+                    return False
                 await page.reload(wait_until="domcontentloaded")
                 await page.wait_for_timeout(2000)
                 if await self._has_saved_card(page):
@@ -666,7 +1009,7 @@ class TockBooker:
                 )
                 return False
 
-        # Fill CVC for saved card if configured
+        # Fill CVC for saved card if configured (per-page; idempotent)
         if self.config.card_cvc:
             await self._fill_cvc(page)
         elif needs_payment and has_card:
@@ -675,21 +1018,32 @@ class TockBooker:
                 "checkout may fail if CVC is required."
             )
 
-        # Wait once for the confirm button, then click with one retry on transient failure.
-        # Waiting once (not per-retry) avoids a potential 30s timeout in the hot path.
-        confirm_key = "confirm_button"
-        confirm_selector = sel.get(confirm_key)
+        # Wait once for the confirm button to be visible. Done in prep so
+        # the lock-protected click section is as short as possible.
+        confirm_selector = sel.get("confirm_button")
         try:
             await page.wait_for_selector(confirm_selector, timeout=15000)
         except Exception as e:
             logger.error(
-                f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
+                f"SELECTOR_FAILED: key='confirm_button'  selector={confirm_selector!r}\n"
                 f"  Confirm button not found on page.\n"
                 f"  Current URL: {page.url}\n"
                 f"  → Update src/selectors.py  Error: {e}"
             )
             return False
+        return True
 
+    async def _execute_confirm_click_and_verify(
+        self, page: Page, slot: AvailableSlot
+    ) -> bool:
+        """Click the confirm button and verify Tock accepted the booking.
+        MUST be called under `self._confirm_lock` (Phase B3.1).
+
+        Returns True only if Tock's confirmation page rendered. Returns
+        False if the click failed OR the confirmation could not be
+        verified — the caller is responsible for soft-win bookkeeping.
+        """
+        confirm_selector = sel.get("confirm_button")
         for click_attempt in range(2):
             try:
                 await page.click(confirm_selector)
@@ -703,7 +1057,8 @@ class TockBooker:
                     await asyncio.sleep(2)
                 else:
                     logger.error(
-                        f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
+                        f"SELECTOR_FAILED: key='confirm_button'  "
+                        f"selector={confirm_selector!r}\n"
                         f"  Could not click the confirm button after 2 attempts.\n"
                         f"  Current URL: {page.url}\n"
                         f"  → Update src/selectors.py  Error: {e}"
@@ -740,6 +1095,14 @@ class TockBooker:
                 f"  → Check if booking actually succeeded, then update src/selectors.py"
             )
             return False
+
+    # Codex holistic review: the `_confirm_booking` shim was removed
+    # because (a) no production code in src/ called it, (b) it was
+    # semantically WEAKER than `_book_single` (no soft-win persistence,
+    # no notify, no shared booking_won.set), so any future caller would
+    # have silently lost the safety bookkeeping. Tests now patch the
+    # split helpers `_prepare_for_confirm` and
+    # `_execute_confirm_click_and_verify` directly.
 
     # ------------------------------------------------------------------
     # Payment detection helpers

@@ -34,30 +34,28 @@ def _make_slot(slot_time="5:00 PM"):
 
 @pytest.mark.asyncio
 async def test_generic_book_button_skipped_when_no_time_in_parent():
-    """A generic 'Book' button whose parent has no time text must NOT be clicked."""
+    """A generic 'Book' button whose parent has no time text must NOT be clicked.
+
+    Post-B1.2: the JS is what enforces the skip — the wrapper test asserts
+    that when the JS reports no-match (no generic candidate found because
+    parents lacked the time), the wrapper returns False without re-clicking.
+    """
     booker = _make_booker()
     slot = _make_slot("5:00 PM")
 
     page = AsyncMock()
-    # wait_for_selector times out (no specific slot buttons)
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
-
-    # Capture the generic button mock so we can assert it was never clicked
-    captured_btn: AsyncMock | None = None
+    # JS iterated and found nothing clickable
+    page.evaluate = AsyncMock(return_value={
+        "clicked": False,
+        "text": None,
+        "reason": "no-match",
+    })
 
     def make_locator(selector):
-        nonlocal captured_btn
         loc = MagicMock()
         if 'has-text("Book")' in selector or 'book_now' in selector.lower():
             loc.count = AsyncMock(return_value=1)
-            btn = AsyncMock()
-            btn.text_content = AsyncMock(return_value="Book")
-            parent = AsyncMock()
-            # Parent has NO time text — should skip this button
-            parent.text_content = AsyncMock(return_value="Restaurant details")
-            btn.locator = MagicMock(return_value=parent)
-            loc.nth = MagicMock(return_value=btn)
-            captured_btn = btn
         else:
             loc.count = AsyncMock(return_value=0)
         return loc
@@ -67,31 +65,36 @@ async def test_generic_book_button_skipped_when_no_time_in_parent():
     result = await booker._click_time_slot(page, slot)
 
     assert result is False
-    # The button's .click() must never have been called
-    if captured_btn is not None:
-        captured_btn.click.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_generic_book_button_clicked_when_time_in_parent():
-    """A generic 'Book' button whose parent contains the target time MUST be clicked."""
+    """A generic 'Book' button whose parent contains the target time MUST be clicked.
+
+    Post-B1.2: the click decision happens inside one page.evaluate. The JS is
+    responsible for the parent-time check; this test asserts that when the JS
+    reports a generic-parent click happened, the wrapper returns True (and
+    that the wrapper passes isGeneric=True for a generic-Book selector).
+    """
     booker = _make_booker()
     slot = _make_slot("5:00 PM")
 
     page = AsyncMock()
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    # JS reports it found a generic button whose parent had the target time
+    page.evaluate = AsyncMock(return_value={
+        "clicked": True,
+        "text": "5:00 PM  Book  2 guests",
+        "reason": "generic-parent",
+    })
 
+    # Use a CSS-only generic selector so matched_selector takes the JS
+    # fast path (PW selectors like `button:text("Book now")` route to the
+    # locator-loop fallback after the Codex HIGH fix).
     def make_locator(selector):
         loc = MagicMock()
-        if 'has-text("Book")' in selector:
+        if selector == "button.SearchExperience-bookButton":
             loc.count = AsyncMock(return_value=1)
-            btn = AsyncMock()
-            btn.text_content = AsyncMock(return_value="Book")
-            parent = AsyncMock()
-            # Parent DOES contain the target time
-            parent.text_content = AsyncMock(return_value="5:00 PM  Book  2 guests")
-            btn.locator = MagicMock(return_value=parent)
-            loc.nth = MagicMock(return_value=btn)
         else:
             loc.count = AsyncMock(return_value=0)
         return loc
@@ -101,6 +104,10 @@ async def test_generic_book_button_clicked_when_time_in_parent():
     result = await booker._click_time_slot(page, slot)
 
     assert result is True
+    # The wrapper must have flagged the matched selector as generic
+    args, _ = page.evaluate.call_args
+    js_arg = args[1] if len(args) > 1 else args[0]
+    assert js_arg["isGeneric"] is True
 
 
 @pytest.mark.asyncio
@@ -174,7 +181,10 @@ async def test_screenshot_taken_on_checkout_timeout(tmp_path):
 
     page = AsyncMock()
     page.url = "https://www.exploretock.com/test/search"
+    # All three checkout waiters must fail to exercise the timeout path
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_url = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_function = AsyncMock(side_effect=Exception("timeout"))
     page.query_selector = AsyncMock(return_value=None)
     screenshot_paths = []
 
@@ -216,7 +226,11 @@ async def test_no_screenshot_when_debug_disabled(tmp_path):
 
     page = AsyncMock()
     page.url = "https://www.exploretock.com/test/search"
+    # All three waiters fail so the timeout branch runs (and would screenshot
+    # if debug_screenshots were True, which it isn't)
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_url = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_function = AsyncMock(side_effect=Exception("timeout"))
     page.query_selector = AsyncMock(return_value=None)
     page.screenshot = AsyncMock()
 

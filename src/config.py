@@ -50,6 +50,47 @@ class Config:
     sniper_scan_weeks: int = 2       # scan-range cap during sniper mode (Tock releases ≤2 wks)
     prewarm_min_days_out: int = 5    # skip dates closer than this during target-date prewarm
 
+    # B1.5 — skip _click_day when the URL date is authoritative.
+    # When True, checker tries _collect_slots_multi without clicking the
+    # calendar day first; falls back to clicking + retrying once if 0 slots
+    # were found. Booker mirrors this on the owns-page branch.
+    # Default False — flipped to True only after a real release window
+    # confirms the SPA URL alone is enough.
+    skip_day_click_check: bool = False
+
+    # B3.2 — event-driven slot detection (telemetry first pass).
+    # When True, checker registers a Playwright `response` listener
+    # during _check_date and logs every matching XHR to
+    # xhr_telemetry.jsonl. Operator inspects the file to identify the
+    # actual slot-availability XHR pattern, then sets
+    # event_driven_url_pattern to narrow recording. A future commit
+    # will plug a JSON parser into the listener to skip the DOM scan
+    # entirely. Default False — telemetry only.
+    event_driven_detection: bool = False
+    event_driven_url_pattern: str = ""
+
+    # Page pool (Phase B3.3) — pre-warmed Playwright pages reduce cold-task
+    # latency in races. 0 disables the pool entirely (operator side switch).
+    page_pool_size: int = 4
+
+    # B3.2 fast-path — SPA-header replay (76× detection speedup, empirical).
+    # When True, AvailabilityChecker.check_all uses src/calendar_replay.py
+    # to fetch slot availability via in-browser fetch() with replayed Tock
+    # SPA headers (~160ms per poll vs ~12s today). Falls back to the
+    # existing per-date page-reload path on any failure.
+    # Default OFF — opt in after verifying against benu via
+    # spikes/http_replay/validate_replay.py.
+    use_calendar_replay: bool = False
+
+    # Per-date cap for replay-mode slot output. The protobuf body
+    # contains anchor times only (~5-6 per date for benu/fuhuihua-style
+    # dinner restaurants), so cap=5 effectively keeps everything Tock
+    # offers while bounding worst-case booker fanout to ~30 race
+    # candidates (5 dates × ~6 anchors). Lower this if you see Tock
+    # rate-limiting under high fanout; raise it if you want to race
+    # more options per date.
+    replay_per_date_cap: int = 5
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -102,6 +143,12 @@ def load_config() -> Config:
         sniper_interval_sec=int(os.getenv("SNIPER_INTERVAL_SEC", "3")),
         sniper_scan_weeks=int(os.getenv("SNIPER_SCAN_WEEKS", "2")),
         prewarm_min_days_out=int(os.getenv("PREWARM_MIN_DAYS_OUT", "5")),
+        skip_day_click_check=os.getenv("SKIP_DAY_CLICK_CHECK", "false").lower() == "true",
+        event_driven_detection=os.getenv("EVENT_DRIVEN_DETECTION", "false").lower() == "true",
+        event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),
+        page_pool_size=int(os.getenv("PAGE_POOL_SIZE", "4")),
+        use_calendar_replay=os.getenv("USE_CALENDAR_REPLAY", "false").lower() == "true",
+        replay_per_date_cap=int(os.getenv("REPLAY_PER_DATE_CAP", "5")),
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 

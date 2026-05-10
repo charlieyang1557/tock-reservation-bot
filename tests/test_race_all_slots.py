@@ -292,23 +292,26 @@ async def test_failed_outcome_returned_when_no_winner():
 @pytest.mark.asyncio
 async def test_real_book_single_confirm_attempted_blocks_second_call():
     """Real _book_single (not a fake): two concurrent invocations on
-    the SAME booker. First reaches _confirm_booking and returns False;
-    second sees _confirm_attempted set and aborts BEFORE _confirm_booking.
+    the SAME booker. First reaches the click-and-verify step and returns
+    False; second sees _confirm_attempted set and aborts BEFORE the
+    click step.
 
-    This catches regressions like moving _confirm_attempted.set() to
-    after _confirm_booking() — which the fake-based test would miss.
+    Phase B3.1: the click is now in `_execute_confirm_click_and_verify`
+    (under the lock); prep is in `_prepare_for_confirm` (no lock).
+    Both tasks may complete prep concurrently — but only one may run
+    the click step.
     """
     from src.booker import BookingOutcome
 
     booker = _make_booker()
     booker.config.dry_run = False  # we want the confirm-lock path
 
-    # Track real calls to _confirm_booking
-    confirm_booking_calls = []
+    # Track real calls to the locked click step
+    click_calls = []
 
-    async def fake_confirm_booking(page, slot):
-        confirm_booking_calls.append(slot)
-        # First attempt: simulate verification failure → soft-win path
+    async def fake_click_and_verify(page, slot):
+        click_calls.append(slot)
+        # Simulate verification failure → soft-win path
         return False
 
     fake_page = AsyncMock()
@@ -324,18 +327,23 @@ async def test_real_book_single_confirm_attempted_blocks_second_call():
         AvailableSlot(slot_date=date(2026, 5, 1), slot_time="8:00 PM", day_of_week="Friday"),
     ]
 
-    # Patch external Playwright primitives only — NOT the lock/event/_confirm_attempted code
+    # Patch external Playwright primitives only — NOT the lock/event/_confirm_attempted code.
+    # Prep runs without the lock; click runs under the lock. Patch both to
+    # isolate from real Playwright behavior.
     with patch.object(booker, "_click_calendar_day", AsyncMock(return_value=True)), \
          patch.object(booker, "_click_time_slot", AsyncMock(return_value=True)), \
          patch.object(booker, "_wait_for_checkout", AsyncMock(return_value=True)), \
          patch.object(booker, "_booking_screenshot", AsyncMock()), \
-         patch.object(booker, "_confirm_booking", side_effect=fake_confirm_booking):
+         patch.object(booker, "_prepare_for_confirm", AsyncMock(return_value=True)), \
+         patch.object(booker, "_execute_confirm_click_and_verify",
+                      side_effect=fake_click_and_verify):
         outcome, returned_slot = await booker.book_best_slot_race(slots)
 
-    # _confirm_booking must be called EXACTLY ONCE — even though both
-    # tasks raced to it, _confirm_attempted blocked the second.
-    assert len(confirm_booking_calls) == 1, (
-        f"_confirm_booking must run exactly once; ran {len(confirm_booking_calls)} times. "
+    # The locked click step must be called EXACTLY ONCE — even though
+    # both tasks finished prep, _confirm_attempted blocked the second.
+    assert len(click_calls) == 1, (
+        f"_execute_confirm_click_and_verify must run exactly once; "
+        f"ran {len(click_calls)} times. "
         "If >1: _confirm_attempted is not blocking concurrent confirms in production code. "
         "If 0: a different bug — _book_single never reached the lock path."
     )
@@ -456,17 +464,25 @@ async def test_unverified_confirm_persists_across_booker_instances():
 
 
 def test_uncertain_file_round_trip(tmp_path):
-    """Sanity check on the booking_uncertain module's read/write/clear."""
+    """Sanity check on the booking_uncertain module's read/write/clear.
+
+    Uses a today-relative slot_date so the B2.1 stale-by-date archiver
+    doesn't fire on a frozen literal date that drifts out of range as
+    real time advances.
+    """
     from src.booking_uncertain import (
         UncertainBooking, clear_uncertain, read_uncertain, write_uncertain,
     )
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+
     fake_path = tmp_path / "test.json"
+    near_future = _date.today() + _td(days=3)
 
     booking = UncertainBooking(
-        slot_date_str="2026-05-01",
+        slot_date_str=near_future.isoformat(),
         slot_time="5:00 PM",
-        day_of_week="Friday",
-        detected_at_iso="2026-04-29T20:00:00",
+        day_of_week=near_future.strftime("%A"),
+        detected_at_iso=_dt.now().isoformat(),
     )
     write_uncertain(booking, path=fake_path)
     assert fake_path.exists()

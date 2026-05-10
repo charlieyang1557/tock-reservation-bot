@@ -183,16 +183,77 @@ def get(key: str) -> str:
     return SELECTORS[key]
 
 
+# Source of truth for the slot-button selector list AND each selector's
+# kind ("specific" → per-time-slot button, "generic" → restaurant-level
+# Book button that needs parent-time confirmation before clicking).
+# Codex MEDIUM 1: replaces the prior frozenset-of-strings membership
+# check that was fragile to whitespace/quote drift.
+_SLOT_SELECTOR_ENTRIES: list[tuple[str, str]] = [
+    (SELECTORS["available_slot_button"], "specific"),
+    ("button.Consumer-resultsListItem", "specific"),
+    ('button:visible:has-text("Book")', "generic"),
+    (SELECTORS["book_now_button"], "generic"),
+    ("button.SearchExperience-bookButton", "generic"),
+    ("[data-testid='book-button']", "generic"),
+]
+
+
 def get_slot_button_selectors() -> list[str]:
     """Ordered list of selectors for time-slot / booking buttons."""
-    return [
-        SELECTORS["available_slot_button"],
-        "button.Consumer-resultsListItem",
-        'button:visible:has-text("Book")',
-        SELECTORS["book_now_button"],
-        "button.SearchExperience-bookButton",
-        "[data-testid='book-button']",
-    ]
+    return [s for s, _ in _SLOT_SELECTOR_ENTRIES]
+
+
+def get_slot_button_selectors_typed() -> list[tuple[str, str]]:
+    """Same ordered list, with each selector tagged 'specific' or
+    'generic'. Use `is_generic_slot_selector(s)` for membership tests
+    rather than comparing strings directly."""
+    return list(_SLOT_SELECTOR_ENTRIES)
+
+
+def is_generic_slot_selector(selector: str) -> bool:
+    """Return True iff the selector is generic ("treat as restaurant-
+    level Book button — must confirm parent has the target time before
+    clicking").
+
+    Codex B2 review fix: an UNKNOWN selector now defaults to True
+    (treat as generic). Previously unknown → False allowed first-button
+    fallback on selectors a future PR added without tagging — that
+    could click a restaurant-level Book button by mistake.
+
+    Now: unknown → True (refuse first-button fallback) AND log a
+    WARNING so the operator knows the selector wasn't tagged."""
+    if not selector:
+        # Empty isn't a real selector; preserve historic non-warning behavior.
+        return False
+    for s, kind in _SLOT_SELECTOR_ENTRIES:
+        if s == selector:
+            return kind == "generic"
+    # Unknown selector: fail safer (treat as generic) + warn loudly so
+    # the operator adds it to _SLOT_SELECTOR_ENTRIES.
+    logger.warning(
+        f"[selectors] is_generic_slot_selector: unknown selector "
+        f"{selector!r} — treating as generic (safer default). "
+        "Add it to _SLOT_SELECTOR_ENTRIES with an explicit kind."
+    )
+    return True
+
+
+# Substrings that indicate a selector uses Playwright-only syntax
+# (`:has-text(...)`, `:text(...)`, `:visible`) and therefore is unsafe for
+# native `document.querySelectorAll`. Used by the batched JS paths in
+# checker._collect_slots_multi and booker._click_time_slot to decide
+# whether to take the JS fast path or fall back to a Python locator loop.
+_PLAYWRIGHT_SELECTOR_TOKENS: tuple[str, ...] = (":has-text", ":text(", ":visible")
+
+
+def is_playwright_selector(selector: str) -> bool:
+    """Return True if `selector` contains any Playwright-only syntax token.
+
+    document.querySelectorAll throws DOM SyntaxError on these, so the JS
+    fast path must skip them and fall back to page.locator iteration."""
+    if not selector:
+        return False
+    return any(tok in selector for tok in _PLAYWRIGHT_SELECTOR_TOKENS)
 
 
 # ---------------------------------------------------------------------------

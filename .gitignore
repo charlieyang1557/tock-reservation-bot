@@ -43,6 +43,15 @@ debug_screenshots/
 session_cookies.json
 slot_tracker.csv
 slot_tracker.json
+selector_metrics.json
+selector_metrics.json.tmp
+xhr_telemetry.jsonl
+booking_uncertain.archive/
+
+# === Phase C HTTP spike (operator-run, holds live auth tokens) ===
+spikes/http_replay/trace.json
+spikes/http_replay/aiohttp_cookies.json
+spikes/http_replay/*.json
 
 # === Deployment artifacts (host-specific) ===
 ecosystem.config.js

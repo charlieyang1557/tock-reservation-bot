@@ -15,6 +15,7 @@ Usage:
   python main.py --test-sniper-benchmark      A/B benchmark: sequential vs concurrent poll speed/error rate
   python main.py --test-sniper-benchmark --test-restaurant SLUG --test-sniper-polls N
   python main.py --test-adaptive-sniper       Test concurrent↔sequential auto-switching (threshold forced to 0%)
+  python main.py --selector-stats             Print top selectors per role from selector_metrics.json and exit
 """
 
 import asyncio
@@ -155,10 +156,25 @@ async def main() -> None:
             "Use --test-sniper-polls N to control poll count (default: 20)."
         ),
     )
+    parser.add_argument(
+        "--selector-stats",
+        action="store_true",
+        help=(
+            "Print contents of selector_metrics.json formatted as top selectors "
+            "per role (descending hit count) and exit. No browser/login required."
+        ),
+    )
     args = parser.parse_args()
 
     _setup_logging()
     logger = logging.getLogger("main")
+
+    # ── Mode: --selector-stats (read-only; no lock/config/browser needed) ─
+    if args.selector_stats:
+        from src import selector_metrics
+        metrics = selector_metrics.read_metrics()
+        print(selector_metrics.format_stats(metrics))
+        return
 
     # --- Singleton lock — refuse to start if another bot is running ---
     from src.process_lock import acquire_singleton_lock
