@@ -127,7 +127,7 @@ Returns True if EITHER the URL match OR the DOM signal fires. Cache the result p
 
 ### B3 — Architecture changes (medium risk; target: 3–5 days)
 
-#### B3.1 — Move confirm-lock granularity
+#### B3.1 — Move confirm-lock granularity ✅ Done 2026-05-10 (split into `_prepare_for_confirm` (no lock — payment detect, CVC fill, wait for confirm button) and `_execute_confirm_click_and_verify` (under lock — click + verify); 7 new tests in `test_confirm_lock_split.py` covering concurrent prep, lock-protected click, _confirm_attempted blocking, 5-way no-double-booking fuzz; `_confirm_booking` retained as backwards-compat shim)
 **Saves:** 200–1500 ms in races where multiple slots reach checkout simultaneously.
 **Files:** [src/booker.py:325](src/booker.py:325) (`_book_single`'s lock block)
 **Approach:** Currently the lock wraps `_confirm_booking` which includes payment detection, frame search, CVC fill, and the click. Split into:

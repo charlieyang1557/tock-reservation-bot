@@ -485,7 +485,20 @@ class TockBooker:
             if not checkout_ok:
                 return False
 
-            # ── Step 5: confirm (locked — only one task proceeds) ─────
+            # ── Step 5a: prep (NO lock — concurrent across tasks) ─────
+            # Phase B3.1: payment detection, CVC fill, and wait-for-confirm-
+            # button used to all run under the lock, serializing every
+            # racing task. They're idempotent per-page, so we run them
+            # without the lock to maximize concurrency.
+            if booking_won.is_set():
+                self.notifier.booking_aborted(slot, "another slot already booked")
+                return False
+
+            prep_ok = await self._prepare_for_confirm(page, slot)
+            if not prep_ok:
+                return False
+
+            # ── Step 5b: confirm click + verify (locked — only one wins) ─
             if booking_won.is_set():
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
@@ -509,11 +522,11 @@ class TockBooker:
                     return False
 
                 # Mark that we are about to click confirm. From this point on,
-                # no other task can call _confirm_booking even if our own
-                # verification fails — the user must verify manually.
+                # no other task can click even if our own verification fails
+                # — the user must verify manually.
                 self._confirm_attempted.set()
 
-                success = await self._confirm_booking(page, slot)
+                success = await self._execute_confirm_click_and_verify(page, slot)
                 if success:
                     booking_won.set()
                     self.notifier.booking_confirmed(slot)
@@ -914,16 +927,18 @@ class TockBooker:
         except Exception as e:
             logger.debug(f"[book] Screenshot failed at step '{step}': {e}")
 
-    async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
-        """
-        Handle payment validation and click the confirm button.
+    async def _prepare_for_confirm(self, page: Page, slot: AvailableSlot) -> bool:
+        """Per-page idempotent preparation for the confirm click. Runs
+        WITHOUT the lock so N racing tasks can prep concurrently
+        (Phase B3.1).
 
-        Payment flow:
-        ┌─ Is there a payment section on the page?
-        │   NO  → free reservation; go straight to confirm
-        │   YES ─┬─ Saved card found → proceed to confirm
-        │         └─ No card found   → pause, notify user, wait up to 9 min
-        └─ Click confirm → wait for confirmation page → return True/False
+        Steps:
+          - payment detection
+          - wait up to 9 min for the operator to add a card if missing
+          - CVC fill on the saved card (if any)
+          - wait for the confirm button to be visible
+
+        Returns True iff the page is in a ready-to-click state.
         """
         needs_payment = await self._page_needs_payment(page)
         has_card = await self._has_saved_card(page)
@@ -953,7 +968,7 @@ class TockBooker:
                 )
                 return False
 
-        # Fill CVC for saved card if configured
+        # Fill CVC for saved card if configured (per-page; idempotent)
         if self.config.card_cvc:
             await self._fill_cvc(page)
         elif needs_payment and has_card:
@@ -962,21 +977,32 @@ class TockBooker:
                 "checkout may fail if CVC is required."
             )
 
-        # Wait once for the confirm button, then click with one retry on transient failure.
-        # Waiting once (not per-retry) avoids a potential 30s timeout in the hot path.
-        confirm_key = "confirm_button"
-        confirm_selector = sel.get(confirm_key)
+        # Wait once for the confirm button to be visible. Done in prep so
+        # the lock-protected click section is as short as possible.
+        confirm_selector = sel.get("confirm_button")
         try:
             await page.wait_for_selector(confirm_selector, timeout=15000)
         except Exception as e:
             logger.error(
-                f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
+                f"SELECTOR_FAILED: key='confirm_button'  selector={confirm_selector!r}\n"
                 f"  Confirm button not found on page.\n"
                 f"  Current URL: {page.url}\n"
                 f"  → Update src/selectors.py  Error: {e}"
             )
             return False
+        return True
 
+    async def _execute_confirm_click_and_verify(
+        self, page: Page, slot: AvailableSlot
+    ) -> bool:
+        """Click the confirm button and verify Tock accepted the booking.
+        MUST be called under `self._confirm_lock` (Phase B3.1).
+
+        Returns True only if Tock's confirmation page rendered. Returns
+        False if the click failed OR the confirmation could not be
+        verified — the caller is responsible for soft-win bookkeeping.
+        """
+        confirm_selector = sel.get("confirm_button")
         for click_attempt in range(2):
             try:
                 await page.click(confirm_selector)
@@ -990,7 +1016,8 @@ class TockBooker:
                     await asyncio.sleep(2)
                 else:
                     logger.error(
-                        f"SELECTOR_FAILED: key='{confirm_key}'  selector={confirm_selector!r}\n"
+                        f"SELECTOR_FAILED: key='confirm_button'  "
+                        f"selector={confirm_selector!r}\n"
                         f"  Could not click the confirm button after 2 attempts.\n"
                         f"  Current URL: {page.url}\n"
                         f"  → Update src/selectors.py  Error: {e}"
@@ -1027,6 +1054,18 @@ class TockBooker:
                 f"  → Check if booking actually succeeded, then update src/selectors.py"
             )
             return False
+
+    async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
+        """Backwards-compat shim: prep + click + verify in one call.
+
+        Phase B3.1 split this into `_prepare_for_confirm` (no lock) and
+        `_execute_confirm_click_and_verify` (under lock). The shim is
+        kept so existing tests / callers that invoke the whole thing
+        still work, but `_book_single` no longer uses it.
+        """
+        if not await self._prepare_for_confirm(page, slot):
+            return False
+        return await self._execute_confirm_click_and_verify(page, slot)
 
     # ------------------------------------------------------------------
     # Payment detection helpers
