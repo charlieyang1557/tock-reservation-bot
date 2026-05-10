@@ -395,10 +395,13 @@ class AvailabilityChecker:
         # Codex HIGH 1: cap slots before returning so book_best_slot_race
         # doesn't fan out into 100+ concurrent booking pages on a calendar
         # response that includes the full 14-day calendar.
+        # Default cap=5 covers the typical 5-6 anchor times per date
+        # (Tock's protobuf only encodes anchors; UI interpolates 15-min
+        # variants). Operator can override via REPLAY_PER_DATE_CAP env.
         slots = cap_slots_per_date(
             slots,
             preferred_time=getattr(self.config, "preferred_time", "17:00"),
-            per_date_cap=3,
+            per_date_cap=getattr(self.config, "replay_per_date_cap", 5),
         )
         # Success — reset failure count
         self._replay_failure_count = 0

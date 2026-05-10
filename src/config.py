@@ -82,6 +82,15 @@ class Config:
     # spikes/http_replay/validate_replay.py.
     use_calendar_replay: bool = False
 
+    # Per-date cap for replay-mode slot output. The protobuf body
+    # contains anchor times only (~5-6 per date for benu/fuhuihua-style
+    # dinner restaurants), so cap=5 effectively keeps everything Tock
+    # offers while bounding worst-case booker fanout to ~30 race
+    # candidates (5 dates × ~6 anchors). Lower this if you see Tock
+    # rate-limiting under high fanout; raise it if you want to race
+    # more options per date.
+    replay_per_date_cap: int = 5
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -139,6 +148,7 @@ def load_config() -> Config:
         event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),
         page_pool_size=int(os.getenv("PAGE_POOL_SIZE", "4")),
         use_calendar_replay=os.getenv("USE_CALENDAR_REPLAY", "false").lower() == "true",
+        replay_per_date_cap=int(os.getenv("REPLAY_PER_DATE_CAP", "5")),
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 
