@@ -258,11 +258,11 @@ class TockBrowser:
             page = await self.new_page()
             logger.info(f"[warm] Refreshing session: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            # Wait for network to settle (Cloudflare JS runs after domcontentloaded)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass  # networkidle timeout is fine; proceed with current state
+            # Phase B1.4: dropped wait_for_load_state("networkidle"). Tock's
+            # restaurant page never reaches networkidle (analytics + CF
+            # beacons keep firing) so the 5-s timeout was guaranteed waste
+            # every cycle. domcontentloaded + the _is_logged_in check below
+            # are enough to confirm the session.
 
             if not await self._is_logged_in(page):
                 logger.warning(

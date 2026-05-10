@@ -56,7 +56,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 **Tests:** existing `test_checker_detection.py::TestCollectSlotsMulti` covers the cases — keep them green; add `test_collect_slots_multi_single_evaluate_call` to assert one round-trip.
 **Done when:** all 19 detection tests pass; benchmark in `--test-sniper-benchmark` shows reduced per-date scan time.
 
-#### B1.4 — Replace `wait_for_load_state("networkidle")` in `warm_session`
+#### B1.4 — Replace `wait_for_load_state("networkidle")` in `warm_session` ✅ Done 2026-05-09 (call dropped entirely; 2 new tests in `test_warm_session_no_networkidle.py` assert no networkidle wait + domcontentloaded preserved on goto)
 **Saves:** ~5 s per warm cycle (the timeout fires every cycle on Tock's main page).
 **Files:** [src/browser.py:263](src/browser.py:263)
 **Approach:** Drop the call entirely. Tock's main page has third-party analytics that never reach networkidle; the fixed 5-s timeout is pure waste. Optionally replace with `wait_for_function("document.readyState==='complete'", timeout=2000)`.
