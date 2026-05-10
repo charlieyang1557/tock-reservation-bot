@@ -74,20 +74,26 @@ _SCREENSHOT_DIR = os.path.join(
 # alongside `get_slot_button_selectors` so the two cannot drift apart.
 # Use `is_generic_slot_selector(s)` for membership tests.
 
-# Codex LOW 1: regex matching the actual checkout-style URL paths so
-# substrings like /booklist or /bookmark do not false-positive into the
-# confirm flow. Path segment must be followed by /, ?, #, or end-of-string.
+# Codex LOW 1 + B2 review MEDIUM: match the actual checkout-style URL
+# path segment, not the full URL. Substrings in query string or
+# fragment (e.g., `/search?next=/checkout/abc`) must NOT match.
 _CHECKOUT_PATH_RE = re.compile(
-    r"/(checkout|reservation|book)(?=/|\?|#|$)", re.IGNORECASE
+    r"/(checkout|reservation|book)(?:/|$)", re.IGNORECASE
 )
 
 
 def _checkout_url_matches(url: str) -> bool:
-    """Return True iff `url`'s path looks like an actual checkout/
-    reservation/book page (not a profile, search, or substring match)."""
+    """Return True iff the URL's PATH (not query, not fragment) contains
+    a checkout/reservation/book segment. Parses with urllib so query
+    strings and fragments can never produce a false positive."""
     if not url:
         return False
-    return bool(_CHECKOUT_PATH_RE.search(url))
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path or ""
+    except Exception:
+        return False
+    return bool(_CHECKOUT_PATH_RE.search(path))
 
 
 # Codex LOW 2: payment-visible JS includes a URL precondition so

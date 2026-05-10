@@ -65,10 +65,11 @@ def test_is_generic_slot_selector_returns_false_for_specific_button():
     assert is_generic_slot_selector("button.Consumer-resultsListItem") is False
 
 
-def test_is_generic_slot_selector_returns_false_for_unknown_selector():
-    """Selectors not in the source-of-truth list are treated as specific
-    by default (safer: avoids accidental generic-button clicks)."""
-    assert is_generic_slot_selector("div.some-future-selector") is False
+def test_is_generic_slot_selector_unknown_treated_as_generic():
+    """Codex B2 review: unknown selectors now default to generic (the
+    SAFER fail-closed behavior — refuses first-button fallback). Empty
+    string is still False (not a real selector)."""
+    assert is_generic_slot_selector("div.some-future-selector") is True
     assert is_generic_slot_selector("") is False
 
 

@@ -211,16 +211,31 @@ def get_slot_button_selectors_typed() -> list[tuple[str, str]]:
 
 
 def is_generic_slot_selector(selector: str) -> bool:
-    """Return True iff `selector` is one of the known generic
-    restaurant-level Book buttons (kind='generic' in the typed list).
-    Unknown selectors default to False (safer: avoids accidental
-    generic-button clicks)."""
+    """Return True iff the selector is generic ("treat as restaurant-
+    level Book button — must confirm parent has the target time before
+    clicking").
+
+    Codex B2 review fix: an UNKNOWN selector now defaults to True
+    (treat as generic). Previously unknown → False allowed first-button
+    fallback on selectors a future PR added without tagging — that
+    could click a restaurant-level Book button by mistake.
+
+    Now: unknown → True (refuse first-button fallback) AND log a
+    WARNING so the operator knows the selector wasn't tagged."""
     if not selector:
+        # Empty isn't a real selector; preserve historic non-warning behavior.
         return False
     for s, kind in _SLOT_SELECTOR_ENTRIES:
-        if s == selector and kind == "generic":
-            return True
-    return False
+        if s == selector:
+            return kind == "generic"
+    # Unknown selector: fail safer (treat as generic) + warn loudly so
+    # the operator adds it to _SLOT_SELECTOR_ENTRIES.
+    logger.warning(
+        f"[selectors] is_generic_slot_selector: unknown selector "
+        f"{selector!r} — treating as generic (safer default). "
+        "Add it to _SLOT_SELECTOR_ENTRIES with an explicit kind."
+    )
+    return True
 
 
 # Substrings that indicate a selector uses Playwright-only syntax

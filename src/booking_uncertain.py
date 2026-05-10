@@ -112,6 +112,17 @@ def read_uncertain(path: Path = UNCERTAIN_FILE) -> UncertainBooking | None:
             f"{path.parent / (path.stem + '.archive')}/."
         )
         _archive_uncertain(path, reason="stale")
+        # Codex B2 fix: if archive failed (file still on disk), keep
+        # blocking races by returning the booking object. The next
+        # cycle will retry the archive. Better to block races for
+        # longer than to silently unblock.
+        if path.exists():
+            logger.warning(
+                f"[uncertain-booking] Archive failed; {path} still "
+                "exists. Continuing to block races until disk state "
+                "is repaired."
+            )
+            return booking
         return None
 
     return booking
@@ -119,9 +130,13 @@ def read_uncertain(path: Path = UNCERTAIN_FILE) -> UncertainBooking | None:
 
 def _archive_uncertain(path: Path, *, reason: str) -> None:
     """Move `path` to `<path>.archive/<timestamp>_<reason>__<basename>`.
-    Best-effort: failures are logged but do not raise — we always want to
-    unblock future races, even if archiving fails (we'll fall back to
-    `unlink` so the file at least leaves the live path)."""
+
+    Codex B2 review HIGH: failures are logged loudly but the live file
+    is LEFT IN PLACE. Removing it on archive failure would silently
+    drop the operator's safety guard and let the bot race on a slot
+    whose outcome was never verified — strictly worse than continuing
+    to block races until the operator fixes the underlying disk issue.
+    """
     try:
         archive_dir = path.parent / (path.stem + ".archive")
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -133,17 +148,12 @@ def _archive_uncertain(path: Path, *, reason: str) -> None:
         logger.info(f"[uncertain-booking] Archived {path} → {dest}")
     except Exception as e:
         logger.error(
-            f"[uncertain-booking] Archive of {path} failed: {e}. "
-            "Falling back to unlink so the live path doesn't keep "
-            "blocking races."
+            f"[uncertain-booking] Archive of {path} failed: "
+            f"{type(e).__name__}: {e}. LEAVING the live file in place "
+            "so the no-race guard remains active. Operator must "
+            f"investigate disk state and clear {path} manually after "
+            "verifying the booking on Tock."
         )
-        try:
-            path.unlink(missing_ok=True)
-        except Exception as e2:
-            logger.error(
-                f"[uncertain-booking] Even unlink failed for {path}: {e2}. "
-                "Operator must remove this file manually."
-            )
 
 
 def clear_uncertain(path: Path = UNCERTAIN_FILE) -> None:

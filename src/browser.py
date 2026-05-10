@@ -335,13 +335,23 @@ class TockBrowser:
         75–400 ms on the CVC interaction (Stripe iframe usually isn't
         first in document order).
         """
+        from urllib.parse import urlparse
         cached_host = self._frame_url_cache.get(selector)
+
+        def _frame_host(frame) -> str:
+            try:
+                return urlparse(getattr(frame, "url", "") or "").netloc
+            except Exception:
+                return ""
 
         all_frames = [page.main_frame] + [
             f for f in page.frames if f != page.main_frame
         ]
 
-        # First pass: cached-matching frames (skipping detached ones)
+        # First pass: cached-matching frames (skipping detached ones).
+        # Codex B2 fix: use EXACT netloc equality, not substring match.
+        # Substring `cached_host in frame.url` could prefer an attacker
+        # iframe whose URL embeds the cached host string in its path.
         if cached_host:
             preferred = []
             others = []
@@ -351,7 +361,7 @@ class TockBrowser:
                         continue
                 except Exception:
                     pass
-                if cached_host in (getattr(f, "url", "") or ""):
+                if _frame_host(f) == cached_host:
                     preferred.append(f)
                 else:
                     others.append(f)
@@ -359,8 +369,6 @@ class TockBrowser:
                 try:
                     el = await frame.query_selector(selector)
                     if el:
-                        # Refresh cache (URL may have a new path with
-                        # same host) but don't change the host
                         return el
                 except Exception:
                     continue
@@ -374,14 +382,10 @@ class TockBrowser:
             try:
                 el = await frame.query_selector(selector)
                 if el:
-                    # Cache the matching host for next time
-                    try:
-                        from urllib.parse import urlparse
-                        host = urlparse(getattr(frame, "url", "") or "").netloc
-                        if host:
-                            self._frame_url_cache[selector] = host
-                    except Exception:
-                        pass
+                    # Cache the matching netloc for next time
+                    host = _frame_host(frame)
+                    if host:
+                        self._frame_url_cache[selector] = host
                     return el
             except Exception:
                 continue
