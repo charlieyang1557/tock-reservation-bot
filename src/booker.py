@@ -337,31 +337,47 @@ class TockBooker:
                 ):
                     return False
 
-                # Wait for day buttons to render inside the calendar.
-                try:
-                    await page.wait_for_selector(
-                        sel.get("all_day_button"), timeout=5000
-                    )
-                except Exception:
-                    pass  # calendar may still be loading; proceed anyway
-
-                # ── Step 2: click the calendar day ────────────────────────
-                if booking_won.is_set():
-                    self.notifier.booking_aborted(slot, "another slot already booked")
-                    return False
-
-                if not await self._click_calendar_day(page, slot):
-                    return False
-
-                # Wait reactively for slot buttons after day click
-                for try_sel in get_slot_button_selectors()[:2]:
+                # B1.5: when skip_day_click_check is True, defer the calendar-day
+                # click until after we try the time-slot click — Tock's
+                # `?date=YYYY-MM-DD` URL may already select the date in the
+                # SPA so the click is redundant. If the time-slot click finds
+                # no buttons, we fall back to clicking the day and retrying
+                # once.
+                skip_click = self.config.skip_day_click_check
+                day_clicked = False
+                if not skip_click:
+                    # Wait for day buttons to render inside the calendar.
                     try:
-                        await page.wait_for_selector(try_sel, timeout=2000)
-                        break
+                        await page.wait_for_selector(
+                            sel.get("all_day_button"), timeout=5000
+                        )
                     except Exception:
-                        continue
+                        pass  # calendar may still be loading; proceed anyway
+
+                    # ── Step 2: click the calendar day ────────────────────
+                    if booking_won.is_set():
+                        self.notifier.booking_aborted(slot, "another slot already booked")
+                        return False
+
+                    if not await self._click_calendar_day(page, slot):
+                        return False
+                    day_clicked = True
+
+                    # Wait reactively for slot buttons after day click
+                    for try_sel in get_slot_button_selectors()[:2]:
+                        try:
+                            await page.wait_for_selector(try_sel, timeout=2000)
+                            break
+                        except Exception:
+                            continue
             else:
                 logger.info(f"[book] {slot} → using warm page (skipping navigation)")
+                # No skip-day-click decision needed when the booker reuses a
+                # warm page — the checker already had the correct date
+                # selected. Initialize so the post-Step-3 fallback below
+                # never trips for warm-page bookings.
+                skip_click = False
+                day_clicked = True
 
             await self._booking_screenshot(page, "01_booking_start")
 
@@ -375,9 +391,32 @@ class TockBooker:
             # slot — if it's no longer visible, the slot vanished and the
             # first-button fallback would book the wrong time (Codex review).
             using_warm_page = not owns_page
-            if not await self._click_time_slot(
+            slot_clicked = await self._click_time_slot(
                 page, slot, strict_time_match=using_warm_page
-            ):
+            )
+            if not slot_clicked and skip_click and not day_clicked:
+                # B1.5 fallback: skip-mode found no slot buttons; click the
+                # calendar day and retry the time-slot click once.
+                logger.debug(
+                    f"[book] {slot} — skip-mode found no slot buttons; "
+                    "falling back to click_calendar_day + re-click"
+                )
+                if booking_won.is_set():
+                    self.notifier.booking_aborted(slot, "another slot already booked")
+                    return False
+                if not await self._click_calendar_day(page, slot):
+                    return False
+                day_clicked = True
+                for try_sel in get_slot_button_selectors()[:2]:
+                    try:
+                        await page.wait_for_selector(try_sel, timeout=2000)
+                        break
+                    except Exception:
+                        continue
+                slot_clicked = await self._click_time_slot(
+                    page, slot, strict_time_match=using_warm_page
+                )
+            if not slot_clicked:
                 return False
 
             # Scroll to bottom so the confirm button (which may be below the fold

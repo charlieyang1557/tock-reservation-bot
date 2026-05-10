@@ -882,38 +882,41 @@ class AvailabilityChecker:
             # calendar days, others don't. Slot buttons may be Consumer-resultsListItem
             # or plain "Book" buttons with hashed CSS classes. We try all known
             # patterns and use the first that matches.
+            #
+            # B1.5: when skip_day_click_check is True, defer the calendar-day
+            # click until after the first slot detection — Tock's
+            # `?date=YYYY-MM-DD` URL may already select the date in the SPA
+            # so the click is redundant. If post-skip detection finds 0
+            # slots, we fall back to clicking the day and detecting once
+            # more. The fallback is bounded to a single retry so a SPA quirk
+            # doesn't silently miss slots.
 
             if abort_event is not None and abort_event.is_set():
                 return []
 
-            # Click the target day in the calendar
-            clicked = await self._click_day(page, target_date)
-            if not clicked:
-                logger.info(f"[check] {date_str} — could not click day in calendar")
-                if keep_page:
-                    # Sniper mode: add to per-window skip set
-                    self._skip_dates.add(date_str)
-                else:
-                    # Normal mode: cache for NORMAL_SKIP_TTL_SEC to avoid
-                    # wasting time re-checking dates beyond the booking window
-                    self._add_to_normal_skip(date_str)
-                    logger.debug(
-                        f"[check] {date_str} cached in normal skip (TTL {NORMAL_SKIP_TTL_SEC}s)"
-                    )
-                return []
+            skip_click = self.config.skip_day_click_check
+            day_clicked = False
+            if not skip_click:
+                clicked = await self._click_day(page, target_date)
+                if not clicked:
+                    logger.info(f"[check] {date_str} — could not click day in calendar")
+                    if keep_page:
+                        # Sniper mode: add to per-window skip set
+                        self._skip_dates.add(date_str)
+                    else:
+                        # Normal mode: cache for NORMAL_SKIP_TTL_SEC to avoid
+                        # wasting time re-checking dates beyond the booking window
+                        self._add_to_normal_skip(date_str)
+                        logger.debug(
+                            f"[check] {date_str} cached in normal skip (TTL {NORMAL_SKIP_TTL_SEC}s)"
+                        )
+                    return []
+                day_clicked = True
 
             # Try multiple selectors for slot/booking buttons.
             # Centralized in selectors.py so checker and booker stay in sync.
             from src.selectors import get_slot_button_selectors
             slot_selectors = get_slot_button_selectors()
-
-            # Wait reactively for any slot-like element instead of blind sleep.
-            # Short timeout (500ms sniper, 2500ms normal) — move on if nothing appears.
-            slot_timeout = 500 if keep_page else 2500
-            try:
-                await page.wait_for_selector(slot_selectors[0], timeout=slot_timeout)
-            except Exception:
-                pass  # no slots visible yet — proceed to multi-selector check
 
             # Split selectors: CSS-compatible ones go through fast page.evaluate(),
             # Playwright-specific ones (:has-text, :text, :visible) fall back to locator API
@@ -925,50 +928,79 @@ class AvailabilityChecker:
                 else:
                     css_selectors.append(s)
 
-            found_selector = None
-            slot_count = 0
-
-            # Fast path: batch CSS selectors in one evaluate() call
-            if css_selectors:
-                detect_js = """
-                (selectors) => {
-                    for (let i = 0; i < selectors.length; i++) {
-                        try {
-                            const els = document.querySelectorAll(selectors[i]);
-                            if (els.length > 0) return { index: i, count: els.length };
-                        } catch(e) { continue; }
-                    }
-                    return { index: -1, count: 0 };
+            slot_timeout = 500 if keep_page else 2500
+            detect_js = """
+            (selectors) => {
+                for (let i = 0; i < selectors.length; i++) {
+                    try {
+                        const els = document.querySelectorAll(selectors[i]);
+                        if (els.length > 0) return { index: i, count: els.length };
+                    } catch(e) { continue; }
                 }
-                """
-                detect_result = await page.evaluate(detect_js, css_selectors)
-                if detect_result["index"] >= 0:
-                    found_selector = css_selectors[detect_result["index"]]
-                    slot_count = detect_result["count"]
+                return { index: -1, count: 0 };
+            }
+            """
 
-            # Slow path: Playwright-specific selectors (only if fast path missed)
-            if not found_selector:
-                for try_sel in pw_selectors:
-                    try:
-                        count = await page.locator(try_sel).count()
-                        if count > 0:
-                            found_selector = try_sel
-                            slot_count = count
-                            break
-                    except Exception:
-                        continue
+            async def _detect_and_collect() -> list[AvailableSlot]:
+                # Wait reactively for any slot-like element instead of blind sleep.
+                # Short timeout (500ms sniper, 2500ms normal) — move on if nothing appears.
+                try:
+                    await page.wait_for_selector(slot_selectors[0], timeout=slot_timeout)
+                except Exception:
+                    pass  # no slots visible yet — proceed to multi-selector check
 
-            if found_selector:
+                found = None
+                count = 0
+                # Fast path: batch CSS selectors in one evaluate() call
+                if css_selectors:
+                    res = await page.evaluate(detect_js, css_selectors)
+                    if res["index"] >= 0:
+                        found = css_selectors[res["index"]]
+                        count = res["count"]
+                # Slow path: Playwright-specific selectors (only if fast path missed)
+                if not found:
+                    for try_sel in pw_selectors:
+                        try:
+                            c = await page.locator(try_sel).count()
+                            if c > 0:
+                                found = try_sel
+                                count = c
+                                break
+                        except Exception:
+                            continue
+                if not found:
+                    logger.debug(
+                        f"[check] {date_str} — no slots found with any selector"
+                    )
+                    return []
                 logger.info(
-                    f"[check] {date_str} — {slot_count} slot(s) found via {found_selector!r}"
+                    f"[check] {date_str} — {count} slot(s) found via {found!r}"
                 )
+                return await self._collect_slots_multi(page, target_date, found)
 
-            if not found_selector:
-                logger.debug(f"[check] {date_str} — no slots found with any selector")
-                return []
+            slots = await _detect_and_collect()
 
-            # Collect slots from the matched selector
-            slots = await self._collect_slots_multi(page, target_date, found_selector)
+            # B1.5 fallback: if we skipped the day click and the SPA URL alone
+            # didn't surface any slots, click the day and retry once. Bounded
+            # to a single retry so an SPA quirk doesn't silently miss slots.
+            if skip_click and not day_clicked and not slots:
+                logger.debug(
+                    f"[check] {date_str} — skip-mode produced 0 slots; "
+                    "falling back to click_day + re-detect"
+                )
+                fallback_clicked = await self._click_day(page, target_date)
+                if fallback_clicked:
+                    day_clicked = True
+                    slots = await _detect_and_collect()
+                else:
+                    if keep_page:
+                        self._skip_dates.add(date_str)
+                    else:
+                        self._add_to_normal_skip(date_str)
+                        logger.debug(
+                            f"[check] {date_str} cached in normal skip "
+                            f"(TTL {NORMAL_SKIP_TTL_SEC}s, skip-mode fallback)"
+                        )
 
             # Record each new slot in the tracker
             # Sniper mode defers disk I/O; monitor.poll() calls flush_deferred() after

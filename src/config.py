@@ -50,6 +50,14 @@ class Config:
     sniper_scan_weeks: int = 2       # scan-range cap during sniper mode (Tock releases ≤2 wks)
     prewarm_min_days_out: int = 5    # skip dates closer than this during target-date prewarm
 
+    # B1.5 — skip _click_day when the URL date is authoritative.
+    # When True, checker tries _collect_slots_multi without clicking the
+    # calendar day first; falls back to clicking + retrying once if 0 slots
+    # were found. Booker mirrors this on the owns-page branch.
+    # Default False — flipped to True only after a real release window
+    # confirms the SPA URL alone is enough.
+    skip_day_click_check: bool = False
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -102,6 +110,7 @@ def load_config() -> Config:
         sniper_interval_sec=int(os.getenv("SNIPER_INTERVAL_SEC", "3")),
         sniper_scan_weeks=int(os.getenv("SNIPER_SCAN_WEEKS", "2")),
         prewarm_min_days_out=int(os.getenv("PREWARM_MIN_DAYS_OUT", "5")),
+        skip_day_click_check=os.getenv("SKIP_DAY_CLICK_CHECK", "false").lower() == "true",
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 

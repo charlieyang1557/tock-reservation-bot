@@ -63,7 +63,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 **Tests:** add `test_warm_session_does_not_block_on_networkidle` — patch `wait_for_load_state` and assert it's not called (or called with a different state).
 **Done when:** test passes; manually verify warm cycle is faster via `python main.py --once` with HEADLESS=true.
 
-#### B1.5 — Skip `_click_day` when URL date is authoritative
+#### B1.5 — Skip `_click_day` when URL date is authoritative ✅ Done 2026-05-09 (config flag `skip_day_click_check` defaults False; checker `_check_date` and booker `_book_single` both honor it with a single bounded retry; 8 new tests in `test_skip_day_click.py`. Default flip pending a real release-window A/B run)
 **Saves:** 50–300 ms per scan.
 **Files:** [src/checker.py:679](src/checker.py:679), [src/checker.py:1023](src/checker.py:1023), [src/booker.py:_click_calendar_day]
 **Approach:** Tock's `/search?date=YYYY-MM-DD` URL may already select that date in the SPA, making the subsequent calendar-day click redundant. **Don't blindly cut it** — A/B-test:
