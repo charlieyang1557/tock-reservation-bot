@@ -597,53 +597,87 @@ class TockBooker:
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
         """Return True when the checkout/booking-details page is detected.
 
-        Polls every 2s for up to 30s, checking three signals in order:
-          1. checkout_container selector present
-          2. URL contains /checkout, /reservation, or /book
-          3. Any payment-related element present (saved card or add-card prompt)
+        Race three Playwright waiters concurrently and return True on the
+        first success, cutting 0–1900 ms off the old 2-s polling tick:
+
+          1. wait_for_selector(checkout_container)
+          2. wait_for_url(predicate)        — URL contains /checkout, /reservation, /book
+          3. wait_for_function(payment_visible_js)
+
+        Returns False after a 30 s overall timeout (all three waiters
+        either raised or did not resolve). Losing waiters are cancelled and
+        awaited so Python doesn't warn about un-awaited coroutines.
         """
         key = "checkout_container"
         selector = sel.get(key)
-        no_pay_sel = sel.get("no_payment_indicator")
-        saved_card_sel = sel.get("saved_payment_card")
         total_wait = 30
-        interval = 2
+        timeout_ms = total_wait * 1000
 
-        for elapsed in range(0, total_wait, interval):
-            # 1. Checkout container selector
-            try:
-                await page.wait_for_selector(selector, timeout=interval * 1000)
-                logger.info(
-                    f"[book] Checkout page loaded for {slot.slot_date_str} "
-                    f"(+{elapsed}s)"
-                )
-                return True
-            except Exception:
-                pass
+        def _url_matches(url: str) -> bool:
+            return any(p in url for p in ("/checkout", "/reservation", "/book"))
 
-            # 2. URL-based detection
-            url = page.url
-            if any(p in url for p in ("/checkout", "/reservation", "/book")):
-                logger.info(f"[book] Checkout detected via URL: {url}")
-                return True
+        # JS predicate for "payment form is visible". Mirrors the legacy
+        # query_selector check on saved_payment_card / no_payment_indicator
+        # but in a single browser-side evaluation so we can wait for it
+        # event-style instead of polling.
+        payment_visible_js = (
+            "() => {"
+            "  const card = document.querySelector("
+            "    '[data-testid=\"saved-card\"], .SavedCard, "
+            ".PaymentMethod--saved, [data-testid=\"payment-card\"]'"
+            "  );"
+            "  if (card) return true;"
+            "  const ctrls = Array.from(document.querySelectorAll('button, a'));"
+            "  return ctrls.some(el => "
+            "    /add (payment|card|a card)/i.test(el.innerText || '')"
+            "  );"
+            "}"
+        )
 
-            # 3. Payment element detection
-            try:
-                pay_el = await page.query_selector(no_pay_sel)
-                if pay_el is None:
-                    pay_el = await page.query_selector(saved_card_sel)
-                if pay_el:
-                    logger.info(
-                        f"[book] Checkout detected via payment element "
-                        f"at +{elapsed + interval}s"
+        async def _via_selector():
+            await page.wait_for_selector(selector, timeout=timeout_ms)
+            return "selector"
+
+        async def _via_url():
+            await page.wait_for_url(_url_matches, timeout=timeout_ms)
+            return "url"
+
+        async def _via_function():
+            await page.wait_for_function(payment_visible_js, timeout=timeout_ms)
+            return "function"
+
+        tasks = [
+            asyncio.create_task(_via_selector(), name="wait_for_checkout::selector"),
+            asyncio.create_task(_via_url(), name="wait_for_checkout::url"),
+            asyncio.create_task(_via_function(), name="wait_for_checkout::function"),
+        ]
+        won_via: str | None = None
+        try:
+            for fut in asyncio.as_completed(tasks, timeout=total_wait):
+                try:
+                    label = await fut
+                except Exception as e:
+                    logger.debug(
+                        f"[book] checkout waiter raised: {type(e).__name__}: {e}"
                     )
-                    return True
-            except Exception:
-                pass
+                    continue
+                won_via = label
+                break
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Drain cancellations so Python doesn't warn about un-awaited
+            # coroutines and so any stray Playwright cleanup runs.
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.debug(
-                f"[book] Waiting for checkout… {elapsed + interval}s / {total_wait}s"
+        if won_via:
+            logger.info(
+                f"[book] Checkout detected via {won_via} for {slot.slot_date_str}"
             )
+            return True
 
         url = page.url
         await self._booking_screenshot(page, "checkout_timeout_final")

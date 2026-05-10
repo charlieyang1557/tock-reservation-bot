@@ -174,7 +174,10 @@ async def test_screenshot_taken_on_checkout_timeout(tmp_path):
 
     page = AsyncMock()
     page.url = "https://www.exploretock.com/test/search"
+    # All three checkout waiters must fail to exercise the timeout path
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_url = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_function = AsyncMock(side_effect=Exception("timeout"))
     page.query_selector = AsyncMock(return_value=None)
     screenshot_paths = []
 
@@ -216,7 +219,11 @@ async def test_no_screenshot_when_debug_disabled(tmp_path):
 
     page = AsyncMock()
     page.url = "https://www.exploretock.com/test/search"
+    # All three waiters fail so the timeout branch runs (and would screenshot
+    # if debug_screenshots were True, which it isn't)
     page.wait_for_selector = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_url = AsyncMock(side_effect=Exception("timeout"))
+    page.wait_for_function = AsyncMock(side_effect=Exception("timeout"))
     page.query_selector = AsyncMock(return_value=None)
     page.screenshot = AsyncMock()
 

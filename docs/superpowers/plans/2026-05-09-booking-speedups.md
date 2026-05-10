@@ -24,7 +24,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 
 ### B1 — Quick DOM wins (target: 3–5 days)
 
-#### B1.1 — Replace `_wait_for_checkout` polling with race-of-waiters
+#### B1.1 — Replace `_wait_for_checkout` polling with race-of-waiters ✅ Done 2026-05-09 (uses `asyncio.as_completed`; 7 new tests in `test_wait_for_checkout_race.py` pass in 0.10 s vs 25 s on the old impl)
 **Saves:** 0–1900 ms per booking.
 **Files:** [src/booker.py:597–654](src/booker.py:597)
 **Approach:** Replace the 2-s outer poll with `asyncio.wait([...], return_when=FIRST_COMPLETED)` over three primitives: `page.wait_for_url(url_predicate, timeout=30000)`, `page.wait_for_selector(checkout_container, timeout=30000)`, `page.wait_for_function(payment_visible_js, timeout=30000)`. Cancel the losers when the winner returns.
