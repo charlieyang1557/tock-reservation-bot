@@ -109,7 +109,7 @@ Returns True if EITHER the URL match OR the DOM signal fires. Cache the result p
 - `test_cf_detection_text_signal`
 **Done when:** signals fire on staged challenge pages; live test with a known CF challenge confirms detection.
 
-#### B2.3 — Stripe iframe URL caching
+#### B2.3 — Stripe iframe URL caching ✅ Done 2026-05-10 (per-selector `_frame_url_cache: dict[str, str]` on TockBrowser; matching frames tried first, falls through to full scan; skips detached frames; 7 new tests in `test_find_in_frames_cache.py`)
 **Saves:** 75–400 ms per CVC interaction.
 **Files:** [src/browser.py:307](src/browser.py:307) (`find_in_frames`)
 **Approach:** Add an instance cache `self._cvc_frame_url_pattern: str | None`. On first successful match, capture `frame.url` and store the URL prefix. On subsequent calls, check frames matching the cached pattern first; fall through to full scan on miss.
