@@ -85,6 +85,10 @@ class TockBrowser:
         # matched. Lets find_in_frames try matching frames first instead
         # of iterating in document order on every CVC interaction.
         self._frame_url_cache: dict[str, str] = {}
+        # Phase B3.3: lazy page pool. Set in start() so test code that
+        # constructs TockBrowser directly without calling start() (e.g. unit
+        # tests with all-mock dependencies) doesn't trip on a missing pool.
+        self.page_pool = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -132,7 +136,21 @@ class TockBrowser:
             except Exception as e:
                 logger.warning(f"Could not restore session cookies: {e}")
 
+        # Phase B3.3: pre-warm page pool. Reduces cold-task latency in races.
+        # Import here (not at module top) to avoid a circular import path
+        # if PagePool ever needs TockBrowser typing.
+        from src.page_pool import PagePool
+        self.page_pool = PagePool(
+            self, target_size=self.config.page_pool_size,
+        )
+        await self.page_pool.start()
+
     async def close(self) -> None:
+        if self.page_pool is not None:
+            try:
+                await self.page_pool.close_all()
+            except Exception as e:
+                logger.debug(f"[browser] page_pool close failed (non-critical): {e}")
         if self._context:
             await self._context.close()
         if self._browser:

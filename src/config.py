@@ -69,6 +69,10 @@ class Config:
     event_driven_detection: bool = False
     event_driven_url_pattern: str = ""
 
+    # Page pool (Phase B3.3) — pre-warmed Playwright pages reduce cold-task
+    # latency in races. 0 disables the pool entirely (operator side switch).
+    page_pool_size: int = 4
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -124,6 +128,7 @@ def load_config() -> Config:
         skip_day_click_check=os.getenv("SKIP_DAY_CLICK_CHECK", "false").lower() == "true",
         event_driven_detection=os.getenv("EVENT_DRIVEN_DETECTION", "false").lower() == "true",
         event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),
+        page_pool_size=int(os.getenv("PAGE_POOL_SIZE", "4")),
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 

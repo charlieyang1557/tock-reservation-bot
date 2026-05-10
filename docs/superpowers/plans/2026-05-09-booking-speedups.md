@@ -161,7 +161,7 @@ The existing `_confirm_attempted` event already provides session-level deduplica
 
 **Done when:** detection is 100+ ms faster on average across 10 polls; fallback to DOM works when XHR shape changes.
 
-#### B3.3 — Page pool for race overflow
+#### B3.3 — Page pool for race overflow ✅ Done 2026-05-10 (new `src/page_pool.py::PagePool` with deque-backed pool + semaphore-capped lazy refill via `asyncio.create_task`; `target_size=4` configurable via `PAGE_POOL_SIZE` env, `0` disables; `_book_single` uses `pool.acquire()` when no warm page and releases on finally; `close_all()` cancels in-flight refills; 17 new tests in `test_page_pool.py`)
 **Saves:** 200–500 ms per cold task (only matters in multi-slot races).
 **Files:** new `src/page_pool.py`
 **Approach:** `PagePool` class with `target_size = 4` (configurable). On startup, opens N blank pages with stealth applied. `acquire()` returns a pre-warmed page or creates a fresh one if pool empty. `release(page)` closes the page (DOM state is dirty after a race attempt). Pool refills lazily up to target_size.

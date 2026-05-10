@@ -361,8 +361,22 @@ class TockBooker:
             )
         page = warm_page if warm_page and not warm_page.is_closed() else None
         owns_page = page is None  # True ⇒ booker created a fresh page; False ⇒ using warm
+        # Phase B3.3: when we need a fresh page, prefer the pre-warmed pool
+        # so we don't pay full new_page() launch cost on cold race tasks.
+        # Falls through to new_page() when the pool is empty.
+        # Use isinstance(PagePool) — not getattr(...) is not None — because
+        # tests construct browser via MagicMock() where every attribute
+        # auto-resolves to another MagicMock. PagePool is the only valid
+        # source of pre-warmed pages, so isinstance is the safe sentinel.
+        from src.page_pool import PagePool  # local import: avoids cycle
+        from_pool = False
         if page is None:
-            page = await self.browser.new_page()
+            page_pool = getattr(self.browser, "page_pool", None)
+            if isinstance(page_pool, PagePool):
+                page = await page_pool.acquire()
+                from_pool = True
+            else:
+                page = await self.browser.new_page()
 
         try:
             if owns_page:
@@ -574,9 +588,15 @@ class TockBooker:
             # via pop_warm_page() and transferred to this method. The booker
             # is now responsible for closing them after every attempt — success
             # OR failure — to prevent the leak Codex pass 3 caught.
+            #
+            # Phase B3.3: pages obtained from the page pool go through
+            # pool.release() (which closes them — DOM is dirty after a race
+            # attempt). All other booker-owned pages still close directly.
             if page is not None:
                 try:
-                    if not page.is_closed():
+                    if from_pool:
+                        await self.browser.page_pool.release(page)
+                    elif not page.is_closed():
                         await page.close()
                 except Exception:
                     pass
