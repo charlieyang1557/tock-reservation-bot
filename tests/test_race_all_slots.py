@@ -456,17 +456,25 @@ async def test_unverified_confirm_persists_across_booker_instances():
 
 
 def test_uncertain_file_round_trip(tmp_path):
-    """Sanity check on the booking_uncertain module's read/write/clear."""
+    """Sanity check on the booking_uncertain module's read/write/clear.
+
+    Uses a today-relative slot_date so the B2.1 stale-by-date archiver
+    doesn't fire on a frozen literal date that drifts out of range as
+    real time advances.
+    """
     from src.booking_uncertain import (
         UncertainBooking, clear_uncertain, read_uncertain, write_uncertain,
     )
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+
     fake_path = tmp_path / "test.json"
+    near_future = _date.today() + _td(days=3)
 
     booking = UncertainBooking(
-        slot_date_str="2026-05-01",
+        slot_date_str=near_future.isoformat(),
         slot_time="5:00 PM",
-        day_of_week="Friday",
-        detected_at_iso="2026-04-29T20:00:00",
+        day_of_week=near_future.strftime("%A"),
+        detected_at_iso=_dt.now().isoformat(),
     )
     write_uncertain(booking, path=fake_path)
     assert fake_path.exists()
