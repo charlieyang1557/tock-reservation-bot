@@ -79,6 +79,107 @@ def _prune_screenshots(directory: str, max_count: int = MAX_DEBUG_SCREENSHOTS) -
 BASE_URL = "https://www.exploretock.com"
 
 
+# Single-evaluate slot-collection JS (Phase B1.3). Called from
+# _collect_slots_multi. Container scoping + 5-source extraction in one
+# round-trip, replacing the per-button locator chain. Returns
+#   { container_used, button_count, slots: [{time, source}, ...] }
+# where time is null when no source produced a parseable time string —
+# the wrapper drops null entries (Apr 17 lesson: never fabricate "Slot N").
+_COLLECT_SLOTS_JS = r"""
+(args) => {
+  const {
+    containerSelector,
+    matchedSelector,
+    slotTimeTextSelector,
+    timeRegex,
+    timeFlags,
+  } = args;
+  const re = new RegExp(timeRegex, timeFlags || 'i');
+
+  let root = document;
+  let containerUsed = false;
+  if (containerSelector) {
+    const containerEl = document.querySelector(containerSelector);
+    if (containerEl) {
+      root = containerEl;
+      containerUsed = true;
+    }
+  }
+
+  const buttons = Array.from(root.querySelectorAll(matchedSelector));
+  const slots = [];
+
+  const cleanTime = (s) => s.replace(/\s+/g, ' ').trim();
+
+  for (const btn of buttons) {
+    let time = null;
+    let source = -1;
+
+    // Source 1: child span matching slot_time_text selector
+    if (slotTimeTextSelector) {
+      try {
+        const span = btn.querySelector(slotTimeTextSelector);
+        if (span) {
+          const t = (span.innerText || span.textContent || '').trim();
+          if (t) { time = t; source = 1; }
+        }
+      } catch (_) { /* invalid selector → skip */ }
+    }
+
+    // Source 2: parent.text_content
+    if (time === null) {
+      const parent = btn.parentElement;
+      if (parent) {
+        const ptext = (parent.innerText || parent.textContent || '').trim();
+        const m = ptext.match(re);
+        if (m) { time = cleanTime(m[1]); source = 2; }
+      }
+    }
+
+    // Source 3: ancestors up to 3 levels above the parent
+    if (time === null) {
+      let anc = btn.parentElement;
+      for (let i = 0; i < 3 && anc; i++) {
+        anc = anc.parentElement;
+        if (!anc) break;
+        const atext = (anc.innerText || anc.textContent || '').trim();
+        const m = atext.match(re);
+        if (m) { time = cleanTime(m[1]); source = 3; break; }
+      }
+    }
+
+    // Source 4: aria-label / title attributes
+    if (time === null) {
+      for (const attr of ['aria-label', 'title']) {
+        const v = btn.getAttribute(attr);
+        if (!v) continue;
+        const m = v.match(re);
+        if (m) { time = cleanTime(m[1]); source = 4; break; }
+      }
+    }
+
+    // Source 5: button's own text content (only if not a bare 'Book')
+    if (time === null) {
+      const btext = (btn.innerText || btn.textContent || '').trim();
+      const lower = btext.toLowerCase();
+      if (btext && lower !== 'book' && lower !== 'book now') {
+        const m = btext.match(re);
+        if (m) { time = cleanTime(m[1]); source = 5; }
+      }
+    }
+
+    slots.push({ time, source });
+  }
+
+  return {
+    container_used: containerUsed,
+    button_count: buttons.length,
+    slots,
+  };
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
@@ -1094,7 +1195,11 @@ class AvailabilityChecker:
     ) -> list[AvailableSlot]:
         """Collect slots using whichever selector matched during detection.
 
-        Time-extraction priority order:
+        Single browser-side pass: container scope + 5-source extraction
+        run inside one page.evaluate, replacing the per-button locator
+        chain (~5N round-trips → 1).
+
+        Time-extraction priority order (in JS):
           1. Child span matching slot_time_text selector
           2. Time pattern in parent.text_content()
           3. Time pattern in any ancestor up to 3 levels deep
@@ -1105,69 +1210,75 @@ class AvailabilityChecker:
         the 'Slot N' fallback is forbidden because the booker cannot match
         a slot without a real time string (Apr 17 root cause).
         """
-        time_re = re.compile(r'\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b')
+        container_selector = sel.get("slots_container")
+        slot_time_text_selector = sel.get("slot_time_text")
+        # Pattern is split into source + flags to construct RegExp in JS.
+        time_pattern = r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b"
+        time_flags = "i"
 
-        slots: list[AvailableSlot] = []
         try:
-            # First try to scope to the slots container — prevents global
-            # "Book" buttons from becoming false positives.
-            container_selector = sel.get("slots_container")
-            container_finder = page.locator(container_selector)
-            scoped_root = None
-            try:
-                if await container_finder.count() > 0:
-                    scoped_root = container_finder.first
-            except Exception as exc:
-                logger.debug(
-                    f"[check] {target_date.isoformat()} — container count() raised "
-                    f"{type(exc).__name__}: {exc}; falling back to page-wide"
-                )
-                scoped_root = None
-
-            if scoped_root is None:
-                logger.debug(
-                    f"[check] {target_date.isoformat()} — "
-                    f"slots_container not found; falling back to page-wide "
-                    f"collection (selector key: 'slots_container')"
-                )
-                locator = page.locator(matched_selector)
-            else:
-                locator = scoped_root.locator(matched_selector)
-
-            count = await locator.count()
-
-            for i in range(count):
-                el = locator.nth(i)
-                try:
-                    time_text = await self._extract_slot_time(el, time_re)
-                    if time_text is None:
-                        # No parseable time — drop this slot (do NOT fabricate).
-                        # Apr 17 lesson: a slot the booker can't book is worse
-                        # than no slot at all.
-                        logger.warning(
-                            f"[check] {target_date.isoformat()} — "
-                            f"slot at index {i} has no extractable time; "
-                            f"skipping (was 'Slot {i + 1}' under old fallback)"
-                        )
-                        if self.config.debug_screenshots:
-                            await self._save_error_screenshot(
-                                page, target_date.isoformat(),
-                                f"slot_no_time_idx{i}"
-                            )
-                        continue
-
-                    slots.append(
-                        AvailableSlot(
-                            slot_date=target_date,
-                            slot_time=time_text,
-                            day_of_week=target_date.strftime("%A"),
-                        )
-                    )
-                except Exception:
-                    continue
+            result = await page.evaluate(
+                _COLLECT_SLOTS_JS,
+                {
+                    "containerSelector": container_selector,
+                    "matchedSelector": matched_selector,
+                    "slotTimeTextSelector": slot_time_text_selector,
+                    "timeRegex": time_pattern,
+                    "timeFlags": time_flags,
+                },
+            )
         except Exception as e:
             logger.error(
-                f"[check] {target_date.isoformat()} — slot collection failed: {e}"
+                f"[check] {target_date.isoformat()} — "
+                f"slot collection evaluate failed: {type(e).__name__}: {e}"
+            )
+            return []
+
+        if not isinstance(result, dict):
+            logger.error(
+                f"[check] {target_date.isoformat()} — "
+                f"slot collection returned unexpected shape: {result!r}"
+            )
+            return []
+
+        if not result.get("container_used"):
+            logger.debug(
+                f"[check] {target_date.isoformat()} — "
+                f"slots_container not found; falling back to page-wide "
+                f"collection (selector key: 'slots_container')"
+            )
+
+        slots: list[AvailableSlot] = []
+        raw = result.get("slots") or []
+        for i, item in enumerate(raw):
+            if not isinstance(item, dict):
+                continue
+            time_text = item.get("time")
+            if time_text is None:
+                # No parseable time — drop this slot (do NOT fabricate).
+                # Apr 17 lesson: a slot the booker can't book is worse
+                # than no slot at all.
+                logger.warning(
+                    f"[check] {target_date.isoformat()} — "
+                    f"slot at index {i} has no extractable time; "
+                    f"skipping (was 'Slot {i + 1}' under old fallback)"
+                )
+                if self.config.debug_screenshots:
+                    try:
+                        await self._save_error_screenshot(
+                            page, target_date.isoformat(),
+                            f"slot_no_time_idx{i}"
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            slots.append(
+                AvailableSlot(
+                    slot_date=target_date,
+                    slot_time=time_text,
+                    day_of_week=target_date.strftime("%A"),
+                )
             )
 
         if slots:
@@ -1176,73 +1287,6 @@ class AvailabilityChecker:
                 + ", ".join(s.slot_time for s in slots)
             )
         return slots
-
-    async def _extract_slot_time(
-        self, element: Locator, time_re: re.Pattern[str]
-    ) -> str | None:
-        """Try sources 1-5 (see docstring of _collect_slots_multi).
-        Returns the extracted time string, or None when no source matches.
-        """
-        # Source 1: Child span with the standard slot_time_text selector
-        try:
-            time_selector = sel.get("slot_time_text")
-            time_span = element.locator(time_selector)
-            if await time_span.count() > 0:
-                t = (await time_span.first.text_content() or "").strip()
-                if t:
-                    return t
-        except Exception:
-            pass
-
-        # Source 2: Parent text_content
-        try:
-            parent = element.locator("..")
-            parent_text = (await parent.text_content() or "").strip()
-            m = time_re.search(parent_text)
-            if m:
-                return re.sub(r"\s+", " ", m.group(1)).strip()
-        except Exception:
-            pass
-
-        # Source 3: Ancestors up to 3 levels above parent
-        try:
-            ancestor = element
-            for _ in range(3):
-                ancestor = ancestor.locator("..")
-                anc_text = (await ancestor.text_content() or "").strip()
-                m = time_re.search(anc_text)
-                if m:
-                    return re.sub(r"\s+", " ", m.group(1)).strip()
-        except Exception:
-            pass
-
-        # Source 4: aria-label and title attributes
-        for attr in ("aria-label", "title"):
-            try:
-                val = await element.get_attribute(attr)
-                if val:
-                    m = time_re.search(val)
-                    if m:
-                        return re.sub(r"\s+", " ", m.group(1)).strip()
-            except Exception:
-                continue
-
-        # Source 5: Button's own text content, only if not a bare 'Book'.
-        # Note: the regex already accepts the no-space "5:00pm" form because
-        # \s* allows zero whitespace. We do NOT fall back to raw text — a
-        # string like "Dinner 5:00" or "5:00 guests" would pass a digit/colon
-        # heuristic but would not match against actual slot button text in
-        # the booker, reintroducing the Apr 17 failure mode.
-        try:
-            btn_text = (await element.text_content() or "").strip()
-            if btn_text and btn_text.lower() not in ("book", "book now"):
-                m = time_re.search(btn_text)
-                if m:
-                    return re.sub(r"\s+", " ", m.group(1)).strip()
-        except Exception:
-            pass
-
-        return None
 
     def _sort_by_preferred_time(
         self, slots: list[AvailableSlot]

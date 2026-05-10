@@ -49,7 +49,7 @@ This plan is structured in three phases ordered by risk-adjusted ROI. Each phase
 - `test_click_time_slot_non_strict_clicks_first_specific_button`
 **Done when:** all existing `test_slot_click.py` and `test_race_all_slots.py` tests still pass.
 
-#### B1.3 — Batch `_collect_slots_multi` into one `page.evaluate`
+#### B1.3 — Batch `_collect_slots_multi` into one `page.evaluate` ✅ Done 2026-05-09 (single JS round-trip handles container scope + 5-source extraction; 7 new tests in `test_collect_slots_multi_batched.py`; legacy tests in `test_checker_detection.py`, `test_scoped_slot_selectors.py`, `test_slot_labeling.py` rewritten to mock `page.evaluate`; `_extract_slot_time` removed)
 **Saves:** 150–1000 ms per detected date.
 **Files:** [src/checker.py:1015–1101](src/checker.py:1015)
 **Approach:** Same pattern — one JS pass over `page.locator(matched_selector)` that does the 5-source time extraction (slot_time_text span → parent text → ancestors → aria-label/title → button text) and returns `[{time: str | null, source: int}, ...]`. Drop slots with `time == null` (preserves the Apr 17 lesson: never fabricate "Slot N").
