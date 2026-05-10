@@ -207,7 +207,9 @@ async def test_book_single_skip_day_click_then_clicks_slot():
     ), patch.object(
         booker, "_wait_for_checkout", AsyncMock(return_value=True)
     ), patch.object(
-        booker, "_confirm_booking", AsyncMock(return_value=True)
+        booker, "_prepare_for_confirm", AsyncMock(return_value=True)
+    ), patch.object(
+        booker, "_execute_confirm_click_and_verify", AsyncMock(return_value=True)
     ):
         await booker._book_single(slot, asyncio.Event())
 
@@ -251,7 +253,9 @@ async def test_book_single_skip_day_click_falls_back_when_no_slot_buttons():
     ), patch.object(
         booker, "_wait_for_checkout", AsyncMock(return_value=True)
     ), patch.object(
-        booker, "_confirm_booking", AsyncMock(return_value=True)
+        booker, "_prepare_for_confirm", AsyncMock(return_value=True)
+    ), patch.object(
+        booker, "_execute_confirm_click_and_verify", AsyncMock(return_value=True)
     ):
         result = await booker._book_single(slot, asyncio.Event())
 
@@ -296,7 +300,9 @@ async def test_book_single_default_false_still_clicks_day():
     ), patch.object(
         booker, "_wait_for_checkout", AsyncMock(return_value=True)
     ), patch.object(
-        booker, "_confirm_booking", AsyncMock(return_value=True)
+        booker, "_prepare_for_confirm", AsyncMock(return_value=True)
+    ), patch.object(
+        booker, "_execute_confirm_click_and_verify", AsyncMock(return_value=True)
     ):
         await booker._book_single(slot, asyncio.Event())
 

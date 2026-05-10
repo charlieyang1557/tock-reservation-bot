@@ -1096,29 +1096,13 @@ class TockBooker:
             )
             return False
 
-    async def _confirm_booking(self, page: Page, slot: AvailableSlot) -> bool:
-        """Safe-by-default shim that runs prep + click + verify under
-        the same safety guards as _book_single.
-
-        Codex B3 review HIGH 1: an earlier version of this shim called
-        prep + click directly without acquiring `_confirm_lock` or
-        checking `_confirm_attempted`. Any concurrent caller of the
-        shim could have double-clicked confirm despite the new B3.1
-        safety design. The shim now self-locks so future callers
-        cannot accidentally bypass safety, even though `_book_single`
-        no longer uses it.
-        """
-        if not await self._prepare_for_confirm(page, slot):
-            return False
-        async with self._confirm_lock:
-            if self._confirm_attempted.is_set():
-                logger.warning(
-                    f"[book] _confirm_booking shim: another confirm already "
-                    f"attempted; refusing to click again for {slot}"
-                )
-                return False
-            self._confirm_attempted.set()
-            return await self._execute_confirm_click_and_verify(page, slot)
+    # Codex holistic review: the `_confirm_booking` shim was removed
+    # because (a) no production code in src/ called it, (b) it was
+    # semantically WEAKER than `_book_single` (no soft-win persistence,
+    # no notify, no shared booking_won.set), so any future caller would
+    # have silently lost the safety bookkeeping. Tests now patch the
+    # split helpers `_prepare_for_confirm` and
+    # `_execute_confirm_click_and_verify` directly.
 
     # ------------------------------------------------------------------
     # Payment detection helpers

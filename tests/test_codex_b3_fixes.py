@@ -33,9 +33,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
-# ---------------------------------------------------------------------------
-# HIGH 1: _confirm_booking shim must acquire the lock + check the guard
-# ---------------------------------------------------------------------------
+# NOTE: HIGH 1 fix from this Codex pass introduced a `_confirm_booking`
+# shim that self-locked. The follow-up HOLISTIC review then identified
+# the shim itself as a footgun (semantically WEAKER than `_book_single`:
+# no soft-win persistence, no notify, no shared booking_won.set), and
+# since no production code in src/ called it, the cleanest fix was to
+# DELETE the shim. The 2 tests that asserted shim safety were removed
+# with it. Tests that need to bypass the confirm path now patch the
+# split helpers `_prepare_for_confirm` and
+# `_execute_confirm_click_and_verify` directly.
 
 def _make_booker():
     from src.booker import TockBooker
@@ -50,67 +56,6 @@ def _make_booker():
         debug_screenshots=False, discord_webhook_url="", card_cvc="",
     )
     return TockBooker(config, MagicMock(), MagicMock())
-
-
-@pytest.mark.asyncio
-async def test_confirm_booking_shim_acquires_lock(monkeypatch):
-    """Calling the shim must take `_confirm_lock` so concurrent shim
-    invocations don't double-click confirm."""
-    booker = _make_booker()
-    page = AsyncMock()
-
-    lock_held_during_call = []
-
-    async def fake_click(p, s):
-        lock_held_during_call.append(booker._confirm_lock.locked())
-        return True
-
-    async def fake_prep(p, s):
-        return True
-
-    monkeypatch.setattr(booker, "_prepare_for_confirm", fake_prep)
-    monkeypatch.setattr(
-        booker, "_execute_confirm_click_and_verify", fake_click
-    )
-
-    from src.checker import AvailableSlot
-    slot = AvailableSlot(
-        slot_date=date(2026, 5, 15), slot_time="5:00 PM", day_of_week="Friday"
-    )
-    await booker._confirm_booking(page, slot)
-    assert lock_held_during_call == [True], (
-        "_confirm_booking shim must hold _confirm_lock during the click — "
-        "currently it bypasses the lock entirely (Codex HIGH 1)"
-    )
-
-
-@pytest.mark.asyncio
-async def test_confirm_booking_shim_respects_confirm_attempted():
-    """If `_confirm_attempted` is already set when the shim is called,
-    it must NOT click again (returns False without calling
-    _execute_confirm_click_and_verify)."""
-    booker = _make_booker()
-    booker._confirm_attempted.set()  # simulate prior soft-win
-
-    page = AsyncMock()
-    click_count = 0
-    async def fake_click(p, s):
-        nonlocal click_count
-        click_count += 1
-        return True
-    booker._execute_confirm_click_and_verify = fake_click  # type: ignore[assignment]
-    booker._prepare_for_confirm = AsyncMock(return_value=True)  # type: ignore[assignment]
-
-    from src.checker import AvailableSlot
-    slot = AvailableSlot(
-        slot_date=date(2026, 5, 15), slot_time="5:00 PM", day_of_week="Friday"
-    )
-    result = await booker._confirm_booking(page, slot)
-    assert result is False
-    assert click_count == 0, (
-        "_confirm_booking must respect _confirm_attempted — "
-        "no click when prior unverified confirm exists"
-    )
 
 
 # ---------------------------------------------------------------------------
