@@ -383,6 +383,28 @@ class AvailabilityChecker:
             return None
         return page
 
+    def _maybe_create_xhr_recorder(self, page, target_date: date):
+        """Phase B3.2 telemetry first pass. When event_driven_detection
+        is enabled, return a fresh XhrTelemetryRecorder attached to
+        `page` so the caller can observe matching XHRs during the
+        day-click. Returns None when disabled."""
+        if not getattr(self.config, "event_driven_detection", False):
+            return None
+        from src.xhr_telemetry import XhrTelemetryRecorder, DEFAULT_LOG_PATH
+        recorder = XhrTelemetryRecorder(
+            url_pattern=getattr(self.config, "event_driven_url_pattern", "") or "",
+            log_path=DEFAULT_LOG_PATH,
+            target_date=target_date,
+        )
+        try:
+            recorder.attach(page)
+        except Exception as e:
+            logger.debug(
+                f"[xhr-telemetry] attach failed: {type(e).__name__}: {e}"
+            )
+            return None
+        return recorder
+
     async def close_handoff_pages(self) -> None:
         """Close any remaining normal-mode handoff pages and clear the dict.
 
@@ -952,6 +974,13 @@ class AvailabilityChecker:
             if abort_event is not None and abort_event.is_set():
                 return []
 
+            # Phase B3.2: optional XHR telemetry. When event_driven_detection
+            # is on, register a `response` listener around the day-click
+            # and slot collection so the operator can identify Tock's
+            # slot-availability XHR via `xhr_telemetry.jsonl`. Default OFF
+            # — production-safe.
+            xhr_recorder = self._maybe_create_xhr_recorder(page, target_date)
+
             skip_click = self.config.skip_day_click_check
             day_clicked = False
             if not skip_click:
@@ -1119,6 +1148,18 @@ class AvailabilityChecker:
                     pass
             return []
         finally:
+            # Phase B3.2: detach + flush XHR telemetry (best-effort).
+            recorder = locals().get("xhr_recorder", None)
+            if recorder is not None:
+                try:
+                    recorder.detach(page)
+                    await recorder.flush()
+                except Exception as e:
+                    logger.debug(
+                        f"[xhr-telemetry] detach/flush failed for {date_str}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+
             # Close the page UNLESS:
             #   1. keep_page=True (sniper mode keeps it across polls), OR
             #   2. handoff_to_booker=True (booker now owns it; will close

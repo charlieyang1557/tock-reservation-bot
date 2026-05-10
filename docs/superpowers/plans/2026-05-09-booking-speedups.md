@@ -147,7 +147,7 @@ The existing `_confirm_attempted` event already provides session-level deduplica
 
 **Done when:** existing `test_race_all_slots.py` still passes; new tests verify concurrent prep + serialized click; benchmark shows races finish faster.
 
-#### B3.2 — Event-driven slot detection via `page.expect_response`
+#### B3.2 — Event-driven slot detection via `page.expect_response` ⚠️ Done 2026-05-10 — TELEMETRY-ONLY first pass (config flags `event_driven_detection` + `event_driven_url_pattern` default OFF; new `src/xhr_telemetry.py::XhrTelemetryRecorder` registers a Playwright `response` listener during `_check_date` and writes matching XHRs to `xhr_telemetry.jsonl` for operator analysis; 9 new tests in `test_event_driven_detection.py`. Operator pre-work to identify Tock's actual slot-availability XHR pattern is now possible without code changes; the JSON-parser fast-path is a follow-up commit once the pattern is known)
 **Saves:** 100–300 ms per slot detection (DOM paints AFTER the network response arrives).
 **Files:** [src/checker.py:_check_date](src/checker.py:597), specifically the slot-detection block after `_click_day`.
 **Approach:** Wrap the day click in `async with page.expect_response(predicate, timeout=...) as resp_info: await page.evaluate(click_js)`. The predicate matches Tock's slot-availability XHR (need to identify it via DevTools — likely contains `availability`, `slots`, or the date in the URL). When the response lands, parse the JSON directly (skip DOM) for the slot list. Fall back to DOM scan if response shape is unrecognized.

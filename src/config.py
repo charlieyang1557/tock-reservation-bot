@@ -58,6 +58,17 @@ class Config:
     # confirms the SPA URL alone is enough.
     skip_day_click_check: bool = False
 
+    # B3.2 — event-driven slot detection (telemetry first pass).
+    # When True, checker registers a Playwright `response` listener
+    # during _check_date and logs every matching XHR to
+    # xhr_telemetry.jsonl. Operator inspects the file to identify the
+    # actual slot-availability XHR pattern, then sets
+    # event_driven_url_pattern to narrow recording. A future commit
+    # will plug a JSON parser into the listener to skip the DOM scan
+    # entirely. Default False — telemetry only.
+    event_driven_detection: bool = False
+    event_driven_url_pattern: str = ""
+
     # Debug
     debug_screenshots: bool = False  # save screenshots each poll (slow, skip in sniper)
 
@@ -111,6 +122,8 @@ def load_config() -> Config:
         sniper_scan_weeks=int(os.getenv("SNIPER_SCAN_WEEKS", "2")),
         prewarm_min_days_out=int(os.getenv("PREWARM_MIN_DAYS_OUT", "5")),
         skip_day_click_check=os.getenv("SKIP_DAY_CLICK_CHECK", "false").lower() == "true",
+        event_driven_detection=os.getenv("EVENT_DRIVEN_DETECTION", "false").lower() == "true",
+        event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),
         debug_screenshots=os.getenv("DEBUG_SCREENSHOTS", "false").lower() == "true",
     )
 
