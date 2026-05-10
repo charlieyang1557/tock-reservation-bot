@@ -261,8 +261,20 @@ class TockBrowser:
             # Phase B1.4: dropped wait_for_load_state("networkidle"). Tock's
             # restaurant page never reaches networkidle (analytics + CF
             # beacons keep firing) so the 5-s timeout was guaranteed waste
-            # every cycle. domcontentloaded + the _is_logged_in check below
-            # are enough to confirm the session.
+            # every cycle.
+            #
+            # Codex MEDIUM 3: replace it with a bounded wait_for_selector on
+            # the logged_in_indicator. If hydrated quickly, _is_logged_in
+            # below returns True immediately; if it times out, we still fall
+            # through to _is_logged_in which can trigger re-login. Net
+            # ceiling ~2 s vs the old 5 s, with a real signal instead of an
+            # arbitrary network silence wait.
+            try:
+                await page.wait_for_selector(
+                    sel.get("logged_in_indicator"), timeout=2000
+                )
+            except Exception:
+                pass
 
             if not await self._is_logged_in(page):
                 logger.warning(

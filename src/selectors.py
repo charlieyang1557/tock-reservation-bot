@@ -195,6 +195,24 @@ def get_slot_button_selectors() -> list[str]:
     ]
 
 
+# Substrings that indicate a selector uses Playwright-only syntax
+# (`:has-text(...)`, `:text(...)`, `:visible`) and therefore is unsafe for
+# native `document.querySelectorAll`. Used by the batched JS paths in
+# checker._collect_slots_multi and booker._click_time_slot to decide
+# whether to take the JS fast path or fall back to a Python locator loop.
+_PLAYWRIGHT_SELECTOR_TOKENS: tuple[str, ...] = (":has-text", ":text(", ":visible")
+
+
+def is_playwright_selector(selector: str) -> bool:
+    """Return True if `selector` contains any Playwright-only syntax token.
+
+    document.querySelectorAll throws DOM SyntaxError on these, so the JS
+    fast path must skip them and fall back to page.locator iteration."""
+    if not selector:
+        return False
+    return any(tok in selector for tok in _PLAYWRIGHT_SELECTOR_TOKENS)
+
+
 # ---------------------------------------------------------------------------
 # Live verification  (python main.py --verify)
 # ---------------------------------------------------------------------------

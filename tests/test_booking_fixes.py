@@ -88,9 +88,12 @@ async def test_generic_book_button_clicked_when_time_in_parent():
         "reason": "generic-parent",
     })
 
+    # Use a CSS-only generic selector so matched_selector takes the JS
+    # fast path (PW selectors like `button:text("Book now")` route to the
+    # locator-loop fallback after the Codex HIGH fix).
     def make_locator(selector):
         loc = MagicMock()
-        if 'has-text("Book")' in selector:
+        if selector == "button.SearchExperience-bookButton":
             loc.count = AsyncMock(return_value=1)
         else:
             loc.count = AsyncMock(return_value=0)

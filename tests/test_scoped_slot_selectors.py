@@ -48,14 +48,14 @@ async def test_collect_only_buttons_inside_container(monkeypatch):
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
-        'button:visible:has-text("Book")'
+        'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 1
     # The wrapper passed both the matched selector and the container selector
     args, _ = page.evaluate.call_args
     js_arg = args[1] if len(args) > 1 else args[0]
     assert js_arg["containerSelector"] == "div.results-list"
-    assert js_arg["matchedSelector"] == 'button:visible:has-text("Book")'
+    assert js_arg["matchedSelector"] == 'button.Consumer-resultsListItem.is-available'
 
 
 @pytest.mark.asyncio
@@ -77,7 +77,7 @@ async def test_falls_back_to_page_when_container_missing(monkeypatch):
 
     slots = await checker._collect_slots_multi(
         page, date(2026, 4, 17),
-        'button:visible:has-text("Book")'
+        'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 1
     assert slots[0].slot_time.upper() == "5:00 PM"

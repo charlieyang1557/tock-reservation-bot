@@ -30,6 +30,7 @@ inside the lock is effectively atomic — no double-bookings can occur.
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime
 from enum import Enum
 
@@ -40,7 +41,7 @@ from src.browser import TockBrowser
 from src.checker import AvailableSlot
 from src.config import Config
 from src.notifier import Notifier
-from src.selectors import get_slot_button_selectors
+from src.selectors import get_slot_button_selectors, is_playwright_selector
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +92,7 @@ _CLICK_TIME_SLOT_JS = r"""
   let bestText = null;
 
   for (const btn of buttons) {
-    const text = (btn.innerText || btn.textContent || '').trim();
+    const text = (btn.textContent || btn.innerText || '').trim();
     const upperText = text.toUpperCase();
 
     if (upperText.includes(upperTarget)) {
@@ -108,7 +109,7 @@ _CLICK_TIME_SLOT_JS = r"""
     if (isGeneric) {
       const parent = btn.parentElement;
       const parentText = parent
-        ? (parent.innerText || parent.textContent || '').trim()
+        ? (parent.textContent || parent.innerText || '').trim()
         : '';
       const parentUpper = parentText.toUpperCase();
       if (parentUpper.includes(upperTarget) || slotWordRe.test(parentText)) {
@@ -615,6 +616,16 @@ class TockBooker:
         # Single browser-side iteration: match + click in one round-trip.
         target_time = slot.slot_time.strip().upper()
         is_generic = matched_selector in _GENERIC_BOOK_SELECTORS
+
+        # Codex HIGH 2: Playwright-only selectors (`:has-text`, `:text`,
+        # `:visible`) cannot be passed to document.querySelectorAll —
+        # fall back to a Python locator iteration for those, preserving
+        # the JS fast path for plain CSS selectors.
+        if is_playwright_selector(matched_selector):
+            return await self._click_time_slot_locator_loop(
+                page, slot, matched_selector, is_generic, strict_time_match
+            )
+
         try:
             result = await page.evaluate(
                 _CLICK_TIME_SLOT_JS,
@@ -673,6 +684,96 @@ class TockBooker:
                 f"[book] No clickable slot button found for '{slot.slot_time}' "
                 f"(selector: {matched_selector!r})"
             )
+        return False
+
+    async def _click_time_slot_locator_loop(
+        self, page: Page, slot: AvailableSlot,
+        matched_selector: str, is_generic: bool, strict_time_match: bool,
+    ) -> bool:
+        """Locator-based fallback for Playwright-only matched selectors
+        (`:has-text`, `:text(`, `:visible`) which can't be passed to
+        document.querySelectorAll. Mirrors the pre-B1.2 algorithm but
+        runs on the slow path only when the JS fast path is unsafe.
+        """
+        target_time = slot.slot_time.strip().upper()
+        slot_word_re = re.compile(
+            r"\b" + re.escape(slot.slot_time) + r"\b", re.IGNORECASE
+        )
+        time_re = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b", re.IGNORECASE)
+
+        locator = page.locator(matched_selector)
+        try:
+            count = await locator.count()
+        except Exception as e:
+            logger.error(f"[book] PW-locator count failed: {type(e).__name__}: {e}")
+            return False
+
+        best_btn = None
+        for i in range(count):
+            btn = locator.nth(i)
+            try:
+                text = (await btn.text_content() or "").strip()
+                upper = text.upper()
+                # Exact substring match
+                if target_time in upper:
+                    await btn.click()
+                    logger.info(
+                        f"[book] Clicked slot button matching '{slot.slot_time}': {text}"
+                    )
+                    return True
+                # Regex time match
+                m = time_re.search(text)
+                if m and m.group(1).strip().upper() == target_time:
+                    await btn.click()
+                    logger.info(f"[book] Clicked slot button (regex match): {text}")
+                    return True
+                # Generic 'Book' button: only click if parent has the time
+                if is_generic:
+                    try:
+                        parent_text = (
+                            await btn.locator("..").text_content() or ""
+                        ).strip()
+                    except Exception:
+                        parent_text = ""
+                    if (
+                        target_time in parent_text.upper()
+                        or slot_word_re.search(parent_text)
+                    ):
+                        await btn.click()
+                        logger.info(
+                            f"[book] Clicked generic 'Book' button — "
+                            f"time confirmed in parent: {parent_text[:80]!r}"
+                        )
+                        return True
+                    continue  # never set best_btn for unmatched generic
+                if best_btn is None:
+                    best_btn = btn
+            except Exception:
+                continue
+
+        if best_btn is not None and not strict_time_match:
+            try:
+                text = (await best_btn.text_content() or "").strip()
+                await best_btn.click()
+                logger.warning(
+                    f"[book] No exact time match for '{slot.slot_time}' — "
+                    f"clicked first specific button: {text}"
+                )
+                return True
+            except Exception as e:
+                logger.error(f"[book] Could not click fallback slot button: {e}")
+                return False
+        if best_btn is not None and strict_time_match:
+            logger.warning(
+                f"[book] No exact time match for '{slot.slot_time}' on warm "
+                "page; refusing first-button fallback (slot likely vanished) "
+                "— returning False so the race tries another slot or a fresh "
+                "page next poll"
+            )
+        logger.error(
+            f"[book] No clickable slot button found for '{slot.slot_time}' "
+            f"(selector: {matched_selector!r})"
+        )
         return False
 
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:

@@ -118,7 +118,7 @@ class TestCollectSlotsMulti:
         })
 
         slots = await checker._collect_slots_multi(
-            page, date(2026, 4, 4), 'button:has-text("Book")'
+            page, date(2026, 4, 4), 'button.Consumer-resultsListItem.is-available'
         )
 
         assert len(slots) == 1
@@ -137,7 +137,7 @@ class TestCollectSlotsMulti:
         })
 
         slots = await checker._collect_slots_multi(
-            page, date(2026, 4, 4), 'button:has-text("Book")'
+            page, date(2026, 4, 4), 'button.Consumer-resultsListItem.is-available'
         )
 
         assert slots == [], (
@@ -159,7 +159,7 @@ class TestCollectSlotsMulti:
         })
 
         slots = await checker._collect_slots_multi(
-            page, date(2026, 4, 4), 'button:has-text("Book")'
+            page, date(2026, 4, 4), 'button.Consumer-resultsListItem.is-available'
         )
 
         assert len(slots) == 2

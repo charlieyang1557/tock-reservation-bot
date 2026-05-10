@@ -70,7 +70,7 @@ async def test_extracts_from_aria_label():
     page = _page_returning([{"time": "5:30 PM", "source": 4}])
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 4, 17), 'button:visible:has-text("Book")'
+        page, date(2026, 4, 17), 'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 1
     assert slots[0].slot_time.upper() == "5:30 PM"
@@ -83,7 +83,7 @@ async def test_extracts_from_grandparent():
     page = _page_returning([{"time": "6:00 PM", "source": 3}])
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 4, 17), 'button:visible:has-text("Book")'
+        page, date(2026, 4, 17), 'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 1
     assert slots[0].slot_time.upper() == "6:00 PM"
@@ -97,7 +97,7 @@ async def test_no_time_anywhere_drops_slot():
     page = _page_returning([{"time": None, "source": -1}])
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 4, 17), 'button:visible:has-text("Book")'
+        page, date(2026, 4, 17), 'button.Consumer-resultsListItem.is-available'
     )
     assert slots == [], f"Expected no slot when time cannot be extracted; got {slots}"
 
@@ -114,7 +114,7 @@ async def test_no_slot_n_label_in_output():
     ])
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 4, 17), 'button:visible:has-text("Book")'
+        page, date(2026, 4, 17), 'button.Consumer-resultsListItem.is-available'
     )
     # Primary assertion: with no extractable time on any button, no slots emit.
     # The "Slot N" fallback would have produced 3 slots — its absence is a 0-len list.

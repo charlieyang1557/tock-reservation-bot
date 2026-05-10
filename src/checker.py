@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from playwright.async_api import Locator, Page
 
 import src.selectors as sel
+from src.selectors import is_playwright_selector
 from src.config import Config, parse_time
 from src.tracker import SlotTracker
 
@@ -120,7 +121,7 @@ _COLLECT_SLOTS_JS = r"""
       try {
         const span = btn.querySelector(slotTimeTextSelector);
         if (span) {
-          const t = (span.innerText || span.textContent || '').trim();
+          const t = (span.textContent || span.innerText || '').trim();
           if (t) { time = t; source = 1; }
         }
       } catch (_) { /* invalid selector → skip */ }
@@ -130,7 +131,7 @@ _COLLECT_SLOTS_JS = r"""
     if (time === null) {
       const parent = btn.parentElement;
       if (parent) {
-        const ptext = (parent.innerText || parent.textContent || '').trim();
+        const ptext = (parent.textContent || parent.innerText || '').trim();
         const m = ptext.match(re);
         if (m) { time = cleanTime(m[1]); source = 2; }
       }
@@ -142,7 +143,7 @@ _COLLECT_SLOTS_JS = r"""
       for (let i = 0; i < 3 && anc; i++) {
         anc = anc.parentElement;
         if (!anc) break;
-        const atext = (anc.innerText || anc.textContent || '').trim();
+        const atext = (anc.textContent || anc.innerText || '').trim();
         const m = atext.match(re);
         if (m) { time = cleanTime(m[1]); source = 3; break; }
       }
@@ -160,7 +161,7 @@ _COLLECT_SLOTS_JS = r"""
 
     // Source 5: button's own text content (only if not a bare 'Book')
     if (time === null) {
-      const btext = (btn.innerText || btn.textContent || '').trim();
+      const btext = (btn.textContent || btn.innerText || '').trim();
       const lower = btext.toLowerCase();
       if (btext && lower !== 'book' && lower !== 'book now') {
         const m = btext.match(re);
@@ -1248,6 +1249,15 @@ class AvailabilityChecker:
         time_pattern = r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b"
         time_flags = "i"
 
+        # Codex HIGH 1: Playwright-only selectors (`:has-text`, `:text`,
+        # `:visible`) cannot be passed to document.querySelectorAll —
+        # fall back to a Python locator iteration for those, preserving
+        # the JS fast path for plain CSS selectors.
+        if is_playwright_selector(matched_selector):
+            return await self._collect_slots_multi_locator_loop(
+                page, target_date, matched_selector
+            )
+
         try:
             result = await page.evaluate(
                 _COLLECT_SLOTS_JS,
@@ -1319,6 +1329,129 @@ class AvailabilityChecker:
                 + ", ".join(s.slot_time for s in slots)
             )
         return slots
+
+    async def _collect_slots_multi_locator_loop(
+        self, page: Page, target_date: date, matched_selector: str
+    ) -> list[AvailableSlot]:
+        """Locator-based fallback for Playwright-only matched selectors
+        (`:has-text`, `:text(`, `:visible`) which can't be passed to
+        document.querySelectorAll. Mirrors the pre-B1.3 algorithm but
+        runs only when the JS fast path is unsafe.
+        """
+        time_re = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b")
+        slots: list[AvailableSlot] = []
+        date_str = target_date.isoformat()
+
+        try:
+            # Container scope: when slots_container exists, scope to it;
+            # otherwise fall back to page-wide collection.
+            container_selector = sel.get("slots_container")
+            container_finder = page.locator(container_selector)
+            scoped_root = None
+            try:
+                if await container_finder.count() > 0:
+                    scoped_root = container_finder.first
+            except Exception as exc:
+                logger.debug(
+                    f"[check] {date_str} — container count() raised "
+                    f"{type(exc).__name__}: {exc}; falling back to page-wide"
+                )
+                scoped_root = None
+
+            if scoped_root is None:
+                logger.debug(
+                    f"[check] {date_str} — slots_container not found; "
+                    f"falling back to page-wide collection (PW selector path)"
+                )
+                locator = page.locator(matched_selector)
+            else:
+                locator = scoped_root.locator(matched_selector)
+
+            count = await locator.count()
+            for i in range(count):
+                el = locator.nth(i)
+                try:
+                    time_text = await self._extract_slot_time_locator(el, time_re)
+                    if time_text is None:
+                        logger.warning(
+                            f"[check] {date_str} — slot at index {i} "
+                            "has no extractable time; skipping (PW fallback path)"
+                        )
+                        continue
+                    slots.append(AvailableSlot(
+                        slot_date=target_date,
+                        slot_time=time_text,
+                        day_of_week=target_date.strftime("%A"),
+                    ))
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.error(
+                f"[check] {date_str} — PW-locator collection failed: {e}"
+            )
+
+        if slots:
+            logger.info(
+                f"[check] {date_str} — {len(slots)} slot(s) (PW fallback): "
+                + ", ".join(s.slot_time for s in slots)
+            )
+        return slots
+
+    async def _extract_slot_time_locator(
+        self, element, time_re: re.Pattern[str]
+    ) -> str | None:
+        """5-source extraction via Playwright Locator API. Used by the
+        PW-selector fallback in _collect_slots_multi_locator_loop."""
+        # Source 1: child span matching slot_time_text selector
+        try:
+            time_selector = sel.get("slot_time_text")
+            time_span = element.locator(time_selector)
+            if await time_span.count() > 0:
+                t = (await time_span.first.text_content() or "").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+        # Source 2: parent text
+        try:
+            parent = element.locator("..")
+            parent_text = (await parent.text_content() or "").strip()
+            m = time_re.search(parent_text)
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip()
+        except Exception:
+            pass
+        # Source 3: ancestors up to 3 levels above parent
+        try:
+            ancestor = element
+            for _ in range(3):
+                ancestor = ancestor.locator("..")
+                anc_text = (await ancestor.text_content() or "").strip()
+                m = time_re.search(anc_text)
+                if m:
+                    return re.sub(r"\s+", " ", m.group(1)).strip()
+        except Exception:
+            pass
+        # Source 4: aria-label / title attributes
+        for attr in ("aria-label", "title"):
+            try:
+                val = await element.get_attribute(attr)
+                if val:
+                    m = time_re.search(val)
+                    if m:
+                        return re.sub(r"\s+", " ", m.group(1)).strip()
+            except Exception:
+                continue
+        # Source 5: button's own text content (only if not bare 'Book')
+        try:
+            btn_text = (await element.text_content() or "").strip()
+            if btn_text and btn_text.lower() not in ("book", "book now"):
+                m = time_re.search(btn_text)
+                if m:
+                    return re.sub(r"\s+", " ", m.group(1)).strip()
+        except Exception:
+            pass
+        return None
 
     def _sort_by_preferred_time(
         self, slots: list[AvailableSlot]

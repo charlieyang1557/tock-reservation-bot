@@ -60,7 +60,7 @@ async def test_collect_slots_multi_single_evaluate_call():
     })
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 5, 15), 'button:has-text("Book")'
+        page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 5
     assert page.evaluate.await_count == 1, (
@@ -82,7 +82,7 @@ async def test_collect_slots_multi_returns_slots_from_evaluate():
     })
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 5, 15), 'button:has-text("Book")'
+        page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 2
     assert slots[0].slot_time == "5:00 PM"
@@ -107,7 +107,7 @@ async def test_collect_slots_multi_drops_null_times():
     })
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 5, 15), 'button:has-text("Book")'
+        page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
     )
     times = [s.slot_time for s in slots]
     assert times == ["5:00 PM", "8:00 PM"], (
@@ -126,7 +126,7 @@ async def test_collect_slots_multi_uses_container_when_present():
     })
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 5, 15), 'button:has-text("Book")'
+        page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
     )
     assert len(slots) == 1
     args, _ = page.evaluate.call_args
@@ -151,7 +151,7 @@ async def test_collect_slots_multi_falls_back_when_container_missing(caplog):
 
     with caplog.at_level(_logging.DEBUG):
         slots = await checker._collect_slots_multi(
-            page, date(2026, 5, 15), 'button:has-text("Book")'
+            page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
         )
     assert len(slots) == 1
     assert any(
@@ -170,7 +170,7 @@ async def test_collect_slots_multi_handles_evaluate_failure_gracefully():
     page.evaluate = AsyncMock(side_effect=Exception("page closed"))
 
     slots = await checker._collect_slots_multi(
-        page, date(2026, 5, 15), 'button:has-text("Book")'
+        page, date(2026, 5, 15), 'button.Consumer-resultsListItem.is-available'
     )
     assert slots == []
 
