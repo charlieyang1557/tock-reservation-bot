@@ -30,7 +30,7 @@ async def test_abort_event_passed_in_sniper_concurrent_mode():
     checker = _make_checker()
     received_events = []
 
-    async def fake_check_date(target_date, keep_page=False, abort_event=None):
+    async def fake_check_date(target_date, abort_event=None, **kwargs):
         received_events.append(abort_event)
         return []
 
@@ -51,7 +51,7 @@ async def test_remaining_tasks_see_abort_event_after_first_slot():
     checker = _make_checker()
     dates_called: list[str] = []
 
-    async def fake_check_date(target_date, keep_page=False, abort_event=None):
+    async def fake_check_date(target_date, abort_event=None, **kwargs):
         dates_called.append(target_date.isoformat())
         if abort_event is not None and abort_event.is_set():
             return []
@@ -80,7 +80,7 @@ async def test_sequential_sniper_stops_after_first_slot():
     checker = _make_checker()
     dates_scanned = []
 
-    async def fake_check_date(target_date, keep_page=False, abort_event=None):
+    async def fake_check_date(target_date, **kwargs):
         dates_scanned.append(target_date.isoformat())
         return [AvailableSlot(
             slot_date=target_date, slot_time="5:00 PM",
@@ -102,7 +102,7 @@ async def test_non_sniper_concurrent_no_abort_event():
     checker = _make_checker()
     received_events = []
 
-    async def fake_check_date(target_date, keep_page=False, abort_event=None):
+    async def fake_check_date(target_date, abort_event=None, **kwargs):
         received_events.append(abort_event)
         return []
 

@@ -113,6 +113,11 @@ class AvailabilityChecker:
         # Sniper mode: keep pages open across polls and reload them instead of
         # opening fresh — faster (no DNS/TCP overhead) and looks more human.
         self._sniper_pages: dict[str, "Page"] = {}  # date_str -> open Page
+        # Normal-mode fast-path handoff: when retain_found_pages=True, the page
+        # that found slots is parked here for one cycle so the booker can click
+        # the already-visible slot button instead of re-navigating. Drained by
+        # the monitor immediately after check_all and before book_best_slot_race.
+        self._handoff_pages: dict[str, "Page"] = {}  # date_str -> open Page
         self._screenshot_taken_this_poll = False  # reset each poll cycle
         # Sniper-mode skip cache: dates that failed to show target day in calendar.
         # Cleared when sniper pages are closed (new window).
@@ -230,6 +235,39 @@ class AvailabilityChecker:
         self._sniper_cf_challenges = 0
         self._sniper_cf_attempts = 0
         logger.debug("[check] Sniper pages closed.")
+
+    def pop_handoff_page(self, date_str: str) -> "Page | None":
+        """Remove and return the normal-mode handoff page for *date_str*.
+
+        Mirrors pop_warm_page: ownership transfers to the caller. Closed pages
+        are dropped (returned as None) so a stale entry can't poison the next
+        poll cycle. Used by the monitor to drain the booker's warm_pages dict
+        in normal-mode fast-path booking.
+        """
+        page = self._handoff_pages.pop(date_str, None)
+        if page is None:
+            return None
+        try:
+            if page.is_closed():
+                return None
+        except Exception:
+            return None
+        return page
+
+    async def close_handoff_pages(self) -> None:
+        """Close any remaining normal-mode handoff pages and clear the dict.
+
+        Defensive cleanup — under normal flow the monitor drains the dict via
+        pop_handoff_page() and the booker closes each page. This method handles
+        the edge cases (early returns, exceptions) so pages never leak across
+        polls.
+        """
+        for page in list(self._handoff_pages.values()):
+            try:
+                await page.close()
+            except Exception:
+                pass
+        self._handoff_pages.clear()
 
     @staticmethod
     def _is_cloudflare_challenge_page(page: Page) -> bool:
@@ -371,6 +409,8 @@ class AvailabilityChecker:
         sniper_window_age_sec: float = 0,
         bypass_normal_skip: bool = False,
         notifier: "Notifier | None" = None,
+        stop_on_first_slot: bool = False,
+        retain_found_pages: bool = False,
     ) -> list[AvailableSlot]:
         """
         Scan for available slots in two phases:
@@ -384,11 +424,30 @@ class AvailabilityChecker:
         concurrent=False (default): sequential per date — safe from Cloudflare.
         concurrent=True: parallel per date — ~4× faster, 1% error rate at 14 dates.
 
+        stop_on_first_slot=True (normal-mode fast path): in sequential mode,
+          break out of the date loop the moment any slot is found. Combined
+          with retain_found_pages, lets the booker click the already-visible
+          slot button without re-navigating — closes the latency window between
+          detection and booking that was costing slots in normal-mode polls.
+
+        retain_found_pages=True (normal-mode fast path): when keep_pages is
+          False AND a date yields slots, that date's live page is parked in
+          self._handoff_pages instead of being closed. The monitor drains it
+          via pop_handoff_page() and hands it to the booker as warm_pages.
+          Independent of keep_pages so this fast path doesn't reuse the sniper
+          scan-horizon, skip-cache, or pre-release scaffolding.
+
         After each call, self.last_errors / self.last_checks reflects the
         calendar load error rate for this poll — monitor.py uses this to
         adaptively switch between concurrent and sequential modes.
         """
         import asyncio as _asyncio
+
+        # Defensive cleanup: any stale handoff pages from a prior cycle (e.g.
+        # an exception bypassed the monitor's drain) get closed before we open
+        # new ones. Costs a single dict iteration per poll.
+        if self._handoff_pages:
+            await self.close_handoff_pages()
 
         self._screenshot_taken_this_poll = False
 
@@ -435,21 +494,16 @@ class AvailabilityChecker:
                     # In sniper mode, create an abort event: the first date to find
                     # slots signals others to stop early via abort_event.set().
                     abort_evt = _asyncio.Event() if keep_pages else None
-                    if bypass_normal_skip:
-                        check_calls = [
-                            self._check_date(
-                                d,
-                                keep_page=keep_pages,
-                                abort_event=abort_evt,
-                                bypass_normal_skip=bypass_normal_skip,
-                            )
-                            for d in dates
-                        ]
-                    else:
-                        check_calls = [
-                            self._check_date(d, keep_page=keep_pages, abort_event=abort_evt)
-                            for d in dates
-                        ]
+                    check_calls = [
+                        self._check_date(
+                            d,
+                            keep_page=keep_pages,
+                            abort_event=abort_evt,
+                            bypass_normal_skip=bypass_normal_skip,
+                            retain_found_page=retain_found_pages,
+                        )
+                        for d in dates
+                    ]
                     results = await _asyncio.gather(
                         *check_calls,
                         return_exceptions=True,
@@ -468,18 +522,22 @@ class AvailabilityChecker:
                 else:
                     slots = []
                     for d in dates:
-                        if bypass_normal_skip:
-                            result = await self._check_date(
-                                d,
-                                keep_page=keep_pages,
-                                bypass_normal_skip=bypass_normal_skip,
-                            )
-                        else:
-                            result = await self._check_date(d, keep_page=keep_pages)
+                        result = await self._check_date(
+                            d,
+                            keep_page=keep_pages,
+                            bypass_normal_skip=bypass_normal_skip,
+                            retain_found_page=retain_found_pages,
+                        )
                         slots.extend(result)
-                        if result and keep_pages:
+                        if result and (keep_pages or stop_on_first_slot):
+                            reason = (
+                                "sniper page-reuse keeps following dates warm"
+                                if keep_pages
+                                else "fast path — booker takes the live page"
+                            )
                             logger.info(
-                                "[check] First slot found — stopping sequential scan early"
+                                f"[check] First slot found on {d.isoformat()} — "
+                                f"stopping sequential scan early ({reason})"
                             )
                             break
                     return slots
@@ -581,6 +639,7 @@ class AvailabilityChecker:
         self, target_date: date, keep_page: bool = False,
         abort_event: asyncio.Event | None = None,
         bypass_normal_skip: bool = False,
+        retain_found_page: bool = False,
     ) -> list[AvailableSlot]:
         """
         Load the Tock search page for target_date, verify the day is
@@ -588,6 +647,12 @@ class AvailabilityChecker:
 
         keep_page=True (sniper mode): reuses the existing page for this date
         (reload instead of full navigate) for speed and Cloudflare friendliness.
+
+        retain_found_page=True (normal-mode fast path): when slots ARE found
+        AND keep_page is False, the page is parked in self._handoff_pages
+        instead of being closed in the finally block. The booker reuses it via
+        warm_pages so it doesn't have to re-navigate. No effect when keep_page
+        is True (the sniper path already retains pages in _sniper_pages).
         """
         date_str = target_date.isoformat()
 
@@ -630,6 +695,10 @@ class AvailabilityChecker:
             reusing = False
 
         nav_timeout = 10000 if keep_page else 30000
+        # Set True only when we hand the page off to the booker (normal-mode
+        # fast path with slots found). The finally block reads this to decide
+        # whether to close the page.
+        handoff_to_booker = False
         try:
             if reusing:
                 # Defensive: verify the page is still on the search URL
@@ -815,6 +884,29 @@ class AvailabilityChecker:
                     f"[check] {date_str} — first slot found, "
                     "abort signaled to remaining tasks"
                 )
+            # Normal-mode fast path: park the live page so the booker can
+            # click the already-visible slot button instead of re-navigating.
+            # No effect for keep_page=True (sniper already retains via
+            # _sniper_pages) or when no slots were extracted.
+            if sorted_slots and retain_found_page and not keep_page:
+                # Close any pre-existing handoff page for this date before
+                # overwriting — otherwise the old page leaks (Codex review).
+                # In current monitor wiring this slot is always empty by the
+                # time we get here (defensive close_handoff_pages at start of
+                # check_all), but a future concurrent caller could trip it.
+                old = self._handoff_pages.get(date_str)
+                if old is not None and old is not page:
+                    try:
+                        if not old.is_closed():
+                            await old.close()
+                    except Exception:
+                        pass
+                self._handoff_pages[date_str] = page
+                handoff_to_booker = True
+                logger.info(
+                    f"[check] {date_str} — handing live page to booker "
+                    "(normal-mode fast path)"
+                )
             return sorted_slots
 
         except Exception as e:
@@ -830,8 +922,11 @@ class AvailabilityChecker:
                     pass
             return []
         finally:
-            # Only close if we're not keeping this page across polls
-            if not keep_page:
+            # Close the page UNLESS:
+            #   1. keep_page=True (sniper mode keeps it across polls), OR
+            #   2. handoff_to_booker=True (booker now owns it; will close
+            #      after booking succeeds or fails — see TockBooker._book_single).
+            if not keep_page and not handoff_to_booker:
                 await page.close()
 
     async def _save_error_screenshot(self, page: Page, date_str: str, label: str) -> None:

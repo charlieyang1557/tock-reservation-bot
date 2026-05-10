@@ -361,6 +361,19 @@ class TockMonitor:
             if age is not None:
                 sniper_age = age
 
+        # Normal-mode fast path: stop scanning at first slot and hand the
+        # live page off to the booker so it can click the already-visible
+        # slot button without re-navigating. Disabled for sniper (which has
+        # its own page-reuse via _sniper_pages and races multiple slots),
+        # for dry-run (no booking, so nothing to hand off to), and after
+        # booking has been secured (poll returns early above anyway, but
+        # belt-and-suspenders).
+        enable_fast_handoff = (
+            not self._sniper_active
+            and not self.config.dry_run
+            and not self._booking_secured
+        )
+
         try:
             bypass_normal_skip = self._sniper_active or self._in_release_window()
             slots = await self.checker.check_all(
@@ -369,6 +382,8 @@ class TockMonitor:
                 sniper_window_age_sec=sniper_age,
                 bypass_normal_skip=bypass_normal_skip,
                 notifier=self.notifier,
+                stop_on_first_slot=enable_fast_handoff,
+                retain_found_pages=enable_fast_handoff,
             )
         except Exception as e:
             logger.error(f"[monitor] Availability check error: {e}")
@@ -386,64 +401,117 @@ class TockMonitor:
         if self._sniper_active:
             self._sniper_slots_found += len(slots)
 
-        self.notifier.slots_found(slots, sniper_mode=self._sniper_active)
+        # The post-slots section runs under try/finally so that any exception
+        # from notifier.slots_found, the warm-pages drain, or book_best_slot_race
+        # cannot leave handoff pages open. Cleanup runs in two layers:
+        #   1. Pages already popped into local `warm_pages`        — close here
+        #   2. Pages still parked in checker._handoff_pages         — close via
+        #      checker.close_handoff_pages() in case we never drained them
+        # (Codex adversarial review MEDIUM finding.)
+        warm_pages: dict[str, "Page"] | None = None
+        try:
+            self.notifier.slots_found(slots, sniper_mode=self._sniper_active)
 
-        # --- Dry-run: log and stop ---
-        if self.config.dry_run:
-            for slot in slots:
-                self.notifier.dry_run_would_book(slot)
-            return
+            # --- Dry-run: log and stop ---
+            if self.config.dry_run:
+                for slot in slots:
+                    self.notifier.dry_run_would_book(slot)
+                return
 
-        # --- Attempt booking ---
-        # Pass warm sniper pages to booker (avoids re-navigation).
-        # Use pop_warm_page so the booker takes OWNERSHIP — checker no longer
-        # holds a Page that the booker may navigate to checkout.
-        # Codex pass 2 HIGH: prevents next sniper poll's reload() from
-        # reloading a checkout page and poisoning the date.
-        warm_pages = None
-        if self._sniper_active:
-            warm_pages = {}
-            seen: set[str] = set()
-            for s in slots:
-                if s.slot_date_str in seen:
-                    continue  # multiple slots per date share one warm page
-                seen.add(s.slot_date_str)
-                wp = self.checker.pop_warm_page(s.slot_date_str)
-                if wp is not None:
-                    warm_pages[s.slot_date_str] = wp
+            # --- Attempt booking ---
+            # Pass warm pages to booker (avoids re-navigation in either mode).
+            # Sniper drains _sniper_pages via pop_warm_page; normal-mode fast
+            # path drains _handoff_pages via pop_handoff_page. The booker
+            # treats both identically — pop()-and-own; close after success or
+            # failure. The two sources are kept in separate dicts so the
+            # sniper warm-page lifetime (across polls) doesn't leak into the
+            # one-shot fast-path lifetime (single poll).
+            if self._sniper_active:
+                warm_pages = {}
+                seen: set[str] = set()
+                for s in slots:
+                    if s.slot_date_str in seen:
+                        continue  # multiple slots per date share one warm page
+                    seen.add(s.slot_date_str)
+                    wp = self.checker.pop_warm_page(s.slot_date_str)
+                    if wp is not None:
+                        warm_pages[s.slot_date_str] = wp
+                if warm_pages:
+                    logger.info(
+                        f"[monitor] Passing {len(warm_pages)} warm page(s) to booker"
+                    )
+                else:
+                    warm_pages = None
+            elif enable_fast_handoff:
+                warm_pages = {}
+                seen = set()
+                for s in slots:
+                    if s.slot_date_str in seen:
+                        continue
+                    seen.add(s.slot_date_str)
+                    hp = self.checker.pop_handoff_page(s.slot_date_str)
+                    if hp is not None:
+                        warm_pages[s.slot_date_str] = hp
+                if warm_pages:
+                    logger.info(
+                        f"[monitor] Passing {len(warm_pages)} handoff page(s) to "
+                        "booker (normal-mode fast path)"
+                    )
+                else:
+                    logger.info(
+                        "[monitor] No handoff page available — booker will fall "
+                        "back to fresh navigation"
+                    )
+                    warm_pages = None
+
+            from src.booker import BookingOutcome
+            outcome, booked_slot = await self.booker.book_best_slot_race(
+                slots, warm_pages=warm_pages
+            )
+
+            if outcome == BookingOutcome.CONFIRMED:
+                self._booking_secured = True
+                logger.info(
+                    f"[monitor] *** Booking secured: {booked_slot} ***\n"
+                    "Bot will idle from now on. Safe to Ctrl+C."
+                )
+            elif outcome == BookingOutcome.UNVERIFIED_CONFIRM:
+                # Codex pass 2 HIGH: confirm click happened but verification
+                # failed. Tock MAY have accepted. We MUST idle this session — do
+                # not try another slot or another release window. Operator must
+                # restart after verifying manually on Tock's website.
+                self._booking_secured = True
+                logger.error(
+                    f"[monitor] *** Unverified confirm for {booked_slot} ***\n"
+                    "Bot will idle until restart. Verify manually at "
+                    "https://www.exploretock.com/account/reservations."
+                )
+            else:  # FAILED
+                logger.warning(
+                    "[monitor] All booking attempts failed this cycle. Will retry."
+                )
+
+            # Flush any deferred tracker writes (sniper mode defers disk I/O)
+            self.tracker.flush_deferred()
+        finally:
+            # Layer 1: close pages popped into warm_pages but never claimed
+            # by the booker (early-return paths inside book_best_slot_race).
             if warm_pages:
-                logger.info(f"[monitor] Passing {len(warm_pages)} warm page(s) to booker")
-            else:
-                warm_pages = None
-
-        from src.booker import BookingOutcome
-        outcome, booked_slot = await self.booker.book_best_slot_race(
-            slots, warm_pages=warm_pages
-        )
-        if outcome == BookingOutcome.CONFIRMED:
-            self._booking_secured = True
-            logger.info(
-                f"[monitor] *** Booking secured: {booked_slot} ***\n"
-                "Bot will idle from now on. Safe to Ctrl+C."
-            )
-        elif outcome == BookingOutcome.UNVERIFIED_CONFIRM:
-            # Codex pass 2 HIGH: confirm click happened but verification
-            # failed. Tock MAY have accepted. We MUST idle this session — do
-            # not try another slot or another release window. Operator must
-            # restart after verifying manually on Tock's website.
-            self._booking_secured = True
-            logger.error(
-                f"[monitor] *** Unverified confirm for {booked_slot} ***\n"
-                "Bot will idle until restart. Verify manually at "
-                "https://www.exploretock.com/account/reservations."
-            )
-        else:  # FAILED
-            logger.warning(
-                "[monitor] All booking attempts failed this cycle. Will retry."
-            )
-
-        # Flush any deferred tracker writes (sniper mode defers disk I/O)
-        self.tracker.flush_deferred()
+                for _date_str, p in list(warm_pages.items()):
+                    try:
+                        if not p.is_closed():
+                            await p.close()
+                    except Exception:
+                        pass
+            # Layer 2: any handoff pages still parked in the checker (e.g.
+            # an exception fired before we drained them). Sniper-warm pages
+            # are NOT closed here — they live across polls by design and
+            # close_sniper_pages() handles them at window end.
+            if enable_fast_handoff:
+                try:
+                    await self.checker.close_handoff_pages()
+                except Exception:
+                    pass
 
     def _apply_adaptive_switching(self, sniper_age: float) -> None:
         """Update concurrent/sequential mode based on rolling error rate.

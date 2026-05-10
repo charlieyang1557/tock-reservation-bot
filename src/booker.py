@@ -236,9 +236,18 @@ class TockBooker:
             self.notifier.dry_run_would_book(slot)
             return False
 
-        # Use warm page from checker (sniper mode) or create fresh
+        # Use warm page from checker (sniper warm or normal-mode handoff) or
+        # create fresh. A page is considered usable only if it's still open;
+        # a closed handoff is logged so operators can distinguish between
+        # "no warm page provided" and "provided but stale".
+        warm_page_unusable = warm_page is not None and warm_page.is_closed()
+        if warm_page_unusable:
+            logger.warning(
+                f"[book] {slot} — warm page provided but already closed; "
+                "falling back to fresh navigation"
+            )
         page = warm_page if warm_page and not warm_page.is_closed() else None
-        owns_page = page is None  # noqa: F841 — kept for readability; close is now unconditional
+        owns_page = page is None  # True ⇒ booker created a fresh page; False ⇒ using warm
         if page is None:
             page = await self.browser.new_page()
 
@@ -292,7 +301,14 @@ class TockBooker:
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
 
-            if not await self._click_time_slot(page, slot):
+            # When operating on a warm/handoff page, demand an exact time match.
+            # The page was last touched by the checker, which detected this exact
+            # slot — if it's no longer visible, the slot vanished and the
+            # first-button fallback would book the wrong time (Codex review).
+            using_warm_page = not owns_page
+            if not await self._click_time_slot(
+                page, slot, strict_time_match=using_warm_page
+            ):
                 return False
 
             # Scroll to bottom so the confirm button (which may be below the fold
@@ -438,11 +454,25 @@ class TockBooker:
         )
         return False
 
-    async def _click_time_slot(self, page: Page, slot: AvailableSlot) -> bool:
+    async def _click_time_slot(
+        self, page: Page, slot: AvailableSlot,
+        strict_time_match: bool = False,
+    ) -> bool:
         """Find the time slot matching slot.slot_time and click it.
 
         Iterates all matching buttons and compares text content to find the
-        correct time. Falls back to first button if no text match is found.
+        correct time.
+
+        strict_time_match=False (default): if no exact match is found, falls
+          back to clicking the first non-generic button. Acceptable for fresh
+          navigation where the page state was just established and a missing
+          exact time often means the button text format changed slightly.
+
+        strict_time_match=True: refuse the fallback. Used when the booker
+          is operating on a warm/handoff page that was last touched by the
+          checker — if the target time isn't visible now, the slot likely
+          vanished and clicking any other button would book the wrong time
+          (Codex adversarial review HIGH finding).
         """
         slot_selectors = get_slot_button_selectors()
 
@@ -533,8 +563,12 @@ class TockBooker:
             except Exception:
                 continue
 
-        # Fallback: click first non-generic button (only reached for specific selectors)
-        if best_btn is not None:
+        # Fallback: click first non-generic button (only reached for specific selectors).
+        # Suppressed in strict mode: a warm/handoff page that no longer shows
+        # the target time means the slot vanished — clicking anything else
+        # would book the wrong time. Returning False instead lets the race
+        # try a different slot or fall back to fresh navigation next poll.
+        if best_btn is not None and not strict_time_match:
             try:
                 text = (await best_btn.text_content() or "").strip()
                 await best_btn.click()
@@ -546,6 +580,13 @@ class TockBooker:
             except Exception as e:
                 logger.error(f"[book] Could not click fallback slot button: {e}")
                 return False
+        if best_btn is not None and strict_time_match:
+            logger.warning(
+                f"[book] No exact time match for '{slot.slot_time}' on warm "
+                "page; refusing first-button fallback (slot likely vanished) "
+                "— returning False so the race tries another slot or a fresh "
+                "page next poll"
+            )
 
         logger.error(
             f"[book] No clickable slot button found for '{slot.slot_time}' "
