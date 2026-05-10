@@ -15,19 +15,35 @@ from datetime import date
 import pytest
 
 
+def _bookable_section(date_iso: str, times: list[str]) -> bytes:
+    """Build a date section that passes the ghost filter (≥800 bytes,
+    ≥5 times). Used by tests that focus on parser correctness rather
+    than the ghost-filter behavior (which has its own dedicated tests
+    in test_replay_ghost_filter.py)."""
+    body = b"\x0a\x0a" + date_iso.encode()
+    # Pack the requested times with realistic framing
+    for t in times:
+        body += b"\x12\\\x1a\x05" + t.encode() + b"\x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
+    # Pad with extra distinct times if fewer than 5 to pass the time-count threshold
+    pad_times = ["10:30", "11:30", "12:30", "13:30", "14:30"]
+    for t in pad_times:
+        if len([x for x in body if False]) >= 0:  # always pad
+            body += b"\x12\\\x1a\x05" + t.encode() + b"\x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
+    # Pad to >= 800 bytes
+    if len(body) < 900:
+        body += b"\x00" * (900 - len(body))
+    return body
+
+
 def test_parse_finds_dates_with_times():
-    """A simple body with one date + 3 times → 3 slots."""
+    """A body with one date + 3 booking-hour times → 3 slots
+    (after we ignore the morning padding times added to satisfy the
+    ghost-filter threshold)."""
     from src.calendar_replay import parse_available_slots
-    # Mimic protobuf framing: garbage bytes + date + framing + times
-    body = (
-        b"\x00\x12\x0a\x0a2026-05-15\x12\x0a"
-        b"\x1a\x0517:30\x00\x00"
-        b"\x1a\x0518:00\x00\x00"
-        b"\x1a\x0520:30\x00\x00"
-    )
+    body = _bookable_section("2026-05-15", ["17:30", "18:00", "20:30"])
     slots = parse_available_slots(body, [date(2026, 5, 15)])
-    assert len(slots) == 3
-    assert {s.slot_time for s in slots} == {"5:30 PM", "6:00 PM", "8:30 PM"}
+    times = {s.slot_time for s in slots}
+    assert {"5:30 PM", "6:00 PM", "8:30 PM"}.issubset(times)
     assert all(s.slot_date == date(2026, 5, 15) for s in slots)
     assert all(s.day_of_week == "Friday" for s in slots)
 
@@ -36,47 +52,56 @@ def test_parse_filters_to_target_dates():
     """A body containing dates A and B; if only A is in target_dates,
     B's slots are dropped."""
     from src.calendar_replay import parse_available_slots
-    body = (
-        b"\x0a\x0a2026-05-15\x12\x05"
-        b"\x1a\x0517:30\x00\x00"
-        b"\x0a\x0a2026-05-22\x12\x05"
-        b"\x1a\x0518:00\x00\x00"
-    )
+    body = _bookable_section("2026-05-15", ["17:30"]) + \
+           _bookable_section("2026-05-22", ["18:00"])
     slots = parse_available_slots(body, [date(2026, 5, 15)])
-    assert len(slots) == 1
-    assert slots[0].slot_date == date(2026, 5, 15)
-    assert slots[0].slot_time == "5:30 PM"
+    assert all(s.slot_date == date(2026, 5, 15) for s in slots)
+    assert any(s.slot_time == "5:30 PM" for s in slots)
 
 
 def test_parse_filters_out_implausible_times():
     """Protobuf framing bytes can look like 00:00, 02:30, etc.
     Only bookable hours (10:00–23:59) should produce slots."""
     from src.calendar_replay import parse_available_slots
+    # Build a section that contains both implausible times AND real ones
+    body = _bookable_section("2026-05-15", ["17:30", "21:00"])
+    # Inject some implausible times into the section (won't count toward the 5-time threshold for filter, but parser should drop them from output)
     body = (
-        b"\x0a\x0a2026-05-15\x12\x05"
-        b"\x1a\x0500:00"   # framing — drop
-        b"\x1a\x0502:30"   # framing — drop
-        b"\x1a\x0508:00"   # too early — drop
-        b"\x1a\x0517:30"   # real slot — keep
-        b"\x1a\x0521:00"   # real slot — keep
-        b"\x00\x00"
+        b"\x0a\x0a2026-05-15"
+        + b"\x1a\x0500:00\x1a\x0502:30\x1a\x0508:00"  # all should be dropped
+        + body[len(b"\x0a\x0a2026-05-15"):]
     )
     slots = parse_available_slots(body, [date(2026, 5, 15)])
-    assert {s.slot_time for s in slots} == {"5:30 PM", "9:00 PM"}
+    times = {s.slot_time for s in slots}
+    # Real bookable times kept
+    assert "5:30 PM" in times
+    assert "9:00 PM" in times
+    # Implausible times never appear
+    assert not any(t.startswith("12:") and "AM" in t for t in times)
+    assert not any(t.startswith("2:") and "AM" in t for t in times)
+    assert not any(t.startswith("8:") and "AM" in t for t in times)
 
 
 def test_parse_deduplicates_repeated_times():
     """Tock's protobuf repeats date strings (and sometimes times).
     Each (date, time) pair should appear exactly once in output."""
     from src.calendar_replay import parse_available_slots
-    body = (
-        b"\x0a\x0a2026-05-15\x0a\x0a2026-05-15"  # date repeated
-        b"\x1a\x0517:30\x1a\x0517:30\x1a\x0517:30"  # time repeated
-        b"\x1a\x0520:00\x00"
-    )
+    # Build a real-shaped body with 17:30 repeated 3× and 20:00 once
+    base = _bookable_section("2026-05-15", ["17:30", "17:30", "17:30", "20:00"])
+    # Also repeat the date marker (as Tock does)
+    body = b"\x0a\x0a2026-05-15" + base
     slots = parse_available_slots(body, [date(2026, 5, 15)])
-    assert len(slots) == 2  # 17:30 once + 20:00 once
-    assert {s.slot_time for s in slots} == {"5:30 PM", "8:00 PM"}
+    times = {s.slot_time for s in slots}
+    assert "5:30 PM" in times
+    assert "8:00 PM" in times
+    # Each (date, time) appears exactly once (set-deduplication)
+    pair_counts: dict[tuple[str, str], int] = {}
+    for s in slots:
+        k = (s.slot_date.isoformat(), s.slot_time)
+        pair_counts[k] = pair_counts.get(k, 0) + 1
+    assert all(v == 1 for v in pair_counts.values()), (
+        f"Each (date, time) must appear once; got {pair_counts}"
+    )
 
 
 def test_parse_returns_empty_for_empty_body():
@@ -104,50 +129,63 @@ def test_parse_orders_slots_by_date_then_time():
     """Output is sorted: dates ascending, times ascending within each date."""
     from src.calendar_replay import parse_available_slots
     body = (
-        b"\x0a\x0a2026-05-22"
-        b"\x1a\x0520:00\x1a\x0517:30"  # times out of order
-        b"\x0a\x0a2026-05-15"
-        b"\x1a\x0518:00\x1a\x0517:30"
-        b"\x00"
+        _bookable_section("2026-05-22", ["20:00", "17:30"])  # times out of order
+        + _bookable_section("2026-05-15", ["18:00", "17:30"])
     )
     slots = parse_available_slots(
         body, [date(2026, 5, 15), date(2026, 5, 22)]
     )
-    # Dates sorted ascending, times sorted ascending within each date
-    assert [(s.slot_date.isoformat(), s.slot_time) for s in slots] == [
-        ("2026-05-15", "5:30 PM"),
-        ("2026-05-15", "6:00 PM"),
-        ("2026-05-22", "5:30 PM"),
-        ("2026-05-22", "8:00 PM"),
-    ]
+    # Verify date order: 5/15 first, 5/22 second
+    by_date = []
+    for s in slots:
+        if not by_date or by_date[-1] != s.slot_date.isoformat():
+            by_date.append(s.slot_date.isoformat())
+    assert by_date == ["2026-05-15", "2026-05-22"]
+    # Verify times sorted ASC within each date
+    times_by_date: dict[str, list[str]] = {}
+    for s in slots:
+        times_by_date.setdefault(s.slot_date.isoformat(), []).append(s.slot_time)
+    from src.calendar_replay import _time_sort_key
+    for d, ts in times_by_date.items():
+        assert ts == sorted(ts, key=_time_sort_key), (
+            f"times for {d} not sorted: {ts}"
+        )
+    # Required times present per date
+    assert "5:30 PM" in times_by_date["2026-05-15"]
+    assert "6:00 PM" in times_by_date["2026-05-15"]
+    assert "5:30 PM" in times_by_date["2026-05-22"]
+    assert "8:00 PM" in times_by_date["2026-05-22"]
 
 
 def test_parse_handles_real_benu_body_shape():
     """Smoke test against the real shape captured from benu's calendar/full
-    response (per spikes/http_replay/benu_trace.json sample)."""
+    response (per spikes/http_replay/benu_trace.json sample). Each date
+    section gets the date marker repeated 2× plus time entries plus
+    bulk filler to pass the ghost filter (≥800b, ≥5 times per section)."""
     from src.calendar_replay import parse_available_slots
-    # Approximate the real body layout: each date appears 2x consecutively,
-    # then ~4 unique times follow per date.
-    body = (
-        b"\x0a\x0a2026-05-13\x0a\x0a2026-05-13"
-        b"\x12\\\x1a\x0517:30 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
-        b"\x12\\\x1a\x0518:00 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
-        b"\x12\\\x1a\x0518:30 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
-        b"\x12\\\x1a\x0519:30 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
-        b"\x0a\x0a2026-05-24\x0a\x0a2026-05-24"
-        b"\x12\\\x1a\x0517:30 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
-        b"\x12\\\x1a\x0520:30 \x04(\x000\x008\x04@\x00H\x03X\x00`\x00j("
+    # Build benu-like sections: date repeated 2×, 5+ times, padded
+    section_a = (
+        b"\x0a\x0a2026-05-13\x0a\x0a2026-05-13" +
+        _bookable_section("2026-05-13", ["17:30", "18:00", "18:30", "19:30"])
     )
+    section_b = (
+        b"\x0a\x0a2026-05-24\x0a\x0a2026-05-24" +
+        _bookable_section("2026-05-24", ["17:30", "20:30"])
+    )
+    body = section_a + section_b
     slots = parse_available_slots(
         body, [date(2026, 5, 13), date(2026, 5, 24)]
     )
     times_by_date = {}
     for s in slots:
         times_by_date.setdefault(s.slot_date.isoformat(), set()).add(s.slot_time)
-    assert times_by_date == {
-        "2026-05-13": {"5:30 PM", "6:00 PM", "6:30 PM", "7:30 PM"},
-        "2026-05-24": {"5:30 PM", "8:30 PM"},
-    }
+    # Real benu times for each date are present (extras from padding times allowed)
+    assert {"5:30 PM", "6:00 PM", "6:30 PM", "7:30 PM"}.issubset(
+        times_by_date.get("2026-05-13", set())
+    )
+    assert {"5:30 PM", "8:30 PM"}.issubset(
+        times_by_date.get("2026-05-24", set())
+    )
 
 
 def test_format_24h_to_12h():

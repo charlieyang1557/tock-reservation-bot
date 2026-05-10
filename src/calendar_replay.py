@@ -64,6 +64,18 @@ _HTML_SIGNATURE_BYTES = (b"<!doctype", b"<html", b"<HTML", b"<HEAD", b"<head")
 # safer to treat as failure (fall back) than as "no slots success".
 _PROTOBUF_MIN_PLAUSIBLE_BYTES = 20
 
+# Per-date section heuristics (empirical, 2026-05-10):
+# benu (has slots):     each date section is 1000-1500 bytes, 11-17 times
+# fuhuihua (sold out):  each date section is 16-322 bytes, 0-2 times
+# A "real bookable date" section is large because it contains slot
+# metadata (party limits, prices, availability counts) per slot. A
+# "sold out" date section is just the date marker + a few framing bytes.
+# Filter date sections that look too small to plausibly contain real
+# slot metadata, AND require at least N time strings — together this
+# rejects fuhuihua's ghost slots while keeping all benu's real ones.
+_MIN_BOOKABLE_SECTION_BYTES = 800
+_MIN_BOOKABLE_TIMES_PER_SECTION = 5
+
 # Time marker pattern (HH:MM, 24-hour). Note: the body has many "00:00"
 # style framing artifacts (zero offsets in the protobuf wire format) so
 # we filter to plausible booking times (10:00–23:59).
@@ -297,6 +309,23 @@ def parse_available_slots(
             else len(body)
         )
         section = body[start:end]
+
+        # Ghost-slot guard (empirical 2026-05-10): real bookable date
+        # sections are >= 800 bytes (contain slot metadata: party
+        # limits, prices, availability counts per slot). Sold-out
+        # restaurants like fuhuihua have date markers in the body but
+        # only ~20-300 bytes per date section because there's no slot
+        # metadata to encode. Skip these to avoid attributing protobuf
+        # framing bytes that happen to look like times to a date the
+        # restaurant has 0 availability for.
+        if len(section) < _MIN_BOOKABLE_SECTION_BYTES:
+            logger.debug(
+                f"[calendar-replay] skipping date {d}: "
+                f"section {len(section)}b < {_MIN_BOOKABLE_SECTION_BYTES}b "
+                "threshold (likely sold out / no real slot metadata)"
+            )
+            continue
+
         times: set[str] = set()
         for tm in _TIME_RE.finditer(section):
             hh = int(tm.group(1))
@@ -304,6 +333,14 @@ def parse_available_slots(
             if _MIN_BOOKING_HOUR <= hh <= _MAX_BOOKING_HOUR:
                 # Format as "H:MM AM/PM" to match the bot's slot_time format
                 times.add(_format_24h_to_12h(hh, mm))
+        if len(times) < _MIN_BOOKABLE_TIMES_PER_SECTION:
+            logger.debug(
+                f"[calendar-replay] skipping date {d}: "
+                f"only {len(times)} time(s) found "
+                f"< {_MIN_BOOKABLE_TIMES_PER_SECTION} threshold (likely "
+                "ghost slots from protobuf framing)"
+            )
+            continue
         if times:
             slots_by_date[d] = times
 
