@@ -41,7 +41,11 @@ from src.browser import TockBrowser
 from src.checker import AvailableSlot
 from src.config import Config
 from src.notifier import Notifier
-from src.selectors import get_slot_button_selectors, is_playwright_selector
+from src.selectors import (
+    get_slot_button_selectors,
+    is_generic_slot_selector,
+    is_playwright_selector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,16 +68,48 @@ _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "debug_screenshots"
 )
 
-# Selectors that match generic "Book" buttons (restaurant/experience level, not time-slot).
-# These must only be clicked if surrounding context confirms the target time.
-_GENERIC_BOOK_SELECTORS: frozenset[str] = frozenset({
-    'button:visible:has-text("Book")',
-    'button:text("Book now")',
-    'a:text("Book now")',
-    '[data-testid="book-now"]',
-    "button.SearchExperience-bookButton",
-    "[data-testid='book-button']",
-})
+# Codex MEDIUM 1: classification of "generic Book" selectors (vs.
+# specific per-time-slot selectors) now lives in src/selectors.py
+# alongside `get_slot_button_selectors` so the two cannot drift apart.
+# Use `is_generic_slot_selector(s)` for membership tests.
+
+# Codex LOW 1: regex matching the actual checkout-style URL paths so
+# substrings like /booklist or /bookmark do not false-positive into the
+# confirm flow. Path segment must be followed by /, ?, #, or end-of-string.
+_CHECKOUT_PATH_RE = re.compile(
+    r"/(checkout|reservation|book)(?=/|\?|#|$)", re.IGNORECASE
+)
+
+
+def _checkout_url_matches(url: str) -> bool:
+    """Return True iff `url`'s path looks like an actual checkout/
+    reservation/book page (not a profile, search, or substring match)."""
+    if not url:
+        return False
+    return bool(_CHECKOUT_PATH_RE.search(url))
+
+
+# Codex LOW 2: payment-visible JS includes a URL precondition so
+# `/account/payment-methods` (which contains identical "Add card" text)
+# cannot false-trigger checkout detection while the bot is on the wrong
+# page. The URL check happens INSIDE the page context, not just in
+# Python — so the JS sees the live page state at the moment it runs.
+_PAYMENT_VISIBLE_JS_SOURCE = (
+    "() => {"
+    "  const path = (window.location && window.location.pathname || '').toLowerCase();"
+    "  if (!/\\/(checkout|reservation|book)(\\/|$)/.test(path)) return false;"
+    "  const card = document.querySelector("
+    "    '[data-testid=\"saved-card\"], .SavedCard, "
+    ".PaymentMethod--saved, [data-testid=\"payment-card\"]'"
+    "  );"
+    "  if (card) return true;"
+    "  const ctrls = Array.from(document.querySelectorAll('button, a'));"
+    "  return ctrls.some(el => "
+    "    /add (payment|card|a card)/i.test(el.innerText || '')"
+    "  );"
+    "}"
+)
+
 
 # Single-evaluate slot-click JS (Phase B1.2). Called from _click_time_slot.
 # Iterates DOM-side and clicks inside the same call, eliminating per-button
@@ -615,7 +651,7 @@ class TockBooker:
 
         # Single browser-side iteration: match + click in one round-trip.
         target_time = slot.slot_time.strip().upper()
-        is_generic = matched_selector in _GENERIC_BOOK_SELECTORS
+        is_generic = is_generic_slot_selector(matched_selector)
 
         # Codex HIGH 2: Playwright-only selectors (`:has-text`, `:text`,
         # `:visible`) cannot be passed to document.querySelectorAll —
@@ -783,8 +819,9 @@ class TockBooker:
         first success, cutting 0–1900 ms off the old 2-s polling tick:
 
           1. wait_for_selector(checkout_container)
-          2. wait_for_url(predicate)        — URL contains /checkout, /reservation, /book
-          3. wait_for_function(payment_visible_js)
+          2. wait_for_url(predicate)        — URL has /checkout/, /reservation/, /book/
+          3. wait_for_function(payment_visible_js) — payment form visible
+                                                     AND URL precondition
 
         Returns False after a 30 s overall timeout (all three waiters
         either raised or did not resolve). Losing waiters are cancelled and
@@ -795,37 +832,16 @@ class TockBooker:
         total_wait = 30
         timeout_ms = total_wait * 1000
 
-        def _url_matches(url: str) -> bool:
-            return any(p in url for p in ("/checkout", "/reservation", "/book"))
-
-        # JS predicate for "payment form is visible". Mirrors the legacy
-        # query_selector check on saved_payment_card / no_payment_indicator
-        # but in a single browser-side evaluation so we can wait for it
-        # event-style instead of polling.
-        payment_visible_js = (
-            "() => {"
-            "  const card = document.querySelector("
-            "    '[data-testid=\"saved-card\"], .SavedCard, "
-            ".PaymentMethod--saved, [data-testid=\"payment-card\"]'"
-            "  );"
-            "  if (card) return true;"
-            "  const ctrls = Array.from(document.querySelectorAll('button, a'));"
-            "  return ctrls.some(el => "
-            "    /add (payment|card|a card)/i.test(el.innerText || '')"
-            "  );"
-            "}"
-        )
-
         async def _via_selector():
             await page.wait_for_selector(selector, timeout=timeout_ms)
             return "selector"
 
         async def _via_url():
-            await page.wait_for_url(_url_matches, timeout=timeout_ms)
+            await page.wait_for_url(_checkout_url_matches, timeout=timeout_ms)
             return "url"
 
         async def _via_function():
-            await page.wait_for_function(payment_visible_js, timeout=timeout_ms)
+            await page.wait_for_function(_PAYMENT_VISIBLE_JS_SOURCE, timeout=timeout_ms)
             return "function"
 
         tasks = [

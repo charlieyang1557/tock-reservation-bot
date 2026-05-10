@@ -183,16 +183,44 @@ def get(key: str) -> str:
     return SELECTORS[key]
 
 
+# Source of truth for the slot-button selector list AND each selector's
+# kind ("specific" → per-time-slot button, "generic" → restaurant-level
+# Book button that needs parent-time confirmation before clicking).
+# Codex MEDIUM 1: replaces the prior frozenset-of-strings membership
+# check that was fragile to whitespace/quote drift.
+_SLOT_SELECTOR_ENTRIES: list[tuple[str, str]] = [
+    (SELECTORS["available_slot_button"], "specific"),
+    ("button.Consumer-resultsListItem", "specific"),
+    ('button:visible:has-text("Book")', "generic"),
+    (SELECTORS["book_now_button"], "generic"),
+    ("button.SearchExperience-bookButton", "generic"),
+    ("[data-testid='book-button']", "generic"),
+]
+
+
 def get_slot_button_selectors() -> list[str]:
     """Ordered list of selectors for time-slot / booking buttons."""
-    return [
-        SELECTORS["available_slot_button"],
-        "button.Consumer-resultsListItem",
-        'button:visible:has-text("Book")',
-        SELECTORS["book_now_button"],
-        "button.SearchExperience-bookButton",
-        "[data-testid='book-button']",
-    ]
+    return [s for s, _ in _SLOT_SELECTOR_ENTRIES]
+
+
+def get_slot_button_selectors_typed() -> list[tuple[str, str]]:
+    """Same ordered list, with each selector tagged 'specific' or
+    'generic'. Use `is_generic_slot_selector(s)` for membership tests
+    rather than comparing strings directly."""
+    return list(_SLOT_SELECTOR_ENTRIES)
+
+
+def is_generic_slot_selector(selector: str) -> bool:
+    """Return True iff `selector` is one of the known generic
+    restaurant-level Book buttons (kind='generic' in the typed list).
+    Unknown selectors default to False (safer: avoids accidental
+    generic-button clicks)."""
+    if not selector:
+        return False
+    for s, kind in _SLOT_SELECTOR_ENTRIES:
+        if s == selector and kind == "generic":
+            return True
+    return False
 
 
 # Substrings that indicate a selector uses Playwright-only syntax
