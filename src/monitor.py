@@ -33,6 +33,7 @@ from datetime import date, datetime, time, timedelta
 
 import pytz
 
+from src import selector_metrics
 from src.booker import TockBooker
 from src.checker import AvailabilityChecker
 from src.config import Config, parse_time
@@ -82,6 +83,13 @@ _SNIPER_PRE_RELEASE_SEC = 60.0
 # across the 60s pre-release period — well below the watchdog's 10/5s burst
 # threshold, with plenty of margin.
 _SNIPER_PRE_RELEASE_TICK_SEC = 0.5
+
+# B2.4: selector-hit telemetry flush cadence inside sniper mode. Sniper polls
+# fire ~every 3s; flushing every poll would mean ~20 file writes per minute.
+# Flushing every Nth poll keeps the I/O cost negligible while still landing
+# fresh data on disk well before the window ends. Outside sniper mode polls
+# are 5+ min apart so we always flush.
+_SNIPER_METRICS_FLUSH_EVERY_N = 5
 
 
 class TockMonitor:
@@ -351,6 +359,25 @@ class TockMonitor:
             )
             return
 
+        try:
+            await self._poll_inner()
+        finally:
+            # B2.4: persist selector-hit telemetry. Outside sniper mode polls
+            # are 5+ min apart so we always flush; inside sniper mode (~3s
+            # polls) we gate to every Nth poll to keep the I/O footprint
+            # tiny. Best-effort — never let a metrics bug abort a poll cycle.
+            try:
+                should_flush = (
+                    not self._sniper_active
+                    or (self._poll_count % _SNIPER_METRICS_FLUSH_EVERY_N == 0)
+                )
+                if should_flush:
+                    selector_metrics.flush()
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.debug(f"[monitor] selector_metrics.flush failed: {exc}")
+
+    async def _poll_inner(self) -> None:
+        """Body of poll() — kept separate so finally can run flushes."""
         # --- Availability check ---
         # Sniper mode uses concurrent by default (~34s vs ~133s sequential).
         # If error rate spikes, adaptive logic switches to sequential automatically.

@@ -37,6 +37,7 @@ from enum import Enum
 from playwright.async_api import Page
 
 import src.selectors as sel
+from src import selector_metrics
 from src.browser import TockBrowser
 from src.checker import AvailableSlot
 from src.config import Config
@@ -648,6 +649,13 @@ class TockBooker:
                 "  -> Update src/selectors.py"
             )
             return False
+
+        # B2.4: telemetry for selector hit-rate analysis. Best-effort —
+        # never let a metrics bug break the booking flow.
+        try:
+            selector_metrics.record_match("slot_button_book", matched_selector)
+        except Exception as exc:
+            logger.debug(f"[book] selector_metrics.record_match failed: {exc}")
 
         # Single browser-side iteration: match + click in one round-trip.
         target_time = slot.slot_time.strip().upper()

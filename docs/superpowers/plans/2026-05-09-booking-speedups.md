@@ -119,7 +119,7 @@ Returns True if EITHER the URL match OR the DOM signal fires. Cache the result p
 - `test_find_in_frames_clears_cache_on_invalidation` (e.g., new context)
 **Done when:** find_in_frames performance test shows reduction on subsequent calls.
 
-#### B2.4 — Selector hit telemetry
+#### B2.4 — Selector hit telemetry ✅ Done 2026-05-10 (new `src/selector_metrics.py` with thread-safe in-memory counter + atomic JSON flush; hooks in `checker._check_date` and `booker._click_time_slot` keyed by `slot_button_check`/`slot_button_book`; monitor flushes after every poll outside sniper mode and every 5th poll inside; `--selector-stats` CLI prints top selectors per key; 18 new tests in `test_selector_metrics.py`)
 **Files:** new `src/selector_metrics.py`
 **Approach:** Tiny module with `record_match(key: str, selector: str)` that appends to `selector_metrics.json` (lazy in-memory aggregation, periodic flush). Hook into checker and booker on every successful selector match. Add a CLI flag `--selector-stats` to print top selectors per role.
 **Tests:** standard append-and-read tests; cleanup in `conftest.py`.

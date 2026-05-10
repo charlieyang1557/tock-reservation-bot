@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from playwright.async_api import Locator, Page
 
 import src.selectors as sel
+from src import selector_metrics
 from src.selectors import is_playwright_selector
 from src.config import Config, parse_time
 from src.tracker import SlotTracker
@@ -1033,6 +1034,12 @@ class AvailabilityChecker:
                 logger.info(
                     f"[check] {date_str} — {count} slot(s) found via {found!r}"
                 )
+                # B2.4: telemetry for selector hit-rate analysis. Best-effort —
+                # never let a metrics bug break the booking flow.
+                try:
+                    selector_metrics.record_match("slot_button_check", found)
+                except Exception as exc:
+                    logger.debug(f"[check] selector_metrics.record_match failed: {exc}")
                 return await self._collect_slots_multi(page, target_date, found)
 
             slots = await _detect_and_collect()
