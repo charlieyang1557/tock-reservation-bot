@@ -76,12 +76,14 @@ _SNIPER_HOLD_SEC = 120
 # so the run loop must sleep instead of spinning at sleep(0) — otherwise the
 # poll-rate watchdog escalates within seconds (2026-05-01 19:44 incident:
 # 120 polls in 60s, 4 watchdog trips, PM2 restart loop).  Must match the
-# threshold used in checker.py:406 — they reference the same release boundary.
+# threshold checker.check_all() applies (the `keep_pages and
+# sniper_window_age_sec < 60.0` gate) — same release boundary on both sides.
 _SNIPER_PRE_RELEASE_SEC = 60.0
 # Cap a single pre-release sleep so the loop wakes promptly to cross the
 # release boundary and so tests stay responsive.  0.5s gives ~120 wakeups
-# across the 60s pre-release period — well below the watchdog's 10/5s burst
-# threshold, with plenty of margin.
+# across the 60s pre-release period.  Pre-release polls no longer tick the
+# watchdog (see poll() — _is_pre_release_skip_age gate), so the wake-up count
+# is bounded by sleep duration, not the watchdog ceiling.
 _SNIPER_PRE_RELEASE_TICK_SEC = 0.5
 
 # B2.4: selector-hit telemetry flush cadence inside sniper mode. Sniper polls
@@ -132,8 +134,13 @@ class TockMonitor:
         self._session_dates_prewarmed_for: str | None = None  # "DayName@HH:MM"
 
         # Watchdog: detect pathological poll bursts (see Apr 14 20:14 incident).
-        # Threshold is well above legitimate sniper rate (~1 poll per 3-4s).
-        self._watchdog = PollWatchdog(burst_threshold=10, window_sec=5.0)
+        # Normal-mode threshold (10/5s) is generous around legacy 1-poll/3-4s.
+        # Sniper-mode threshold (60/5s) accommodates calendar-replay polls
+        # (~150 ms each, so 5-10/sec is healthy). enter_sniper_mode()/
+        # exit_sniper_mode() are called when _sniper_active transitions.
+        self._watchdog = PollWatchdog(
+            burst_threshold=10, window_sec=5.0, sniper_burst_threshold=60,
+        )
 
     # ------------------------------------------------------------------
     # Public
@@ -153,8 +160,11 @@ class TockMonitor:
         self.config.dry_run = True
 
         # Force sniper mode on and use a hair-trigger threshold (0%) so even
-        # 1 Cloudflare blip triggers the concurrent→sequential transition
+        # 1 Cloudflare blip triggers the concurrent→sequential transition.
+        # The watchdog must also flip — without enter_sniper_mode() this test
+        # path runs the legacy 10/5s ceiling and trips on calendar-replay rates.
         self._sniper_active = True
+        self._watchdog.enter_sniper_mode()
         self._sniper_concurrent = True
         self._sniper_error_window.clear()
         self._sniper_sequential_clean = 0
@@ -173,14 +183,20 @@ class TockMonitor:
             f"{'='*60}"
         )
 
-        for i in range(1, num_polls + 1):
-            mode = "CONCURRENT" if self._sniper_concurrent else "sequential"
-            logger.info(f"[test-adaptive] ── Poll {i}/{num_polls}  [{mode}] ──")
-            await self.poll()
-            await asyncio.sleep(0)
+        try:
+            for i in range(1, num_polls + 1):
+                mode = "CONCURRENT" if self._sniper_concurrent else "sequential"
+                logger.info(f"[test-adaptive] ── Poll {i}/{num_polls}  [{mode}] ──")
+                await self.poll()
+                await asyncio.sleep(0)
+        finally:
+            # Always tear down — otherwise an exception mid-loop leaves the
+            # watchdog in sniper mode (suppressed sys.exit, 60/5s threshold)
+            # for the remainder of the process.
+            self._SNIPER_ERROR_THRESH = saved_thresh
+            self._sniper_active = False
+            self._watchdog.exit_sniper_mode()
 
-        self._SNIPER_ERROR_THRESH = saved_thresh
-        self._sniper_active = False
         logger.info(
             f"\n{'='*60}\n"
             f"[test-adaptive] Done. Review log above for mode-switch events:\n"
@@ -345,11 +361,23 @@ class TockMonitor:
 
     async def poll(self) -> None:
         """One full check-and-book cycle."""
-        try:
-            self._watchdog.tick()
-        except WatchdogTrip as e:
-            logger.warning(f"[monitor] Watchdog throttled this poll: {e}")
-            return  # skip this cycle; throttle already slept
+        # Cache the sniper age at poll entry. Reading it again in _poll_inner
+        # could land on the other side of the 60s boundary, so the watchdog
+        # skip decision and check_all's pre-release gate would disagree (one
+        # path does real I/O while the other thinks it's a no-op).
+        sniper_age = None
+        if self._sniper_active:
+            sniper_age = self._current_sniper_age_sec(datetime.now(PT))
+
+        # Pre-release sniper polls short-circuit to no I/O. They must NOT
+        # count toward the watchdog — otherwise the ~120 wake-ups across the
+        # 60s pre-release period burn the 3-trip budget while doing zero work.
+        if not self._is_pre_release_skip_age(sniper_age):
+            try:
+                self._watchdog.tick()
+            except WatchdogTrip as e:
+                logger.warning(f"[monitor] Watchdog throttled this poll: {e}")
+                return  # skip this cycle; throttle already slept
         self._poll_count += 1
 
         if self._booking_secured:
@@ -360,7 +388,7 @@ class TockMonitor:
             return
 
         try:
-            await self._poll_inner()
+            await self._poll_inner(sniper_age=sniper_age)
         finally:
             # B2.4: persist selector-hit telemetry. Outside sniper mode polls
             # are 5+ min apart so we always flush; inside sniper mode (~3s
@@ -376,17 +404,18 @@ class TockMonitor:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug(f"[monitor] selector_metrics.flush failed: {exc}")
 
-    async def _poll_inner(self) -> None:
-        """Body of poll() — kept separate so finally can run flushes."""
+    async def _poll_inner(self, sniper_age: float | None) -> None:
+        """Body of poll() — kept separate so finally can run flushes.
+
+        ``sniper_age`` is cached by ``poll()`` at entry (None outside a sniper
+        window). Threading it through here keeps the watchdog skip and the
+        checker's pre-release gate on the same clock read so they can't
+        disagree across the 60s boundary."""
         # --- Availability check ---
         # Sniper mode uses concurrent by default (~34s vs ~133s sequential).
         # If error rate spikes, adaptive logic switches to sequential automatically.
         use_concurrent = self._sniper_active and self._sniper_concurrent
-        sniper_age = 0.0
-        if self._sniper_active:
-            age = self._current_sniper_age_sec(datetime.now(PT))
-            if age is not None:
-                sniper_age = age
+        sniper_age_f = sniper_age if sniper_age is not None else 0.0
 
         # Normal-mode fast path: stop scanning at first slot and hand the
         # live page off to the booker so it can click the already-visible
@@ -406,7 +435,7 @@ class TockMonitor:
             slots = await self.checker.check_all(
                 concurrent=use_concurrent,
                 keep_pages=self._sniper_active,
-                sniper_window_age_sec=sniper_age,
+                sniper_window_age_sec=sniper_age_f,
                 bypass_normal_skip=bypass_normal_skip,
                 notifier=self.notifier,
                 stop_on_first_slot=enable_fast_handoff,
@@ -418,7 +447,7 @@ class TockMonitor:
             return
 
         # --- Adaptive sniper mode switching ---
-        self._apply_adaptive_switching(sniper_age)
+        self._apply_adaptive_switching(sniper_age_f)
 
         if not slots:
             self.notifier.no_slots_found()
@@ -654,6 +683,10 @@ class TockMonitor:
                 # Refresh screenshot count from disk so rotation stays accurate
                 # even when old screenshots from previous runs are on disk
                 self.checker.refresh_screenshot_count()
+                # Lift the watchdog's burst threshold (calendar-replay polls
+                # run 5-10/sec; the normal 10/5s ceiling trips every cycle)
+                # and suppress sys.exit while we're in the window.
+                self._watchdog.enter_sniper_mode()
                 self.notifier.sniper_mode_active(
                     day=day_name,
                     trigger_time=t.strftime("%H:%M"),
@@ -665,6 +698,9 @@ class TockMonitor:
             )
             return 0
         else:
+            if self._sniper_active:
+                # Restore the tighter normal-mode threshold and exit policy
+                self._watchdog.exit_sniper_mode()
             self._sniper_active = False
 
         # 2. Normal release window
@@ -741,6 +777,15 @@ class TockMonitor:
         if age is None or age >= _SNIPER_PRE_RELEASE_SEC:
             return 0.0
         return min(_SNIPER_PRE_RELEASE_SEC - age, _SNIPER_PRE_RELEASE_TICK_SEC)
+
+    def _is_pre_release_skip_age(self, age: float | None) -> bool:
+        """True if a poll with this cached age would short-circuit in
+        checker.check_all() (sniper active, age < _SNIPER_PRE_RELEASE_SEC).
+        Caller passes the age it read at poll entry so the watchdog skip
+        decision and check_all's pre-release gate agree on the same clock."""
+        if not self._sniper_active:
+            return False
+        return age is not None and age < _SNIPER_PRE_RELEASE_SEC
 
     def _seconds_until_next_sniper(self) -> float | None:
         """
