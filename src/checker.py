@@ -265,6 +265,13 @@ class AvailabilityChecker:
         # prewarm has run yet.
         self._last_prewarm_cf_challenges: int = 0
         self._last_prewarm_attempts: int = 0
+        # Count of completed sniper scans this window. Drives the
+        # _compute_cal_timeout warmup ramp: scans 1-2 wait 12s for the
+        # calendar to render (peak release traffic), scan 3+ tightens to
+        # 5s. Reset by close_sniper_pages() between windows. Incremented
+        # in check_all() AFTER the pre-release gate, so pre-release ticks
+        # don't burn through the warmup budget.
+        self._sniper_scan_count: int = 0
         # Sniper-phase CF challenge counters. Reset per sniper window via
         # close_sniper_pages(). Tracked separately from prewarm counters
         # because they signal different operational risks.
@@ -295,6 +302,16 @@ class AvailabilityChecker:
     # tries in case of transient network blip" without "every poll
     # incurs init+fetch cost on a known-broken auth path".
     _REPLAY_FAILURE_THRESHOLD: int = 3
+
+    # Calendar-render wait budgets used by _compute_cal_timeout. The
+    # warmup budget covers scans 1-2 of a sniper window; tuned against
+    # the 5/22 8 PM Fuhuihua release where 9/14 dates timed out on
+    # scan #1 because page.reload() of 6 pre-warmed pages contended
+    # with Tock's release-moment latency spike.
+    _SNIPER_WARMUP_SCANS: int = 2
+    _SNIPER_WARMUP_CAL_TIMEOUT_MS: int = 12000
+    _SNIPER_STEADY_CAL_TIMEOUT_MS: int = 5000
+    _NORMAL_CAL_TIMEOUT_MS: int = 15000
 
     async def _try_calendar_replay(
         self, sniper_mode: bool
@@ -509,7 +526,25 @@ class AvailabilityChecker:
         self._skip_dates.clear()
         self._sniper_cf_challenges = 0
         self._sniper_cf_attempts = 0
+        self._sniper_scan_count = 0
         logger.debug("[check] Sniper pages closed.")
+
+    def _compute_cal_timeout(self, keep_page: bool) -> int:
+        """Calendar-render wait budget for the current scan.
+
+        Non-sniper polls keep the existing 15 s budget. Sniper polls use a
+        12 s warmup budget for the first two scans of the window, then
+        drop to 5 s for steady-state so the poll-rate stays high.
+
+        The counter is incremented in check_all() AFTER the pre-release
+        gate (sniper_window_age_sec >= 60s), so warmup is spent on real
+        scans rather than pre-release no-ops.
+        """
+        if not keep_page:
+            return self._NORMAL_CAL_TIMEOUT_MS
+        if self._sniper_scan_count <= self._SNIPER_WARMUP_SCANS:
+            return self._SNIPER_WARMUP_CAL_TIMEOUT_MS
+        return self._SNIPER_STEADY_CAL_TIMEOUT_MS
 
     def pop_handoff_page(self, date_str: str) -> "Page | None":
         """Remove and return the normal-mode handoff page for *date_str*.
@@ -917,6 +952,17 @@ class AvailabilityChecker:
             )
             preferred_slots = await _scan_dates(preferred_dates)
 
+            # Tick the warmup counter only AFTER the legacy per-date scan
+            # actually returned. Two failure modes this ordering protects:
+            #   1. Codex MEDIUM — replay-success bypasses _scan_dates by
+            #      early-returning above, so the counter stays put and the
+            #      first reload after a replay failure still gets 12s.
+            #   2. Review M-1 — if _scan_dates raises (browser disconnect,
+            #      CancelledError, etc.), the counter stays put so the
+            #      user still has two real warmup attempts to spend.
+            if keep_pages:
+                self._sniper_scan_count += 1
+
             fallback_dates = self._get_target_dates(
                 self.config.fallback_days, sniper_mode=sniper_horizon
             )
@@ -1116,8 +1162,11 @@ class AvailabilityChecker:
             if abort_event is not None and abort_event.is_set():
                 return []
 
-            # Wait for calendar to render (shorter timeout in sniper mode)
-            cal_timeout = 5000 if keep_page else 15000
+            # Wait for calendar to render. Sniper mode uses a 12s warmup
+            # budget for the first 2 scans of the window (peak release
+            # traffic spike); see _compute_cal_timeout. Steady state drops
+            # to 5s so poll-rate stays high. Normal mode keeps 15s.
+            cal_timeout = self._compute_cal_timeout(keep_page)
             if not await self._wait_for_calendar(page, date_str, timeout=cal_timeout):
                 return []
 

@@ -119,7 +119,13 @@ class TockMonitor:
         self._sniper_concurrent = True          # current mode for sniper polls
         self._sniper_error_window: list[float] = []  # rolling error rates (last N polls)
         self._SNIPER_WINDOW_SIZE   = 3    # look at last 3 polls to decide
-        self._SNIPER_ERROR_THRESH  = 0.20 # >20% errors → switch to sequential
+        # >30% errors → switch to sequential. Bumped from 0.20 after the
+        # 5/22 Fri Fuhuihua release windows showed 3-poll mode-flapping
+        # caused by routine 3/14 (21%) timeout bursts that look like CDN
+        # noise but are not the failure mode we should degrade for.
+        # 30% requires 5/14 sustained, which matches real Cloudflare-side
+        # problems worth giving up concurrency for.
+        self._SNIPER_ERROR_THRESH  = 0.30
         self._SNIPER_RECOVER_POLLS = 3    # consecutive clean sequential polls → try concurrent again
         self._sniper_sequential_clean = 0  # consecutive clean polls in sequential mode
 
@@ -592,8 +598,15 @@ class TockMonitor:
         if len(self._sniper_error_window) > self._SNIPER_WINDOW_SIZE:
             self._sniper_error_window.pop(0)
         rolling_rate = sum(self._sniper_error_window) / len(self._sniper_error_window)
+        # Codex HIGH: require a full sample window before any flip. With
+        # only 1-2 samples the rolling average is the single (or pair of)
+        # post-release polls — exactly the spike pattern the 5/22 incident
+        # showed, where one bad poll out of one immediately degraded the
+        # bot. Wait until we have N samples so 'rolling' actually means
+        # rolling.
+        window_full = len(self._sniper_error_window) >= self._SNIPER_WINDOW_SIZE
 
-        if self._sniper_concurrent and rolling_rate > self._SNIPER_ERROR_THRESH:
+        if self._sniper_concurrent and window_full and rolling_rate > self._SNIPER_ERROR_THRESH:
             self._sniper_concurrent = False
             self._sniper_sequential_clean = 0
             logger.warning(

@@ -72,18 +72,24 @@ def test_no_degradation_before_release():
 
 
 def test_degradation_after_release():
-    """100% errors at sniper_age=90s MUST degrade to sequential mode."""
+    """Sustained 100%-error polls at sniper_age >= 60s MUST degrade to
+    sequential mode. Codex HIGH (5/22 incident): the flip requires a full
+    rolling window, so we feed _SNIPER_WINDOW_SIZE samples to confirm the
+    degradation path still works once the gate is satisfied."""
     monitor = _make_monitor()
     monitor._SNIPER_ERROR_THRESH = 0.0  # any error triggers switch
-    monitor._apply_adaptive_switching(sniper_age=90.0)
+    for _ in range(monitor._SNIPER_WINDOW_SIZE):
+        monitor._apply_adaptive_switching(sniper_age=90.0)
     assert monitor._sniper_concurrent is False
 
 
 def test_boundary_exactly_60s():
-    """sniper_age=60.0 is post-release — errors should count."""
+    """sniper_age=60.0 is post-release — errors should count once the
+    rolling window has filled."""
     monitor = _make_monitor()
     monitor._SNIPER_ERROR_THRESH = 0.0
-    monitor._apply_adaptive_switching(sniper_age=60.0)
+    for _ in range(monitor._SNIPER_WINDOW_SIZE):
+        monitor._apply_adaptive_switching(sniper_age=60.0)
     assert monitor._sniper_concurrent is False
 
 
