@@ -15,6 +15,7 @@ Tests pin the timeout schedule itself plus the counter lifecycle
 (increment per real scan; do NOT increment during pre-release ticks; reset
 between sniper windows).
 """
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -132,75 +133,118 @@ async def test_normal_mode_does_not_increment_sniper_counter():
 @pytest.mark.asyncio
 async def test_close_sniper_pages_resets_counter():
     """When the sniper window ends, the counter resets so the next window
-    starts fresh in warmup mode."""
+    starts fresh in warmup mode. The replay-diag poll throttle also resets so
+    the 'first poll of each window logs' intent holds for EVERY window."""
     checker = _make_checker()
     checker._sniper_scan_count = 7
+    checker._replay_diag_poll_count = 9
     await checker.close_sniper_pages()
     assert checker._sniper_scan_count == 0
+    assert checker._replay_diag_poll_count == 0
 
 
 # ---------------------------------------------------------------------------
-# Codex MEDIUM: replay-success must not consume the page-scan warmup budget
+# Post-release replay-first / DOM-fallback (fix/replay-parallel-capture):
+# when replay returns EMPTY, the DOM scan runs as the safety net on EVERY
+# post-release sniper poll, so the warmup counter ticks per poll. The Codex
+# MEDIUM "replay-success skips the page path" contract still holds for the
+# replay-FOUND case (DOM is skipped then — see the parallel-capture suite),
+# but on the empty-replay path DOM always runs. The warmup budget is spent on
+# the first 2 real DOM scans (the release-moment scans), so the spirit of the
+# 12s warmup survives; it is simply applied from poll #1.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_replay_success_does_not_burn_warmup_budget():
-    """When USE_CALENDAR_REPLAY is on and the replay fast-path succeeds,
-    no page reload happened. The 12s warmup budget exists to absorb the
-    release-moment latency spike on the FIRST per-date page scan. If the
-    counter ticks during replay-success polls, the first real legacy
-    fallback gets the 5s steady-state budget — exactly the failure mode
-    this change is meant to fix. Codex MEDIUM finding."""
+async def test_post_release_empty_replay_runs_dom_and_ticks_warmup_per_poll():
+    """Post-release sniper with replay returning EMPTY runs the DOM scan as
+    the safety net, so _check_date is called and the warmup counter ticks
+    each poll. With exactly one preferred date and no fallback, each poll
+    invokes _check_date EXACTLY once → after two polls call_count == 2 and
+    the counter == 2. Pins the per-poll behavior precisely (not just >= 1)."""
     checker = _make_checker()
     checker.config.use_calendar_replay = True
+    # Deterministic target set: exactly one preferred date, no fallback, so
+    # each post-release poll runs _check_date EXACTLY once (no calendar-date
+    # flakiness from how many Fridays land in the horizon).
+    target = date.today() + timedelta(days=14)
+    checker._get_target_dates = (  # type: ignore[method-assign]
+        lambda days, sniper_mode=False: [target] if "Friday" in days else []
+    )
     with patch.object(
         checker, "_try_calendar_replay",
         new_callable=AsyncMock, return_value=[],
     ), patch.object(
-        checker, "_check_date", new_callable=AsyncMock,
+        checker, "_check_date", new_callable=AsyncMock, return_value=[],
     ) as mock_check_date:
-        # Two replay-success polls — the legacy page path never ran
+        # Poll 1
         await checker.check_all(
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )
+        assert mock_check_date.call_count == 1, (
+            "first post-release poll must run the DOM scan exactly once "
+            "(one preferred date, no fallback)"
+        )
+        assert checker._sniper_scan_count == 1
+        # Poll 2
         await checker.check_all(
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )
-        mock_check_date.assert_not_called()
-    assert checker._sniper_scan_count == 0, (
-        f"Replay-success polls should not burn the page-scan warmup budget; "
-        f"counter was {checker._sniper_scan_count}"
+        assert mock_check_date.call_count == 2, (
+            "second post-release poll must run the DOM scan exactly once more"
+        )
+    assert checker._sniper_scan_count == 2, (
+        f"Each post-release empty-replay poll runs one real DOM scan → "
+        f"counter ticks per poll; counter was {checker._sniper_scan_count}"
     )
 
 
 @pytest.mark.asyncio
-async def test_replay_success_then_fallback_gets_warmup_timeout():
-    """End-to-end of Codex's MEDIUM scenario: replay succeeds for the
-    first two polls, then fails on poll 3 and falls back to per-date
-    scans. The first real per-date scan must still see the 12s warmup
-    timeout, not the 5s steady-state one."""
+async def test_post_release_replay_found_skips_dom_and_does_not_tick_warmup():
+    """The HIGH-fix companion: when replay FINDS a slot, the DOM scan is NOT
+    run, so _check_date is never called and the warmup counter does NOT tick
+    (the slow DOM path is bypassed entirely on the fast path)."""
+    from src.checker import AvailableSlot
+
+    checker = _make_checker()
+    checker.config.use_calendar_replay = True
+    target = date.today() + timedelta(days=14)
+    checker._get_target_dates = (  # type: ignore[method-assign]
+        lambda days, sniper_mode=False: [target] if "Friday" in days else []
+    )
+    found = [AvailableSlot(
+        slot_date=target, slot_time="8:00 PM", day_of_week="Friday",
+    )]
+    with patch.object(
+        checker, "_try_calendar_replay",
+        new_callable=AsyncMock, return_value=found,
+    ), patch.object(
+        checker, "_check_date", new_callable=AsyncMock, return_value=[],
+    ) as mock_check_date:
+        await checker.check_all(
+            concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
+        )
+    mock_check_date.assert_not_called()
+    assert checker._sniper_scan_count == 0, (
+        "replay fast path must not tick the DOM warmup counter"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_release_first_dom_scan_gets_warmup_timeout():
+    """The FIRST post-release DOM scan (which now runs from poll #1, in
+    parallel with replay) must get the 12s warmup calendar budget to absorb
+    the release-moment latency spike — not the 5s steady-state one."""
     checker = _make_checker()
     checker.config.use_calendar_replay = True
 
-    # First two polls: replay succeeds (returns empty list)
+    # Before any scan, the counter is 0 → warmup applies to the next scan.
+    assert checker._sniper_scan_count == 0
+    assert checker._compute_cal_timeout(keep_page=True) == 12000
+
+    # First post-release poll: replay empty, DOM runs in parallel.
     with patch.object(
         checker, "_try_calendar_replay",
         new_callable=AsyncMock, return_value=[],
-    ), patch.object(checker, "_check_date", new_callable=AsyncMock):
-        await checker.check_all(
-            concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
-        )
-        await checker.check_all(
-            concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
-        )
-
-    # Counter must still be 0 — replay never touched a page
-    assert checker._sniper_scan_count == 0
-
-    # Third poll: replay fails (returns None) → legacy path runs
-    with patch.object(
-        checker, "_try_calendar_replay",
-        new_callable=AsyncMock, return_value=None,
     ), patch.object(
         checker, "_check_date", new_callable=AsyncMock, return_value=[],
     ):
@@ -208,12 +252,12 @@ async def test_replay_success_then_fallback_gets_warmup_timeout():
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )
 
-    # Now the counter has ticked exactly once (this is the first real scan)
+    # Counter ticked once for this first real DOM scan.
     assert checker._sniper_scan_count == 1
-    # … and the calendar-wait budget for it must be the warmup 12s
+    # Scan #2's budget is still the warmup 12s (warmup covers scans 1-2).
     assert checker._compute_cal_timeout(keep_page=True) == 12000, (
-        "First real page scan after replay fallback must still get the "
-        "12s warmup; otherwise the release-spike timeout returns"
+        "First two real DOM scans must get the 12s warmup; otherwise the "
+        "release-spike timeout returns"
     )
 
 

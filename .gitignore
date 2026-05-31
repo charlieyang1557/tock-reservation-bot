@@ -47,6 +47,7 @@ selector_metrics.json
 selector_metrics.json.tmp
 xhr_telemetry.jsonl
 booking_uncertain.archive/
+replay_captures/
 
 # === Phase C HTTP spike (operator-run, holds live auth tokens) ===
 spikes/http_replay/trace.json
@@ -78,3 +79,4 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+.codextmp/
