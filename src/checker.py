@@ -43,6 +43,15 @@ os.makedirs(_SCREENSHOT_ERROR_DIR, exist_ok=True)
 # Error screenshots (saved to _SCREENSHOT_ERROR_DIR) are NEVER deleted.
 MAX_DEBUG_SCREENSHOTS = 50
 
+# Replay-miss capture directory (gitignored). When the DOM scan finds slots
+# a replay poll missed, the raw protobuf body is dumped here so the
+# ghost-slot thresholds in calendar_replay.py can be re-tuned from REAL
+# fuhuihua release bytes (we have none today — see fix/replay-parallel-capture).
+# Module-level (not per-instance) so tests can monkeypatch it to a tmp dir.
+_REPLAY_CAPTURE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "replay_captures"
+)
+
 # Non-sniper skip cache TTL: 20 minutes.  Dates whose calendar day was not
 # visible are skipped for this long before being retried.  This avoids
 # spending ~15s per "day not visible" date on every normal poll cycle.
@@ -291,6 +300,26 @@ class AvailabilityChecker:
         # known-broken auth/headers while the legacy path runs each poll.
         self._replay_failure_count: int = 0
         self._replay_circuit_open: bool = False
+        # Raw protobuf body + parse diagnostics from the MOST RECENT replay
+        # fetch this poll. Stashed by _try_calendar_replay so the post-release
+        # replay-first detect path can (a) log calibration diagnostics on the
+        # replay-empty branch and (b) fall back to dumping this body when a
+        # fresh re-fetch is unavailable. Reset to None at the start of each
+        # _try_calendar_replay so a stale body from a prior poll is never
+        # dumped/logged. _last_replay_diag stays None when the fetch failed
+        # before parsing (None body / circuit open / init failure).
+        self._last_replay_body: bytes | None = None
+        from src.calendar_replay import ReplayParseDiag  # local: avoid cycle
+        self._last_replay_diag: "ReplayParseDiag | None" = None
+        # Replay-miss capture is rate-limited to once per sniper window. A
+        # "window" is the span where keep_pages stays True; reset to False by
+        # close_sniper_pages()/close_replay_session() at window end so the next
+        # window can capture again.
+        self._replay_capture_dumped_this_window: bool = False
+        # Throttle for the per-poll replay-diag INFO line (sniper polls are
+        # ~7/sec; logging every one would flood). Logged every Nth post-release
+        # poll — see _REPLAY_DIAG_LOG_EVERY_N.
+        self._replay_diag_poll_count: int = 0
 
     # ------------------------------------------------------------------
     # Public
@@ -302,6 +331,13 @@ class AvailabilityChecker:
     # tries in case of transient network blip" without "every poll
     # incurs init+fetch cost on a known-broken auth path".
     _REPLAY_FAILURE_THRESHOLD: int = 3
+
+    # Replay diagnostics are logged at INFO every Nth post-release sniper
+    # poll. Sniper polls fire ~7/sec, so N=10 keeps the calibration signal
+    # (body length, date hits, sections passed/filtered) visible in bot.log
+    # at roughly once/sec without flooding. The FIRST post-release poll of a
+    # window always logs (poll_count starts at 0 → 0 % 10 == 0).
+    _REPLAY_DIAG_LOG_EVERY_N: int = 10
 
     # Calendar-render wait budgets used by _compute_cal_timeout. The
     # warmup budget covers scans 1-2 of a sniper window; tuned against
@@ -332,8 +368,14 @@ class AvailabilityChecker:
         """
         from src.calendar_replay import (
             initialize_replay_session, fetch_calendar,
-            parse_available_slots, close_session, cap_slots_per_date,
+            parse_with_diagnostics, close_session, cap_slots_per_date,
         )
+
+        # Fresh poll: clear last poll's stashed body/diag so the post-release
+        # replay-first detect path never logs or dumps a stale body when THIS
+        # poll's fetch fails before producing one.
+        self._last_replay_body = None
+        self._last_replay_diag = None
 
         # Codex MEDIUM 4: circuit breaker — if we've failed enough times
         # this sniper window, stop trying replay until close_replay_session
@@ -400,11 +442,17 @@ class AvailabilityChecker:
                     f"{self._replay_failure_count} consecutive failures."
                 )
             return None
+        # Stash the raw body BEFORE parsing so the post-release replay-first
+        # detect path can fall back to dumping it for calibration (when a
+        # fresh re-fetch is unavailable) even if it parses to zero slots.
+        self._last_replay_body = body
         try:
-            slots = parse_available_slots(body, target_dates)
+            slots, self._last_replay_diag = parse_with_diagnostics(
+                body, target_dates
+            )
         except Exception as e:
             logger.error(
-                f"[check-replay] parse_available_slots raised: "
+                f"[check-replay] parse_with_diagnostics raised: "
                 f"{type(e).__name__}: {e}"
             )
             self._replay_failure_count += 1
@@ -436,6 +484,10 @@ class AvailabilityChecker:
         # Reset circuit-breaker state for the next sniper window
         self._replay_failure_count = 0
         self._replay_circuit_open = False
+        # Window boundary: re-arm the once-per-window replay-miss capture and
+        # the "first poll of the window logs" diag throttle.
+        self._replay_capture_dumped_this_window = False
+        self._replay_diag_poll_count = 0
         await close_session(sess)
 
     def clear_skip_cache(self) -> None:
@@ -527,6 +579,10 @@ class AvailabilityChecker:
         self._sniper_cf_challenges = 0
         self._sniper_cf_attempts = 0
         self._sniper_scan_count = 0
+        # Window boundary: allow the next window to capture a replay-miss again
+        # and re-arm the "first poll of the window logs" diag throttle.
+        self._replay_capture_dumped_this_window = False
+        self._replay_diag_poll_count = 0
         logger.debug("[check] Sniper pages closed.")
 
     def _compute_cal_timeout(self, keep_page: bool) -> int:
@@ -843,46 +899,6 @@ class AvailabilityChecker:
         self._wait_for_calendar = _counting_wait  # type: ignore[method-assign]
 
         try:
-            # B3.2 fast-path: SPA-header replay (76× detection speedup).
-            # When enabled, fetch the entire calendar via one in-browser
-            # fetch() call (~160ms) instead of N concurrent page reloads.
-            # On any failure (None body, parse exception, session not
-            # initialized): set last_errors=1 to mark the path failed and
-            # fall through to the existing per-date scan.
-            if getattr(self.config, "use_calendar_replay", False):
-                replay_slots = await self._try_calendar_replay(
-                    sniper_mode=keep_pages
-                )
-                if replay_slots is not None:
-                    # Success — track + return without running the
-                    # per-date scan.
-                    for slot in replay_slots:
-                        try:
-                            if keep_pages:
-                                self.tracker.record_deferred(
-                                    slot.slot_date, slot.slot_time
-                                )
-                            else:
-                                self.tracker.record(
-                                    slot.slot_date, slot.slot_time
-                                )
-                        except Exception as e:
-                            logger.debug(
-                                f"[check] tracker.record failed: {e}"
-                            )
-                    self.last_errors = 0
-                    self.last_checks = 1  # one fetch represents the whole scan
-                    logger.info(
-                        f"[check-replay] {len(replay_slots)} slot(s) via "
-                        f"calendar-replay fast-path"
-                    )
-                    return replay_slots
-                # Replay returned None: log and fall through to legacy path
-                logger.warning(
-                    "[check-replay] fast-path failed this poll; falling "
-                    "back to per-date page-reload scan"
-                )
-
             async def _scan_dates(dates: list[date]) -> list[AvailableSlot]:
                 if not dates:
                     return []
@@ -942,82 +958,302 @@ class AvailabilityChecker:
                             break
                     return slots
 
-            # Sniper mode implies the tighter scan window (Tock releases ≤2 wks).
-            # `keep_pages` is the existing flag that signals sniper mode in this
-            # method — alias it explicitly so future readers don't have to trace
-            # the coupling.
-            sniper_horizon = keep_pages
-            preferred_dates = self._get_target_dates(
-                self.config.preferred_days, sniper_mode=sniper_horizon
-            )
-            preferred_slots = await _scan_dates(preferred_dates)
+            async def _two_phase_dom_scan() -> list[AvailableSlot]:
+                """The authoritative per-date DOM scan (Phase 1 preferred →
+                Phase 2 fallback). Sets self.last_errors / self.last_checks
+                from the DOM scan's own counters, ticks the sniper warmup
+                counter, and fires sniper-phase CF alerts. Returns the slots.
 
-            # Tick the warmup counter only AFTER the legacy per-date scan
-            # actually returned. Two failure modes this ordering protects:
-            #   1. Codex MEDIUM — replay-success bypasses _scan_dates by
-            #      early-returning above, so the counter stays put and the
-            #      first reload after a replay failure still gets 12s.
-            #   2. Review M-1 — if _scan_dates raises (browser disconnect,
-            #      CancelledError, etc.), the counter stays put so the
-            #      user still has two real warmup attempts to spend.
-            if keep_pages:
-                self._sniper_scan_count += 1
-
-            fallback_dates = self._get_target_dates(
-                self.config.fallback_days, sniper_mode=sniper_horizon
-            )
-            total_dates = len(preferred_dates) + len(fallback_dates)
-
-            if preferred_slots:
-                self.last_errors = errors[0]
-                self.last_checks = len(preferred_dates)
-                logger.info(
-                    f"Scan complete — {len(preferred_slots)} slot(s) found "
-                    f"across {len(preferred_dates)} preferred date(s)"
+                Extracted from the inline body so BOTH the normal path and
+                the post-release replay-first detect path (as its DOM
+                fallback) can drive it without duplicating the two-phase +
+                counter + CF-alert logic.
+                """
+                # Sniper mode implies the tighter scan window (Tock releases
+                # ≤2 wks). `keep_pages` is the existing flag that signals
+                # sniper mode in this method — alias it explicitly so future
+                # readers don't have to trace the coupling.
+                sniper_horizon = keep_pages
+                preferred_dates = self._get_target_dates(
+                    self.config.preferred_days, sniper_mode=sniper_horizon
                 )
-                result_slots = preferred_slots
-            elif not fallback_dates:
-                self.last_errors = errors[0]
-                self.last_checks = len(preferred_dates)
-                logger.info(
-                    f"Scan complete — 0 slot(s) found across "
-                    f"{len(preferred_dates)} date(s) (no fallback days configured)"
-                )
-                result_slots = []
-            else:
-                fallback_slots = await _scan_dates(fallback_dates)
-                self.last_errors = errors[0]
-                self.last_checks = total_dates
-                logger.info(
-                    f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
-                    f"across {total_dates} date(s) total "
-                    f"(0 preferred + {len(fallback_slots)} fallback)"
-                )
-                result_slots = fallback_slots
+                preferred_slots = await _scan_dates(preferred_dates)
 
-            # Sniper-phase CF alerting (Codex pass 2). Independent of prewarm CF.
-            if (
-                keep_pages
-                and self._sniper_cf_attempts > 0
-                and notifier is not None
-            ):
-                sniper_rate = self._sniper_cf_challenges / max(1, self._sniper_cf_attempts)
-                if sniper_rate > _CF_CHALLENGE_ALERT_THRESHOLD:
-                    try:
-                        notifier.cf_challenge_warning(
-                            rate=sniper_rate,
-                            count=self._sniper_cf_challenges,
-                            phase="sniper",
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"[check] sniper cf_challenge_warning failed: {e}"
-                        )
+                # Tick the warmup counter only AFTER the per-date scan
+                # actually returned. Two failure modes this ordering protects:
+                #   1. Codex MEDIUM — replay-success bypasses _scan_dates by
+                #      early-returning, so the counter stays put and the first
+                #      reload after a replay failure still gets 12s.
+                #   2. Review M-1 — if _scan_dates raises (browser disconnect,
+                #      CancelledError, etc.), the counter stays put so the user
+                #      still has two real warmup attempts to spend.
+                if keep_pages:
+                    self._sniper_scan_count += 1
 
-            return result_slots
+                fallback_dates = self._get_target_dates(
+                    self.config.fallback_days, sniper_mode=sniper_horizon
+                )
+                total_dates = len(preferred_dates) + len(fallback_dates)
+
+                if preferred_slots:
+                    self.last_errors = errors[0]
+                    self.last_checks = len(preferred_dates)
+                    logger.info(
+                        f"Scan complete — {len(preferred_slots)} slot(s) found "
+                        f"across {len(preferred_dates)} preferred date(s)"
+                    )
+                    result_slots = preferred_slots
+                elif not fallback_dates:
+                    self.last_errors = errors[0]
+                    self.last_checks = len(preferred_dates)
+                    logger.info(
+                        f"Scan complete — 0 slot(s) found across "
+                        f"{len(preferred_dates)} date(s) (no fallback days configured)"
+                    )
+                    result_slots = []
+                else:
+                    fallback_slots = await _scan_dates(fallback_dates)
+                    self.last_errors = errors[0]
+                    self.last_checks = total_dates
+                    logger.info(
+                        f"Scan complete — {len(fallback_slots)} fallback slot(s) found "
+                        f"across {total_dates} date(s) total "
+                        f"(0 preferred + {len(fallback_slots)} fallback)"
+                    )
+                    result_slots = fallback_slots
+
+                # Sniper-phase CF alerting (Codex pass 2). Independent of prewarm CF.
+                if (
+                    keep_pages
+                    and self._sniper_cf_attempts > 0
+                    and notifier is not None
+                ):
+                    sniper_rate = self._sniper_cf_challenges / max(1, self._sniper_cf_attempts)
+                    if sniper_rate > _CF_CHALLENGE_ALERT_THRESHOLD:
+                        try:
+                            notifier.cf_challenge_warning(
+                                rate=sniper_rate,
+                                count=self._sniper_cf_challenges,
+                                phase="sniper",
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[check] sniper cf_challenge_warning failed: {e}"
+                            )
+
+                return result_slots
+
+            # ── Detection dispatch ───────────────────────────────────────
+            # POST-RELEASE sniper window (keep_pages AND age >= 60s, the same
+            # boundary as the pre-release skip above) is the ONLY place where
+            # a false negative is catastrophic: a real release sells out in
+            # seconds. There we run replay-FIRST and, ONLY if replay comes
+            # back empty/None, fall back to the reliable DOM scan — so a found
+            # replay slot is booked immediately (~160ms) without waiting on the
+            # multi-second DOM scan, AND an empty/wrong replay can never
+            # suppress the DOM safety net (the 2026-05-29 incident). Everywhere
+            # else, replay is the same pure fast-path: replay-if-on-else-DOM,
+            # early-return on success.
+            use_replay = getattr(self.config, "use_calendar_replay", False)
+            post_release_sniper = keep_pages and sniper_window_age_sec >= 60.0
+
+            if use_replay and post_release_sniper:
+                return await self._replay_first_detect(
+                    _two_phase_dom_scan, keep_pages=keep_pages
+                )
+
+            if use_replay:
+                # Normal mode (and any non-sniper caller): existing
+                # replay-if-on-else-DOM behavior — unchanged.
+                replay_slots = await self._try_calendar_replay(
+                    sniper_mode=keep_pages
+                )
+                if replay_slots is not None:
+                    self._record_slots(replay_slots, keep_pages=keep_pages)
+                    self.last_errors = 0
+                    self.last_checks = 1  # one fetch represents the whole scan
+                    logger.info(
+                        f"[check-replay] {len(replay_slots)} slot(s) via "
+                        f"calendar-replay fast-path"
+                    )
+                    return replay_slots
+                # Replay returned None: log and fall through to legacy path
+                logger.warning(
+                    "[check-replay] fast-path failed this poll; falling "
+                    "back to per-date page-reload scan"
+                )
+
+            # No replay (flag off) or replay returned None → DOM scan.
+            return await _two_phase_dom_scan()
 
         finally:
             self._wait_for_calendar = original_wait  # type: ignore[method-assign]
+
+    def _record_slots(self, slots: list["AvailableSlot"], keep_pages: bool) -> None:
+        """Record each slot in the tracker (deferred I/O during sniper).
+        Best-effort — a tracker hiccup must never abort detection."""
+        for slot in slots:
+            try:
+                if keep_pages:
+                    self.tracker.record_deferred(slot.slot_date, slot.slot_time)
+                else:
+                    self.tracker.record(slot.slot_date, slot.slot_time)
+            except Exception as e:
+                logger.debug(f"[check] tracker.record failed: {e}")
+
+    async def _replay_first_detect(
+        self, dom_scan, keep_pages: bool
+    ) -> list["AvailableSlot"]:
+        """Post-release sniper detection: replay-FIRST, DOM-FALLBACK.
+
+        The objective is ONE reservation, and a real fuhuihua release sells
+        out in seconds, so latency is everything:
+
+          1. Try replay (~160ms). If it returns a non-empty slot list, RECORD
+             and RETURN it immediately — book NOW. The slow DOM scan does NOT
+             run. (This is the whole point of replay; the earlier gather-based
+             design waited for BOTH and so blocked booking behind the
+             multi-second DOM scan even when replay had already found a slot.)
+
+          2. If replay returns [] (empty-but-valid — its ghost-slot guards,
+             calibrated on benu, can silently filter a real release) OR None
+             (init/fetch/parse failure), run the authoritative DOM scan (the
+             safety net) and return its result. This is the ONLY path the DOM
+             scan runs on, so an empty/wrong replay can never suppress it
+             (the 2026-05-29 incident).
+
+        last_errors/last_checks:
+          - Fast path (replay found slots): set to errors=0, checks=1
+            ("one fetch represents the whole scan"), matching the normal-mode
+            replay fast-path accounting.
+          - Fallback path: _two_phase_dom_scan sets them from the DOM scan's
+            own counters as its last act, so the monitor's adaptive
+            concurrent↔sequential logic keeps reasoning about the DOM error
+            rate (replay has its own circuit breaker).
+
+        Capture: on the fallback path, if the DOM scan FOUND slots but replay
+        was empty this poll, _capture_replay_miss() SYNCHRONOUSLY dumps the
+        body the poll already stashed (the exact bytes the parser wrongly
+        returned empty for) for offline ghost-slot threshold calibration — no
+        network re-fetch, which would delay booking (codex HIGH).
+        """
+        replay_res = await self._try_calendar_replay(sniper_mode=keep_pages)
+
+        # FAST PATH — replay found a slot. Book it now; skip DOM entirely.
+        if replay_res:
+            self._record_slots(replay_res, keep_pages=keep_pages)
+            self.last_errors = 0
+            self.last_checks = 1  # one fetch represents the whole scan
+            logger.info(
+                f"[check-replay] {len(replay_res)} slot(s) via calendar-replay "
+                "fast-path (post-release) — DOM scan skipped"
+            )
+            return replay_res
+
+        # FALLBACK PATH — replay empty ([]) or failed (None). Run the DOM
+        # safety net. replay_failed distinguishes the two for instrumentation.
+        replay_failed = replay_res is None
+        logger.info(
+            "[check-replay] post-release replay returned "
+            f"{'None (failed)' if replay_failed else 'empty'} — running DOM "
+            "safety-net scan"
+        )
+
+        dom_slots = await dom_scan()
+
+        # Instrumentation: we're otherwise blind to WHY replay returns 0.
+        # Fires on EXACTLY this (the replay-empty/failed) path — the one we
+        # need to recalibrate the ghost-slot guards from.
+        self._log_replay_diag(replay_failed=replay_failed)
+
+        # Replay-miss capture: replay missed but DOM found slots. Dump the
+        # body THIS poll already stashed (the one the parser just wrongly
+        # returned empty for — exactly the calibration sample we want). This
+        # is a synchronous, sub-millisecond file write — NOT a network
+        # re-fetch, which would delay booking slots that sell out in seconds
+        # (codex HIGH). Rate-limited to once per window.
+        if dom_slots:
+            logger.error(
+                f"[replay-miss] DOM found {len(dom_slots)} slot(s) replay "
+                "missed — dumping the poll's stashed body for calibration"
+            )
+            self._capture_replay_miss()
+
+        return dom_slots
+
+    def _log_replay_diag(self, replay_failed: bool) -> None:
+        """Log replay parse diagnostics at INFO, throttled to every Nth
+        post-release poll (sniper polls are frequent). Surfaces body length,
+        date-string hits, and how many date sections the size/time guards
+        passed vs filtered — the signal we need to recalibrate thresholds.
+        """
+        self._replay_diag_poll_count += 1
+        if (self._replay_diag_poll_count - 1) % self._REPLAY_DIAG_LOG_EVERY_N != 0:
+            return
+        diag = self._last_replay_diag
+        if diag is None:
+            body_len = len(self._last_replay_body) if self._last_replay_body else 0
+            logger.info(
+                f"[replay-diag] no parse this poll "
+                f"(replay_failed={replay_failed}, body_len={body_len})"
+            )
+            return
+        logger.info(
+            f"[replay-diag] body_len={diag.body_len} date_hits={diag.date_hits} "
+            f"unique_dates={diag.unique_dates} sections_passed={diag.sections_passed} "
+            f"sections_filtered={diag.sections_filtered}"
+        )
+
+    def _capture_replay_miss(self) -> None:
+        """Dump the poll's stashed replay body for offline ghost-slot
+        calibration when DOM beat replay on a post-release poll. Rate-limited
+        to once per sniper window via _replay_capture_dumped_this_window
+        (reset at window end). Synchronous + best-effort — must NOT delay
+        booking and must never raise.
+
+        _last_replay_body is THIS poll's body — the exact bytes the parser
+        just wrongly returned empty for — so it's precisely the calibration
+        sample we need; no network re-fetch (which would tax the hottest poll,
+        codex HIGH). If the poll produced no body (replay failed before
+        parsing), there is nothing to dump and the once-per-window budget is
+        NOT consumed, so a later poll in the same window can still capture.
+        """
+        if self._replay_capture_dumped_this_window:
+            return
+        body = self._last_replay_body
+        if not body:
+            logger.warning(
+                "[replay-miss] no replay body stashed this poll — capture "
+                "unavailable (once-per-window budget not consumed)"
+            )
+            return
+        self._dump_body(body)
+
+    def _dump_body(self, body: bytes) -> None:
+        """Write *body* to _REPLAY_CAPTURE_DIR and arm the once-per-window
+        flag. Sync, best-effort — a capture I/O error must not abort a poll.
+        Only ever called with a non-empty body (the once-per-window budget is
+        consumed exactly when a body is actually written)."""
+        try:
+            os.makedirs(_REPLAY_CAPTURE_DIR, exist_ok=True)
+            # Microsecond precision so two captures in the same second (e.g.
+            # back-to-back windows) never clobber each other's file.
+            ts = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+            slug = self.config.restaurant_slug
+            path = os.path.join(
+                _REPLAY_CAPTURE_DIR, f"{ts}_{slug}_replay.bin"
+            )
+            with open(path, "wb") as f:
+                f.write(body)
+            self._replay_capture_dumped_this_window = True
+            logger.error(
+                f"[replay-miss] dumped {len(body)}b stashed replay body → {path}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[replay-miss] failed to dump replay body: "
+                f"{type(e).__name__}: {e}"
+            )
 
     # ------------------------------------------------------------------
     # Internal

@@ -334,6 +334,13 @@ class TockMonitor:
             if was_sniper and not now_sniper:
                 self.notifier.sniper_mode_ended(self._sniper_slots_found)
                 await self.checker.close_sniper_pages()
+                # Also tear down the replay session at the window boundary so
+                # the next window starts fresh: this resets the replay
+                # circuit-breaker, the once-per-window capture-dumped flag, and
+                # the replay-diag poll counter. Without it, a tripped breaker
+                # would persist and capture would fire once EVER (not once per
+                # window). Idempotent — safe even if no replay session exists.
+                await self.checker.close_replay_session()
                 # Reset so pre-warm fires again if sniper re-arms (new window same day)
                 self._session_prewarmed_for = None
                 self._session_dates_prewarmed_for = None

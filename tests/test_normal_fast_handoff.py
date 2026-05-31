@@ -454,6 +454,7 @@ def _build_monitor(*, dry_run: bool, slots: list[AvailableSlot],
     checker.last_checks = max(1, len(slots))
     checker.last_errors = 0
     checker.close_sniper_pages = AsyncMock()
+    checker.close_replay_session = AsyncMock()
     checker.close_handoff_pages = AsyncMock()
     checker.flush_deferred = MagicMock()
     handoff_iter = iter(pop_handoff_results or [])
