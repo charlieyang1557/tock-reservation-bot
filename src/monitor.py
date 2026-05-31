@@ -274,18 +274,11 @@ class TockMonitor:
                     )
 
             # Date-page prewarm: 5 min before window (closer than cookie prewarm
-            # so pages don't sit idle for 15+ min before reload). Only worth
-            # doing when sniper REUSES pages — with reuse off (default) it would
-            # navigate N pages and park none (the reuse gate discards them),
-            # wasting pre-window time and possibly delaying the first sniper
-            # poll; the cookie prewarm (warm_session) already refreshes the
-            # Cloudflare session. Skip it when reuse is disabled.
-            dates_prewarm_target = self._get_dates_prewarm_target()
-            if (
-                dates_prewarm_target
-                and dates_prewarm_target != self._session_dates_prewarmed_for
-                and getattr(self.config, "sniper_reuse_pages", False)
-            ):
+            # so pages don't sit idle for 15+ min before reload). Gated by
+            # _should_prewarm_dates() — only fires when sniper reuses pages
+            # (reuse off discards prewarmed pages; warm_session still warms CF).
+            dates_prewarm_target = self._should_prewarm_dates()
+            if dates_prewarm_target:
                 prewarm_failed = False
                 try:
                     prewarm_dates = self._get_prewarm_dates()
@@ -495,55 +488,44 @@ class TockMonitor:
 
             # --- Attempt booking ---
             # Pass warm pages to booker (avoids re-navigation in either mode).
-            # Sniper drains _sniper_pages via pop_warm_page; normal-mode fast
-            # path drains _handoff_pages via pop_handoff_page. The booker
-            # treats both identically — pop()-and-own; close after success or
-            # failure. The two sources are kept in separate dicts so the
+            # Two page sources, one drain loop:
+            #   • sniper: reuse-on keeps the page in _sniper_pages (pop_warm_page);
+            #     reuse-off retains the found-slot page in _handoff_pages. Try
+            #     warm first, fall back to handoff.
+            #   • normal fast-path: only _handoff_pages.
+            # The booker treats them identically (pop()-and-own; close after
+            # success/failure). The two sources stay in separate dicts so the
             # sniper warm-page lifetime (across polls) doesn't leak into the
             # one-shot fast-path lifetime (single poll).
-            if self._sniper_active:
+            if self._sniper_active or enable_fast_handoff:
+                if self._sniper_active:
+                    def _drain(date_str: str):
+                        return (self.checker.pop_warm_page(date_str)
+                                or self.checker.pop_handoff_page(date_str))
+                    source = "warm"
+                else:
+                    _drain = self.checker.pop_handoff_page
+                    source = "handoff"
                 warm_pages = {}
                 seen: set[str] = set()
                 for s in slots:
                     if s.slot_date_str in seen:
-                        continue  # multiple slots per date share one warm page
+                        continue  # multiple slots per date share one page
                     seen.add(s.slot_date_str)
-                    wp = self.checker.pop_warm_page(s.slot_date_str)
-                    if wp is None:
-                        # Reuse OFF (default): no page is kept across polls, but
-                        # the date that found a slot retained its page in
-                        # _handoff_pages for exactly this handoff. Reuse ON: this
-                        # falls through to None and the booker opens fresh.
-                        wp = self.checker.pop_handoff_page(s.slot_date_str)
-                    if wp is not None:
-                        warm_pages[s.slot_date_str] = wp
+                    p = _drain(s.slot_date_str)
+                    if p is not None:
+                        warm_pages[s.slot_date_str] = p
                 if warm_pages:
                     logger.info(
-                        f"[monitor] Passing {len(warm_pages)} warm page(s) to booker"
+                        f"[monitor] Passing {len(warm_pages)} {source} page(s) to booker"
                     )
                 else:
                     warm_pages = None
-            elif enable_fast_handoff:
-                warm_pages = {}
-                seen = set()
-                for s in slots:
-                    if s.slot_date_str in seen:
-                        continue
-                    seen.add(s.slot_date_str)
-                    hp = self.checker.pop_handoff_page(s.slot_date_str)
-                    if hp is not None:
-                        warm_pages[s.slot_date_str] = hp
-                if warm_pages:
-                    logger.info(
-                        f"[monitor] Passing {len(warm_pages)} handoff page(s) to "
-                        "booker (normal-mode fast path)"
-                    )
-                else:
-                    logger.info(
-                        "[monitor] No handoff page available — booker will fall "
-                        "back to fresh navigation"
-                    )
-                    warm_pages = None
+                    if enable_fast_handoff:
+                        logger.info(
+                            "[monitor] No handoff page available — booker will "
+                            "fall back to fresh navigation"
+                        )
 
             from src.booker import BookingOutcome
             outcome, booked_slot = await self.booker.book_best_slot_race(
@@ -879,6 +861,24 @@ class TockMonitor:
             if 0 < delta_sec <= PREWARM_DATES_BEFORE_MIN * 60:
                 return f"{day_name}@{start_str}"
         return None
+
+    def _should_prewarm_dates(self) -> str | None:
+        """Target ('DayName@HH:MM') if date-page prewarm should fire now, else None.
+
+        Date-page prewarm pre-opens one page per target date so the first sniper
+        poll can reload them — but that only pays off when sniper REUSES pages.
+        With reuse off (the default) the pages are discarded, so prewarm would
+        just burn pre-window time (and can delay the first poll) for nothing; the
+        cookie prewarm (warm_session) already refreshes the Cloudflare session.
+        Returns None unless reuse is enabled AND a window is in range AND we have
+        not already prewarmed for it this cycle.
+        """
+        if not getattr(self.config, "sniper_reuse_pages", False):
+            return None
+        target = self._get_dates_prewarm_target()
+        if target is None or target == self._session_dates_prewarmed_for:
+            return None
+        return target
 
     def _get_prewarm_dates(self) -> list[date]:
         """Return up to 7 target dates within the next ~10 days to prewarm.

@@ -1644,23 +1644,21 @@ class AvailabilityChecker:
                     f"[check] {date_str} — first slot found, "
                     "abort signaled to remaining tasks"
                 )
-            # Retain the slot-bearing page for the booker instead of closing it,
-            # so booking clicks the already-loaded slot without a fresh
-            # navigation (~0.85s faster than a cold goto; reuse_speed_bench.py).
-            # Fires only when the page would OTHERWISE be closed (not
-            # reuse_pages) AND it found a slot, in two cases:
-            #   • normal-mode fast path (retain_found_page, keep_page=False), or
-            #   • sniper mode with page-reuse OFF (keep_page=True): we don't keep
-            #     pages across polls, but we DO keep the page(s) that found a
-            #     slot, for this single cycle — only the dates that hit (usually
-            #     one or a few), not all ~14, so there is no across-the-board
-            #     reload contention.
-            # With reuse ON the page already lives in _sniper_pages, so
-            # `not reuse_pages` excludes that case (no double-park). The page is
-            # parked in _handoff_pages (single-cycle lifetime, defensively
-            # closed at the next check_all); the monitor drains it via
-            # pop_handoff_page in BOTH normal and sniper booking.
-            if sorted_slots and not reuse_pages and (retain_found_page or keep_page):
+            # Retain the slot-bearing page for the booker (skips a fresh nav,
+            # ~0.85s; reuse_speed_bench.py) instead of closing it. Only when the
+            # page would otherwise be closed (`not reuse_pages`) and it found a
+            # slot: the normal-mode fast path (retain_found_page) or sniper
+            # reuse-off (keep_page) — keeping only the dates that hit, not all
+            # ~14. Reuse-on already keeps the page in _sniper_pages, which
+            # `not reuse_pages` excludes (no double-park). Parked in
+            # _handoff_pages (single-cycle; defensively closed at the next
+            # check_all); the monitor drains it via pop_handoff_page.
+            park_found_page = (
+                bool(sorted_slots)
+                and not reuse_pages
+                and (retain_found_page or keep_page)
+            )
+            if park_found_page:
                 # Close any pre-existing handoff page for this date before
                 # overwriting — otherwise the old page leaks (Codex review).
                 old = self._handoff_pages.get(date_str)
