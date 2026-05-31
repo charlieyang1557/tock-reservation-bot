@@ -24,6 +24,7 @@ Hardening under test:
   6. Normal (non-sniper) mode keeps the existing single-attempt behavior.
   7. _check_date wires keep_page→sniper_mode and the reuse flag→reused.
 """
+import asyncio
 import logging
 from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -512,3 +513,196 @@ async def test_check_date_normal_mode_passes_sniper_false():
 
     _, kwargs = spy.await_args
     assert kwargs.get("sniper_mode") is False
+
+
+# ===========================================================================
+# Review-finding fixes (code-review + security + Codex adversarial pass)
+# ===========================================================================
+
+# --- Codex Finding 1 (HIGH): abort before the diagnostic+retry ------------
+# In the concurrent sniper gather, once one date finds a slot it sets the
+# abort event. A sibling date already past its pre-calendar abort check must
+# NOT then burn ~12s first-wait + up to ~10s reload-retry before its task
+# finishes — that delays book_best_slot_race on a seconds-wide release. So on
+# a timeout, if abort is already set, skip the diagnostic AND the retry and
+# return False immediately (the first wait genuinely timed out, so it still
+# counts as a calendar miss — we just don't pay for recovery we don't need).
+
+@pytest.mark.asyncio
+async def test_abort_set_skips_diagnostic_and_retry():
+    checker = _make_checker()
+    abort = asyncio.Event()
+    abort.set()
+    page = _make_page(wait_side_effect=[_timeout(), MagicMock()])
+
+    ok = await checker._wait_for_calendar(
+        page, "2026-06-04", timeout=5000, sniper_mode=True, abort_event=abort,
+    )
+
+    assert ok is False
+    page.reload.assert_not_called()       # retry skipped
+    page.evaluate.assert_not_called()     # diagnostic CF probe skipped
+    assert page.wait_for_selector.await_count == 1  # only the first wait ran
+
+
+@pytest.mark.asyncio
+async def test_abort_not_set_runs_retry_as_before():
+    """Regression guard: with abort unset (or None), the retry path is
+    unchanged — a recoverable timeout still recovers."""
+    checker = _make_checker()
+    abort = asyncio.Event()  # not set
+    page = _make_page(wait_side_effect=[_timeout(), MagicMock()])
+
+    with patch.object(checker, "_save_error_screenshot", new_callable=AsyncMock):
+        ok = await checker._wait_for_calendar(
+            page, "2026-06-04", timeout=5000, sniper_mode=True, abort_event=abort,
+        )
+
+    assert ok is True
+    page.reload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_abort_set_during_diagnostic_skips_retry_reload():
+    """Sub-race (Codex re-review): abort fires DURING the diagnostic (the CF
+    probe await), after the top-of-except check passed. The retry must bail
+    BEFORE the reload — not just before the second wait — so a found slot does
+    not wait on this date's reload."""
+    checker = _make_checker()
+    abort = asyncio.Event()
+    page = _make_page(wait_side_effect=[_timeout(), MagicMock()], cf_dom=False)
+
+    async def evaluate_then_abort(*a, **k):
+        abort.set()        # sibling found a slot while we were diagnosing
+        return False       # ...and this page is NOT a CF challenge
+
+    page.evaluate = AsyncMock(side_effect=evaluate_then_abort)
+
+    with patch.object(checker, "_save_error_screenshot", new_callable=AsyncMock):
+        ok = await checker._wait_for_calendar(
+            page, "2026-06-04", timeout=5000, sniper_mode=True, abort_event=abort,
+        )
+
+    assert ok is False
+    page.reload.assert_not_called()   # retry bailed before the reload
+    assert page.wait_for_selector.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_during_retry_reload_skips_second_wait():
+    """Sub-race: abort fires DURING the retry's reload (after the top-of-except
+    check passed). The retry must bail before the second wait_for_selector."""
+    checker = _make_checker()
+    abort = asyncio.Event()
+    page = _make_page(wait_side_effect=[_timeout(), MagicMock()])
+
+    async def reload_then_abort(*a, **k):
+        abort.set()
+
+    page.reload = AsyncMock(side_effect=reload_then_abort)
+
+    with patch.object(checker, "_save_error_screenshot", new_callable=AsyncMock):
+        ok = await checker._wait_for_calendar(
+            page, "2026-06-04", timeout=5000, sniper_mode=True, abort_event=abort,
+        )
+
+    assert ok is False
+    page.reload.assert_awaited_once()
+    assert page.wait_for_selector.await_count == 1  # second wait skipped
+
+
+@pytest.mark.asyncio
+async def test_check_date_passes_abort_event_to_wait():
+    checker = _make_checker()
+    page = _make_page(
+        url="https://www.exploretock.com/benu/search?date=2026-06-04&size=2&time=17:00",
+    )
+    checker.browser.new_page = AsyncMock(return_value=page)
+    abort = asyncio.Event()
+    spy = AsyncMock(return_value=False)
+
+    with patch.object(checker, "_wait_for_calendar", spy):
+        await checker._check_date(date(2026, 6, 4), keep_page=True, abort_event=abort)
+
+    _, kwargs = spy.await_args
+    assert kwargs.get("abort_event") is abort
+
+
+# --- Codex Finding 2 (HIGH, reuse-on): evict CF page in diagnostic path ----
+# When sniper_reuse_pages=True and a CF challenge is detected during the
+# calendar-timeout diagnostic (not the post-nav check), the parked
+# _sniper_pages entry must be evicted+closed so the next poll opens a FRESH
+# page instead of reloading the CF-poisoned one.
+
+@pytest.mark.asyncio
+async def test_cf_in_diagnostic_evicts_parked_page_when_reuse_on():
+    checker = _make_checker(sniper_reuse_pages=True)
+    date_str = "2026-06-04"
+    parked = _make_page(wait_side_effect=[_timeout(), MagicMock()], cf_dom=True)
+    checker._sniper_pages[date_str] = parked
+
+    ok = await checker._wait_for_calendar(
+        parked, date_str, timeout=5000, sniper_mode=True, reused=True,
+    )
+
+    assert ok is False
+    assert date_str not in checker._sniper_pages   # evicted
+    parked.close.assert_awaited()                  # and closed
+    parked.reload.assert_not_called()              # CF → no retry
+
+
+@pytest.mark.asyncio
+async def test_cf_in_diagnostic_reuse_off_does_not_close_here():
+    """With reuse off, nothing is parked, so the CF branch closes nothing —
+    _check_date's finally owns closing the fresh page. _wait_for_calendar must
+    not close a page it doesn't own."""
+    checker = _make_checker(sniper_reuse_pages=False)
+    date_str = "2026-06-04"
+    page = _make_page(wait_side_effect=[_timeout(), MagicMock()], cf_dom=True)
+
+    ok = await checker._wait_for_calendar(
+        page, date_str, timeout=5000, sniper_mode=True,
+    )
+
+    assert ok is False
+    assert date_str not in checker._sniper_pages
+    page.close.assert_not_called()
+
+
+# --- Codex Finding 3 (LOW): screenshot cap must not eat a failed capture ---
+# The once-per-window cap flag is set before the await (race-free). But if the
+# capture itself FAILS (page closed / CDP flake), the flag must be released so
+# a later timeout in the same window can still produce a forensic screenshot.
+
+@pytest.mark.asyncio
+async def test_screenshot_failure_allows_retry_in_same_window():
+    """Drives the REAL _save_error_screenshot (NOT patched) so the production
+    path is exercised: _save_error_screenshot swallows page.screenshot errors
+    internally, so the cap-release must key off its RETURN VALUE, not a raised
+    exception (Codex re-review: the prior except-based reset was unreachable).
+    First page's screenshot fails → cap released → second page can capture."""
+    checker = _make_checker()
+
+    p1 = _make_page(wait_side_effect=[_timeout(), _timeout()])
+    p1.screenshot = AsyncMock(side_effect=RuntimeError("CDP flake"))  # capture fails
+    p2 = _make_page(wait_side_effect=[_timeout(), _timeout()])
+    # p2.screenshot is a plain AsyncMock from _make_page → capture succeeds.
+
+    await checker._wait_for_calendar(p1, "2026-06-04", timeout=5000, sniper_mode=True)
+    await checker._wait_for_calendar(p2, "2026-06-05", timeout=5000, sniper_mode=True)
+
+    p1.screenshot.assert_awaited()  # first capture attempted (and failed)
+    p2.screenshot.assert_awaited()  # cap released → second capture retried
+
+
+@pytest.mark.asyncio
+async def test_screenshot_success_still_caps_window():
+    """Companion: a SUCCESSFUL capture still holds the once-per-window cap."""
+    checker = _make_checker()
+    with patch.object(
+        checker, "_save_error_screenshot", new_callable=AsyncMock
+    ) as ss:
+        for d in ("2026-06-04", "2026-06-05"):
+            page = _make_page(wait_side_effect=[_timeout(), _timeout()])
+            await checker._wait_for_calendar(page, d, timeout=5000, sniper_mode=True)
+    assert ss.await_count == 1

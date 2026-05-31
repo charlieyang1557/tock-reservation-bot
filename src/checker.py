@@ -1466,6 +1466,7 @@ class AvailabilityChecker:
             if not await self._wait_for_calendar(
                 page, date_str, timeout=cal_timeout,
                 sniper_mode=keep_page, reused=reusing,
+                abort_event=abort_event,
             ):
                 return []
 
@@ -1718,16 +1719,23 @@ class AvailabilityChecker:
                 except Exception as e:
                     logger.debug(f"[check] {date_str} — page.close() failed: {e}")
 
-    async def _save_error_screenshot(self, page: Page, date_str: str, label: str) -> None:
-        """Save a screenshot to the errors/ subfolder. Never deleted automatically."""
+    async def _save_error_screenshot(self, page: Page, date_str: str, label: str) -> bool:
+        """Save a screenshot to the errors/ subfolder. Never deleted automatically.
+
+        Returns True if the capture succeeded, False if it failed (the failure
+        is swallowed and logged at debug — callers that need to know, e.g. the
+        once-per-window cap in _diagnose_calendar_timeout, key off this return
+        rather than a raised exception)."""
         try:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"error_{ts}_{label}_{date_str}.png"
             path = os.path.join(_SCREENSHOT_ERROR_DIR, filename)
             await page.screenshot(path=path, full_page=True)
             logger.info(f"[check] Error screenshot saved: errors/{filename}")
+            return True
         except Exception as e:
             logger.debug(f"[check] Error screenshot failed: {e}")
+            return False
 
     async def _wait_for_calendar(
         self,
@@ -1736,6 +1744,7 @@ class AvailabilityChecker:
         timeout: int = 15000,
         sniper_mode: bool = False,
         reused: bool = False,
+        abort_event: "asyncio.Event | None" = None,
     ) -> bool:
         """Wait for the calendar container to render. Returns True on success.
 
@@ -1747,13 +1756,21 @@ class AvailabilityChecker:
         NET (fix/replay-parallel-capture), so a first-attempt timeout is a date
         we'd otherwise silently fail to check during a release that sells out
         in seconds. On timeout we:
+          0. If `abort_event` is already set, another date in this concurrent
+             scan has found a slot — RETURN immediately, skipping the
+             diagnostic AND the reload retry. Otherwise a lagging date would
+             add ~12s (first wait, already spent) + up to ~10s (retry) before
+             its gather task finishes, delaying booking on a seconds-wide
+             release (Codex finding). The first wait genuinely timed out, so
+             this still counts as a calendar miss — we just skip recovery we
+             no longer need.
           1. Capture diagnostics — page URL, CF-challenge presence,
              warm-reload vs cold-goto, and a screenshot — so we can tell a CF
              interstitial from slow SPA hydration from a genuine page error.
           2. If it's a Cloudflare challenge, FAIL FAST (a reload won't clear it
-             within the budget; the date gets a fresh page next poll).
-          3. Otherwise retry EXACTLY ONCE with a quick page.reload() + re-wait
-             on the shorter _SNIPER_CAL_RETRY_TIMEOUT_MS budget.
+             within the budget) and evict+close any parked reuse page so the
+             next poll opens fresh instead of reloading the poisoned one.
+          3. Otherwise retry EXACTLY ONCE with a quick page.reload() + re-wait.
 
         A timeout recovered by the retry returns True and is therefore NOT
         counted as an error by check_all's _counting_wait wrapper — so a
@@ -1777,6 +1794,16 @@ class AvailabilityChecker:
                     await self._save_error_screenshot(page, date_str, "cal_load_fail")
                 return False
 
+            # Another date already won the race — don't pay for the diagnostic
+            # or the reload retry; let this task finish NOW so the concurrent
+            # gather can hand slots to the booker.
+            if abort_event is not None and abort_event.is_set():
+                logger.debug(
+                    f"[check] {date_str} — calendar timed out but another date "
+                    "already found a slot; skipping diagnostic+retry (abort set)"
+                )
+                return False
+
             # Sniper mode: diagnose, then retry once (unless it's a CF wall).
             cf_challenge = await self._diagnose_calendar_timeout(
                 page, date_str, timeout, reused, e
@@ -1787,30 +1814,65 @@ class AvailabilityChecker:
                     "challenge; skipping reload retry (date gets a fresh page "
                     "next poll)"
                 )
+                # Evict+close a parked (reuse-on) page so the next poll opens a
+                # FRESH page instead of reloading the CF-challenged one (mirrors
+                # the post-nav CF handling in _check_date). No-op when reuse is
+                # off: nothing is parked here, and _check_date's finally closes
+                # the fresh page. Guarded so a close hiccup can't abort the poll.
+                parked = self._sniper_pages.pop(date_str, None)
+                if parked is not None:
+                    try:
+                        await parked.close()
+                    except Exception:
+                        pass
                 self._log_calendar_failure(date_str, key, selector, e)
                 return False
 
-            if await self._retry_calendar_load(page, date_str, selector):
+            if await self._retry_calendar_load(
+                page, date_str, selector, abort_event=abort_event
+            ):
                 return True
 
             self._log_calendar_failure(date_str, key, selector, e)
             return False
 
     async def _retry_calendar_load(
-        self, page: Page, date_str: str, selector: str
+        self, page: Page, date_str: str, selector: str,
+        abort_event: "asyncio.Event | None" = None,
     ) -> bool:
         """Sniper recovery: ONE quick reload + re-wait. Bounded to a single
         attempt (never a loop) so a hard failure can't stall the poll. Returns
-        True iff the calendar renders after the reload."""
+        True iff the calendar renders after the reload.
+
+        Each phase (reload nav, then the selector wait) gets its own
+        _SNIPER_CAL_RETRY_TIMEOUT_MS budget, so worst-case added latency on a
+        retried date is ~2× that constant — acceptable because the caller skips
+        this entire path once another date has found a slot (abort set). We
+        also re-check abort right after the reload: if a sibling won during the
+        reload, bail before spending the (longer) selector-wait budget."""
+        # Abort may have been set during the (awaited) diagnostic that ran just
+        # before this call — check BEFORE the reload so a found slot never waits
+        # on this date's reload either (Codex re-review).
+        if abort_event is not None and abort_event.is_set():
+            logger.debug(
+                f"[check] {date_str} — abort set before retry; skipping reload"
+            )
+            return False
         try:
             logger.info(
                 f"[check] {date_str} — calendar_container timed out; one quick "
-                f"reload retry ({self._SNIPER_CAL_RETRY_TIMEOUT_MS}ms, sniper)"
+                f"reload retry ({self._SNIPER_CAL_RETRY_TIMEOUT_MS}ms/phase, sniper)"
             )
             await page.reload(
                 wait_until="domcontentloaded",
                 timeout=self._SNIPER_CAL_RETRY_TIMEOUT_MS,
             )
+            if abort_event is not None and abort_event.is_set():
+                logger.debug(
+                    f"[check] {date_str} — abort set during retry reload; "
+                    "skipping the post-reload calendar wait"
+                )
+                return False
             await page.wait_for_selector(
                 selector, timeout=self._SNIPER_CAL_RETRY_TIMEOUT_MS
             )
@@ -1871,13 +1933,22 @@ class AvailabilityChecker:
         # is race-free under asyncio (no await between), so concurrent date
         # timeouts can't each slip a screenshot through. Best-effort.
         if not self._cal_timeout_diag_captured_window:
+            # Claim the once-per-window slot BEFORE the await so concurrent date
+            # timeouts can't each slip a screenshot through (race-free: no await
+            # between the read and this set).
             self._cal_timeout_diag_captured_window = True
-            try:
-                await self._save_error_screenshot(
-                    page, date_str, "cal_timeout_diag"
-                )
-            except Exception:
-                pass
+            captured = await self._save_error_screenshot(
+                page, date_str, "cal_timeout_diag"
+            )
+            if not captured:
+                # Capture failed (page closed / CDP flake). _save_error_screenshot
+                # SWALLOWS the error and returns False, so we key the release off
+                # its RETURN VALUE — NOT a raised exception, which never escapes
+                # it (Codex re-review: the prior except-based reset was dead
+                # code). Releasing the slot lets a later timeout this window
+                # still grab a forensic shot; on success it stays claimed,
+                # preserving the once-per-window cap.
+                self._cal_timeout_diag_captured_window = False
 
         return cf
 
