@@ -274,11 +274,17 @@ class TockMonitor:
                     )
 
             # Date-page prewarm: 5 min before window (closer than cookie prewarm
-            # so pages don't sit idle for 15+ min before reload).
+            # so pages don't sit idle for 15+ min before reload). Only worth
+            # doing when sniper REUSES pages — with reuse off (default) it would
+            # navigate N pages and park none (the reuse gate discards them),
+            # wasting pre-window time and possibly delaying the first sniper
+            # poll; the cookie prewarm (warm_session) already refreshes the
+            # Cloudflare session. Skip it when reuse is disabled.
             dates_prewarm_target = self._get_dates_prewarm_target()
             if (
                 dates_prewarm_target
                 and dates_prewarm_target != self._session_dates_prewarmed_for
+                and getattr(self.config, "sniper_reuse_pages", False)
             ):
                 prewarm_failed = False
                 try:
@@ -503,6 +509,12 @@ class TockMonitor:
                         continue  # multiple slots per date share one warm page
                     seen.add(s.slot_date_str)
                     wp = self.checker.pop_warm_page(s.slot_date_str)
+                    if wp is None:
+                        # Reuse OFF (default): no page is kept across polls, but
+                        # the date that found a slot retained its page in
+                        # _handoff_pages for exactly this handoff. Reuse ON: this
+                        # falls through to None and the booker opens fresh.
+                        wp = self.checker.pop_handoff_page(s.slot_date_str)
                     if wp is not None:
                         warm_pages[s.slot_date_str] = wp
                 if warm_pages:
@@ -572,15 +584,17 @@ class TockMonitor:
                             await p.close()
                     except Exception:
                         pass
-            # Layer 2: any handoff pages still parked in the checker (e.g.
-            # an exception fired before we drained them). Sniper-warm pages
-            # are NOT closed here — they live across polls by design and
-            # close_sniper_pages() handles them at window end.
-            if enable_fast_handoff:
-                try:
-                    await self.checker.close_handoff_pages()
-                except Exception:
-                    pass
+            # Layer 2: any handoff pages still parked in the checker (e.g. an
+            # exception fired before we drained them, or a dry-run early-return).
+            # _handoff_pages is single-cycle in BOTH modes — normal-mode fast
+            # path AND sniper reuse-off found-slot retention — so always drain
+            # it here. Sniper-WARM pages (_sniper_pages, reuse ON) are NOT
+            # touched: they live across polls by design and close_sniper_pages()
+            # handles them at window end.
+            try:
+                await self.checker.close_handoff_pages()
+            except Exception:
+                pass
 
     def _apply_adaptive_switching(self, sniper_age: float) -> None:
         """Update concurrent/sequential mode based on rolling error rate.

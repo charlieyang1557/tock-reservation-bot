@@ -286,6 +286,13 @@ class AvailabilityChecker:
         # because they signal different operational risks.
         self._sniper_cf_challenges: int = 0
         self._sniper_cf_attempts: int = 0
+        # Calendar-timeout forensic screenshot is capped to ONCE per sniper
+        # window: it's a heavy artifact written to the never-pruned errors/
+        # dir, and a real 11-min window can run dozens of DOM scans (each with
+        # 1-3 timeouts). One screenshot per window is enough to see the page
+        # state; the per-timeout [cal-timeout-diag] log line carries the
+        # per-date detail. Reset by close_sniper_pages() at the window boundary.
+        self._cal_timeout_diag_captured_window: bool = False
         # B3.2 fast-path (USE_CALENDAR_REPLAY=true). Lazy-initialized on
         # first call to check_all when the flag is enabled. Auto-invalidated
         # on fetch failure so the next poll re-initializes.
@@ -348,6 +355,19 @@ class AvailabilityChecker:
     _SNIPER_WARMUP_CAL_TIMEOUT_MS: int = 12000
     _SNIPER_STEADY_CAL_TIMEOUT_MS: int = 5000
     _NORMAL_CAL_TIMEOUT_MS: int = 15000
+
+    # Sniper-mode calendar-load retry budget. On a first-attempt
+    # calendar_container timeout during sniper mode (the post-release DOM
+    # SAFETY NET since fix/replay-parallel-capture — replay returns empty
+    # 100% of the time for fuhuihua, so check_all falls through to the DOM
+    # scan), we do ONE quick page.reload() + re-wait on this shorter budget
+    # before giving up. Recovers the transient slow-hydration / request-
+    # queueing timeouts observed on the 2026-05-30 benu dry-run (2/14 dates
+    # timed out at 12s) without stalling the poll: the retry is bounded to a
+    # single attempt, runs concurrently across dates, and is SKIPPED when the
+    # timeout diagnostic finds a Cloudflare challenge (a reload won't clear
+    # that within the budget).
+    _SNIPER_CAL_RETRY_TIMEOUT_MS: int = 5000
 
     async def _try_calendar_replay(
         self, sniper_mode: bool
@@ -583,6 +603,8 @@ class AvailabilityChecker:
         # and re-arm the "first poll of the window logs" diag throttle.
         self._replay_capture_dumped_this_window = False
         self._replay_diag_poll_count = 0
+        # Re-arm the once-per-window calendar-timeout forensic screenshot.
+        self._cal_timeout_diag_captured_window = False
         logger.debug("[check] Sniper pages closed.")
 
     def _compute_cal_timeout(self, keep_page: bool) -> int:
@@ -765,22 +787,34 @@ class AvailabilityChecker:
                 await page.wait_for_selector(
                     sel.get("calendar_container"), timeout=10000
                 )
-                # If a previous prewarm parked a page for this date (e.g. a
-                # schedule re-aim or a second sniper window in the same
-                # process), close it before overwriting. Otherwise the old
-                # Page object leaks — never reachable for cleanup since
-                # close_sniper_pages() iterates the current dict.
-                old = self._sniper_pages.pop(date_str, None)
-                if old is not None:
-                    try:
-                        await old.close()
-                    except Exception:
-                        pass
-                self._sniper_pages[date_str] = page
-                page = None  # ownership transferred to _sniper_pages — don't close in finally
-                logger.info(
-                    f"[prewarm] {date_str} parked at CALENDAR_LOADED"
-                )
+                if not getattr(self.config, "sniper_reuse_pages", False):
+                    # Reuse disabled (default): the navigation above already
+                    # refreshed the shared Cloudflare session — prewarm's
+                    # remaining value. Do NOT park the page: sniper polls open
+                    # fresh pages, and a parked-but-never-reloaded page would go
+                    # stale and could reach the booker via pop_warm_page(). The
+                    # finally block closes it.
+                    logger.info(
+                        f"[prewarm] {date_str} session warmed "
+                        "(reuse disabled — page not parked)"
+                    )
+                else:
+                    # If a previous prewarm parked a page for this date (e.g. a
+                    # schedule re-aim or a second sniper window in the same
+                    # process), close it before overwriting. Otherwise the old
+                    # Page object leaks — never reachable for cleanup since
+                    # close_sniper_pages() iterates the current dict.
+                    old = self._sniper_pages.pop(date_str, None)
+                    if old is not None:
+                        try:
+                            await old.close()
+                        except Exception:
+                            pass
+                    self._sniper_pages[date_str] = page
+                    page = None  # ownership transferred — don't close in finally
+                    logger.info(
+                        f"[prewarm] {date_str} parked at CALENDAR_LOADED"
+                    )
             except Exception as e:
                 logger.warning(
                     f"[prewarm] {date_str} failed: {type(e).__name__}: {e}"
@@ -1330,14 +1364,36 @@ class AvailabilityChecker:
             f"&time={self.config.preferred_time}"
         )
 
-        # Resolve page: reuse if keep_page and page is still open
-        existing = self._sniper_pages.get(date_str) if keep_page else None
+        # Resolve page. In sniper mode we reuse the kept-open page (page.reload)
+        # ONLY when page-reuse is enabled (config.sniper_reuse_pages). Cross-poll
+        # reuse was measured materially LESS reliable than fresh navigation under
+        # concurrent sniper load — repeatedly reloading ~14 kept-open SPA pages
+        # accumulates renderer state and starves hydration (~19% first-attempt
+        # calendar timeouts with unrecoverable bursts vs ~3.6% all-recovered for
+        # fresh pages; 2026-05-31 investigation, spikes/warm_vs_cold_repro.py).
+        # Default OFF: every poll opens a fresh page that the finally block
+        # closes — so no page survives to be reused or handed stale to the
+        # booker. Opt back in with SNIPER_REUSE_PAGES=true.
+        reuse_pages = keep_page and getattr(self.config, "sniper_reuse_pages", False)
+        if keep_page and not reuse_pages and date_str in self._sniper_pages:
+            # Defense-in-depth: with reuse disabled, nothing should park here —
+            # but a stale page left by a prior reuse-on phase (or a runtime flag
+            # flip) must not linger, or the monitor's pop_warm_page()-first drain
+            # would hand the booker this STALE page instead of the fresh found-
+            # slot page parked in _handoff_pages this poll. Evict and close it.
+            stale = self._sniper_pages.pop(date_str, None)
+            if stale is not None:
+                try:
+                    await stale.close()
+                except Exception:
+                    pass
+        existing = self._sniper_pages.get(date_str) if reuse_pages else None
         if existing and not existing.is_closed():
             page = existing
             reusing = True
         else:
             page = await self.browser.new_page()
-            if keep_page:
+            if reuse_pages:
                 self._sniper_pages[date_str] = page
             reusing = False
 
@@ -1388,10 +1444,14 @@ class AvailabilityChecker:
                     # Drop the page so next poll opens a fresh one
                     if date_str in self._sniper_pages:
                         del self._sniper_pages[date_str]
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
+                    if reuse_pages:
+                        # reuse-on: the finally keeps reused pages, so close the
+                        # CF-challenged page here. reuse-off: the finally already
+                        # closes every fresh page — don't double-close.
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
                     return []
 
             # Check abort before expensive calendar work
@@ -1403,7 +1463,10 @@ class AvailabilityChecker:
             # traffic spike); see _compute_cal_timeout. Steady state drops
             # to 5s so poll-rate stays high. Normal mode keeps 15s.
             cal_timeout = self._compute_cal_timeout(keep_page)
-            if not await self._wait_for_calendar(page, date_str, timeout=cal_timeout):
+            if not await self._wait_for_calendar(
+                page, date_str, timeout=cal_timeout,
+                sniper_mode=keep_page, reused=reusing,
+            ):
                 return []
 
             # Debug screenshot: only when enabled and not in sniper mode (too slow)
@@ -1581,16 +1644,25 @@ class AvailabilityChecker:
                     f"[check] {date_str} — first slot found, "
                     "abort signaled to remaining tasks"
                 )
-            # Normal-mode fast path: park the live page so the booker can
-            # click the already-visible slot button instead of re-navigating.
-            # No effect for keep_page=True (sniper already retains via
-            # _sniper_pages) or when no slots were extracted.
-            if sorted_slots and retain_found_page and not keep_page:
+            # Retain the slot-bearing page for the booker instead of closing it,
+            # so booking clicks the already-loaded slot without a fresh
+            # navigation (~0.85s faster than a cold goto; reuse_speed_bench.py).
+            # Fires only when the page would OTHERWISE be closed (not
+            # reuse_pages) AND it found a slot, in two cases:
+            #   • normal-mode fast path (retain_found_page, keep_page=False), or
+            #   • sniper mode with page-reuse OFF (keep_page=True): we don't keep
+            #     pages across polls, but we DO keep the page(s) that found a
+            #     slot, for this single cycle — only the dates that hit (usually
+            #     one or a few), not all ~14, so there is no across-the-board
+            #     reload contention.
+            # With reuse ON the page already lives in _sniper_pages, so
+            # `not reuse_pages` excludes that case (no double-park). The page is
+            # parked in _handoff_pages (single-cycle lifetime, defensively
+            # closed at the next check_all); the monitor drains it via
+            # pop_handoff_page in BOTH normal and sniper booking.
+            if sorted_slots and not reuse_pages and (retain_found_page or keep_page):
                 # Close any pre-existing handoff page for this date before
                 # overwriting — otherwise the old page leaks (Codex review).
-                # In current monitor wiring this slot is always empty by the
-                # time we get here (defensive close_handoff_pages at start of
-                # check_all), but a future concurrent caller could trip it.
                 old = self._handoff_pages.get(date_str)
                 if old is not None and old is not page:
                     try:
@@ -1601,8 +1673,8 @@ class AvailabilityChecker:
                 self._handoff_pages[date_str] = page
                 handoff_to_booker = True
                 logger.info(
-                    f"[check] {date_str} — handing live page to booker "
-                    "(normal-mode fast path)"
+                    f"[check] {date_str} — retaining found-slot page for booker "
+                    f"({'sniper reuse-off' if keep_page else 'normal-mode fast path'})"
                 )
             return sorted_slots
 
@@ -1632,11 +1704,21 @@ class AvailabilityChecker:
                     )
 
             # Close the page UNLESS:
-            #   1. keep_page=True (sniper mode keeps it across polls), OR
+            #   1. reuse_pages=True (sniper reuse keeps it open across polls), OR
             #   2. handoff_to_booker=True (booker now owns it; will close
             #      after booking succeeds or fails — see TockBooker._book_single).
-            if not keep_page and not handoff_to_booker:
-                await page.close()
+            # reuse_pages is False in normal mode AND in sniper mode when
+            # page-reuse is disabled (the default) — both close the page here so
+            # no page leaks or survives to be reused/handed stale to the booker.
+            # Guarded: this is now the primary close path for every fresh sniper
+            # page, and a close() that raises during a release-traffic spike
+            # (CDP drop) must not propagate — otherwise the coroutine errors,
+            # check_all counts it, and the date is silently unchecked.
+            if not reuse_pages and not handoff_to_booker:
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.debug(f"[check] {date_str} — page.close() failed: {e}")
 
     async def _save_error_screenshot(self, page: Page, date_str: str, label: str) -> None:
         """Save a screenshot to the errors/ subfolder. Never deleted automatically."""
@@ -1649,27 +1731,173 @@ class AvailabilityChecker:
         except Exception as e:
             logger.debug(f"[check] Error screenshot failed: {e}")
 
-    async def _wait_for_calendar(self, page: Page, date_str: str, timeout: int = 15000) -> bool:
-        """Wait for the calendar container to appear. Logs selector failures."""
+    async def _wait_for_calendar(
+        self,
+        page: Page,
+        date_str: str,
+        timeout: int = 15000,
+        sniper_mode: bool = False,
+        reused: bool = False,
+    ) -> bool:
+        """Wait for the calendar container to render. Returns True on success.
+
+        Normal mode (sniper_mode=False): a single wait; on timeout, log the
+        canonical SELECTOR_FAILED line and (when debug_screenshots) save an
+        error screenshot — unchanged historical behavior.
+
+        Sniper mode: the calendar scan is the load-bearing post-release SAFETY
+        NET (fix/replay-parallel-capture), so a first-attempt timeout is a date
+        we'd otherwise silently fail to check during a release that sells out
+        in seconds. On timeout we:
+          1. Capture diagnostics — page URL, CF-challenge presence,
+             warm-reload vs cold-goto, and a screenshot — so we can tell a CF
+             interstitial from slow SPA hydration from a genuine page error.
+          2. If it's a Cloudflare challenge, FAIL FAST (a reload won't clear it
+             within the budget; the date gets a fresh page next poll).
+          3. Otherwise retry EXACTLY ONCE with a quick page.reload() + re-wait
+             on the shorter _SNIPER_CAL_RETRY_TIMEOUT_MS budget.
+
+        A timeout recovered by the retry returns True and is therefore NOT
+        counted as an error by check_all's _counting_wait wrapper — so a
+        transient blip does not flip the adaptive concurrent→sequential switch.
+
+        `reused` (warm-reload vs cold-goto) is forensic only: it lets the
+        diagnostic record whether the sniper page-reuse path or a fresh
+        navigation produced the timeout, answering whether warm-page reuse is
+        more or less reliable than cold navigation for calendar loads.
+        """
         key = "calendar_container"
         selector = sel.get(key)
         try:
             await page.wait_for_selector(selector, timeout=timeout)
             return True
         except Exception as e:
-            logger.error(
-                f"SELECTOR_FAILED: key='{key}'  selector={selector!r}\n"
-                f"  The calendar did not load for {date_str}.\n"
-                f"  Possible causes:\n"
-                f"    • Not logged in (session expired)\n"
-                f"    • Tock redesigned the page — update src/selectors.py\n"
-                f"    • Bot detection triggered — try HEADLESS=false\n"
-                f"  Error: {e}"
+            if not sniper_mode:
+                # Normal mode: existing single-attempt behavior.
+                self._log_calendar_failure(date_str, key, selector, e)
+                if self.config.debug_screenshots:
+                    await self._save_error_screenshot(page, date_str, "cal_load_fail")
+                return False
+
+            # Sniper mode: diagnose, then retry once (unless it's a CF wall).
+            cf_challenge = await self._diagnose_calendar_timeout(
+                page, date_str, timeout, reused, e
             )
-            # Save error screenshot for diagnosis (never rotated/deleted)
-            if self.config.debug_screenshots:
-                await self._save_error_screenshot(page, date_str, "cal_load_fail")
+            if cf_challenge:
+                logger.warning(
+                    f"[check] {date_str} — calendar timeout is a Cloudflare "
+                    "challenge; skipping reload retry (date gets a fresh page "
+                    "next poll)"
+                )
+                self._log_calendar_failure(date_str, key, selector, e)
+                return False
+
+            if await self._retry_calendar_load(page, date_str, selector):
+                return True
+
+            self._log_calendar_failure(date_str, key, selector, e)
             return False
+
+    async def _retry_calendar_load(
+        self, page: Page, date_str: str, selector: str
+    ) -> bool:
+        """Sniper recovery: ONE quick reload + re-wait. Bounded to a single
+        attempt (never a loop) so a hard failure can't stall the poll. Returns
+        True iff the calendar renders after the reload."""
+        try:
+            logger.info(
+                f"[check] {date_str} — calendar_container timed out; one quick "
+                f"reload retry ({self._SNIPER_CAL_RETRY_TIMEOUT_MS}ms, sniper)"
+            )
+            await page.reload(
+                wait_until="domcontentloaded",
+                timeout=self._SNIPER_CAL_RETRY_TIMEOUT_MS,
+            )
+            await page.wait_for_selector(
+                selector, timeout=self._SNIPER_CAL_RETRY_TIMEOUT_MS
+            )
+            logger.info(
+                f"[check] {date_str} — calendar recovered after reload retry"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[check] {date_str} — calendar still not loaded after reload "
+                f"retry: {type(e).__name__}: {e}"
+            )
+            return False
+
+    async def _diagnose_calendar_timeout(
+        self,
+        page: Page,
+        date_str: str,
+        timeout_ms: int,
+        reused: bool,
+        exc: Exception,
+    ) -> bool:
+        """Forensics for a sniper calendar_container timeout. Logs the page
+        URL, whether a CF-challenge element is present, warm-reload vs
+        cold-goto, and saves a screenshot to debug_screenshots/errors/.
+
+        Returns the CF-challenge boolean so the caller can fail fast on a CF
+        wall instead of wasting the reload budget. Best-effort — every probe
+        is guarded so a diagnostic hiccup never aborts the poll.
+        """
+        url = "?"
+        try:
+            raw = page.url
+            url = raw if isinstance(raw, str) else "?"
+        except Exception:
+            pass
+
+        cf = False
+        try:
+            cf = await self.is_cloudflare_challenge_page(page)
+        except Exception as e:
+            logger.debug(
+                f"[cal-timeout-diag] {date_str} CF probe raised "
+                f"{type(e).__name__}: {e}"
+            )
+
+        nav = "warm-reload" if reused else "cold-goto"
+        logger.warning(
+            f"[cal-timeout-diag] {date_str} calendar_container timed out after "
+            f"{timeout_ms}ms — url={url!r} cf_challenge={cf} nav={nav} "
+            f"err={type(exc).__name__}"
+        )
+
+        # Forensic screenshot — captured regardless of debug_screenshots (these
+        # timeouts are rare and critical) but capped to ONCE per sniper window:
+        # errors/ is never auto-pruned and a window can run dozens of scans, so
+        # an uncapped shot would slowly fill the disk. The single check-and-set
+        # is race-free under asyncio (no await between), so concurrent date
+        # timeouts can't each slip a screenshot through. Best-effort.
+        if not self._cal_timeout_diag_captured_window:
+            self._cal_timeout_diag_captured_window = True
+            try:
+                await self._save_error_screenshot(
+                    page, date_str, "cal_timeout_diag"
+                )
+            except Exception:
+                pass
+
+        return cf
+
+    def _log_calendar_failure(
+        self, date_str: str, key: str, selector: str, exc: Exception
+    ) -> None:
+        """The canonical SELECTOR_FAILED calendar-load error line. Factored out
+        so both the normal-mode path and the sniper after-retry-failure path
+        emit the same greppable message (monitoring depends on it)."""
+        logger.error(
+            f"SELECTOR_FAILED: key='{key}'  selector={selector!r}\n"
+            f"  The calendar did not load for {date_str}.\n"
+            f"  Possible causes:\n"
+            f"    • Not logged in (session expired)\n"
+            f"    • Tock redesigned the page — update src/selectors.py\n"
+            f"    • Bot detection triggered — try HEADLESS=false\n"
+            f"  Error: {exc}"
+        )
 
     async def _is_day_available(self, page: Page, target_date: date) -> bool:
         """Return True if target_date appears among the available day buttons."""
