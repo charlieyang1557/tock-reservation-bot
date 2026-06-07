@@ -553,6 +553,16 @@ class TockMonitor:
                 logger.warning(
                     "[monitor] All booking attempts failed this cycle. Will retry."
                 )
+                # Previously this was console-only — a failed sniper cycle (slots
+                # detected, every booking attempt failed) produced ZERO Discord
+                # signal. Wire the (formerly dead) booking_failed embed so the
+                # operator is alerted in real time. 2026-06-05 post-mortem fix.
+                self.notifier.booking_failed(
+                    slots,
+                    "all booking attempts failed (slot vanished, checkout "
+                    "never loaded, or payment prep failed) — see "
+                    "booking_failures/ for the captured page DOM (if any)",
+                )
 
             # Flush any deferred tracker writes (sniper mode defers disk I/O)
             self.tracker.flush_deferred()

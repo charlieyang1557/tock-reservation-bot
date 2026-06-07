@@ -49,6 +49,7 @@ selector_metrics.json.tmp
 xhr_telemetry.jsonl
 booking_uncertain.archive/
 replay_captures/
+booking_failures/
 
 # === Phase C HTTP spike (operator-run, holds live auth tokens) ===
 spikes/http_replay/trace.json

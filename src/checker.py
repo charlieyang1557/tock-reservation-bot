@@ -17,7 +17,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from typing import TYPE_CHECKING
@@ -130,8 +130,10 @@ _COLLECT_SLOTS_JS = r"""
     slotTimeTextSelector,
     timeRegex,
     timeFlags,
+    dateStr,
   } = args;
   const re = new RegExp(timeRegex, timeFlags || 'i');
+  let emitIdx = 0;
 
   let root = document;
   let containerUsed = false;
@@ -205,7 +207,17 @@ _COLLECT_SLOTS_JS = r"""
       }
     }
 
-    slots.push({ time, source });
+    // Tag the exact button so the booker can click it directly (skips
+    // selector rediscovery + the parent-only time match that lost 06/05).
+    // Token is date#index — CSS-safe (no raw time) and unique per emitted
+    // button so same-time duplicates stay distinguishable. Best-effort.
+    let target = null;
+    if (time !== null && dateStr) {
+      target = dateStr + '#' + emitIdx;
+      emitIdx++;
+      try { btn.setAttribute('data-sniper-target', target); } catch (_) {}
+    }
+    slots.push({ time, source, target });
   }
 
   return {
@@ -226,6 +238,12 @@ class AvailableSlot:
     slot_date: date
     slot_time: str    # e.g. "5:00 PM"
     day_of_week: str  # e.g. "Friday"
+    # Transient booker hint (NOT slot identity, hence compare=False): when the
+    # checker finds this slot it tags the exact button on the retained warm
+    # page with a `data-sniper-target` attribute and records the matching CSS
+    # selector here. The booker clicks that element directly, skipping selector
+    # rediscovery and the parent-only time match that lost the 2026-06-05 slots.
+    target_selector: str | None = field(default=None, compare=False)
 
     @property
     def slot_date_str(self) -> str:
@@ -2139,6 +2157,7 @@ class AvailabilityChecker:
                     "slotTimeTextSelector": slot_time_text_selector,
                     "timeRegex": time_pattern,
                     "timeFlags": time_flags,
+                    "dateStr": target_date.isoformat(),
                 },
             )
         except Exception as e:
@@ -2187,11 +2206,19 @@ class AvailabilityChecker:
                         pass
                 continue
 
+            # JS tagged the button (Fix 3) — propagate the selector so the
+            # booker clicks the exact element on the warm page. None when the
+            # JS path could not tag (older shape / no dateStr) → time-scan.
+            js_token = item.get("target")
+            target_selector = (
+                f'[data-sniper-target="{js_token}"]' if js_token else None
+            )
             slots.append(
                 AvailableSlot(
                     slot_date=target_date,
                     slot_time=time_text,
                     day_of_week=target_date.strftime("%A"),
+                    target_selector=target_selector,
                 )
             )
 
@@ -2250,10 +2277,31 @@ class AvailabilityChecker:
                             "has no extractable time; skipping (PW fallback path)"
                         )
                         continue
+                    # Tag the exact button on the (about-to-be-retained) page so
+                    # the booker can click it directly instead of re-finding it
+                    # by time in a narrower DOM scope. Token is date#index —
+                    # CSS-safe (no raw time → no escaping) and unique per button
+                    # so same-time duplicates stay distinct. Best-effort: on
+                    # failure the booker falls back to the time scan.
+                    target_token = f"{date_str}#{i}"
+                    target_selector = None
+                    try:
+                        await el.evaluate(
+                            "(node, v) => node.setAttribute"
+                            "('data-sniper-target', v)",
+                            target_token,
+                        )
+                        target_selector = f'[data-sniper-target="{target_token}"]'
+                    except Exception as exc:
+                        logger.debug(
+                            f"[check] {date_str} — could not tag slot button "
+                            f"({type(exc).__name__}); booker will time-scan"
+                        )
                     slots.append(AvailableSlot(
                         slot_date=target_date,
                         slot_time=time_text,
                         day_of_week=target_date.strftime("%A"),
+                        target_selector=target_selector,
                     ))
                 except Exception:
                     continue
