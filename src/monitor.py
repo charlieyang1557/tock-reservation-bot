@@ -113,6 +113,9 @@ class TockMonitor:
         self._booking_secured = False
         self._sniper_active = False  # tracks whether we're in a sniper window
         self._sniper_slots_found = 0  # slots detected during current sniper window
+        # Dedup key for booking_failed embeds — suppresses per-poll spam when
+        # the same slot-set stays unbookable across a contested window.
+        self._last_booking_failed_key: tuple | None = None
 
         # Adaptive sniper mode: start concurrent, fall back to sequential if
         # Cloudflare error rate gets too high, retry concurrent after recovery.
@@ -463,6 +466,9 @@ class TockMonitor:
 
         if not slots:
             self.notifier.no_slots_found()
+            # Slots cleared — re-arm the failure-dedup so a later failure of the
+            # same slot-set alerts again rather than being suppressed.
+            self._last_booking_failed_key = None
             return
 
         # Track slots found during sniper window for end-of-window summary
@@ -534,6 +540,7 @@ class TockMonitor:
 
             if outcome == BookingOutcome.CONFIRMED:
                 self._booking_secured = True
+                self._last_booking_failed_key = None
                 logger.info(
                     f"[monitor] *** Booking secured: {booked_slot} ***\n"
                     "Bot will idle from now on. Safe to Ctrl+C."
@@ -553,16 +560,28 @@ class TockMonitor:
                 logger.warning(
                     "[monitor] All booking attempts failed this cycle. Will retry."
                 )
-                # Previously this was console-only — a failed sniper cycle (slots
-                # detected, every booking attempt failed) produced ZERO Discord
-                # signal. Wire the (formerly dead) booking_failed embed so the
-                # operator is alerted in real time. 2026-06-05 post-mortem fix.
-                self.notifier.booking_failed(
-                    slots,
-                    "all booking attempts failed (slot vanished, checkout "
-                    "never loaded, or payment prep failed) — see "
-                    "booking_failures/ for the captured page DOM (if any)",
-                )
+                # Wire the (formerly dead) booking_failed embed so a failed
+                # cycle alerts the operator. Dedup by slot-set so a contested
+                # sniper window (continuous polling, same slots unbookable each
+                # poll) fires ONE embed, not dozens — which would hit Discord's
+                # rate limit and bury the signal. A new/changed failed slot-set
+                # re-alerts. 2026-06-05 post-mortem + PFR hardening.
+                failed_key = tuple(sorted(
+                    f"{s.slot_date_str}@{s.slot_time}" for s in slots
+                ))
+                if failed_key != self._last_booking_failed_key:
+                    self._last_booking_failed_key = failed_key
+                    self.notifier.booking_failed(
+                        slots,
+                        "all booking attempts failed (slot vanished, checkout "
+                        "never loaded, or payment prep failed) — see "
+                        "booking_failures/ for the captured page DOM (if any)",
+                    )
+                else:
+                    logger.debug(
+                        "[monitor] booking_failed embed suppressed — same "
+                        "slot-set already alerted this window"
+                    )
 
             # Flush any deferred tracker writes (sniper mode defers disk I/O)
             self.tracker.flush_deferred()
@@ -699,6 +718,7 @@ class TockMonitor:
             if not self._sniper_active:
                 self._sniper_active = True
                 self._sniper_slots_found = 0
+                self._last_booking_failed_key = None  # re-arm failure dedup
                 # Reset adaptive state for each new sniper window
                 self._sniper_concurrent = True
                 self._sniper_error_window.clear()

@@ -133,7 +133,10 @@ _COLLECT_SLOTS_JS = r"""
     dateStr,
   } = args;
   const re = new RegExp(timeRegex, timeFlags || 'i');
-  let emitIdx = 0;
+  // Clear stale tags from a prior pass (matters only under page reuse without
+  // a reload) so a token can never resolve to a leftover element.
+  document.querySelectorAll('[data-sniper-target]')
+    .forEach((e) => e.removeAttribute('data-sniper-target'));
 
   let root = document;
   let containerUsed = false;
@@ -213,8 +216,8 @@ _COLLECT_SLOTS_JS = r"""
     // button so same-time duplicates stay distinguishable. Best-effort.
     let target = null;
     if (time !== null && dateStr) {
-      target = dateStr + '#' + emitIdx;
-      emitIdx++;
+      // Index by physical button position so JS and PW paths agree on tokens.
+      target = dateStr + '#' + buttons.indexOf(btn);
       try { btn.setAttribute('data-sniper-target', target); } catch (_) {}
     }
     slots.push({ time, source, target });
@@ -2240,6 +2243,16 @@ class AvailabilityChecker:
         time_re = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM|am|pm))\b")
         slots: list[AvailableSlot] = []
         date_str = target_date.isoformat()
+
+        # Clear stale tags from a prior pass (page-reuse safety) so a token
+        # never resolves to a leftover element from an earlier collection.
+        try:
+            await page.evaluate(
+                "() => document.querySelectorAll('[data-sniper-target]')"
+                ".forEach((e) => e.removeAttribute('data-sniper-target'))"
+            )
+        except Exception:
+            pass
 
         try:
             # Container scope: when slots_container exists, scope to it;
