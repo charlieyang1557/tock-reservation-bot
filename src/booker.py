@@ -69,6 +69,17 @@ _SCREENSHOT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "debug_screenshots"
 )
 
+# Where _dump_click_failure() writes the page HTML when a slot-click fails.
+# Always on (failures are rare) so the next release window is self-diagnosing:
+# the dump reveals whether the slot vanished (race-loss) or the button was
+# present but unmatched (scope bug) — the 2026-06-05 ambiguity.
+_BOOKING_FAILURE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "booking_failures"
+)
+# Cap dump files so a pathological failure burst can't exhaust the disk
+# (self-DoS). ~50 full search-page HTMLs ≈ a few tens of MB.
+_MAX_FAILURE_DUMPS = 50
+
 # Codex MEDIUM 1: classification of "generic Book" selectors (vs.
 # specific per-time-slot selectors) now lives in src/selectors.py
 # alongside `get_slot_button_selectors` so the two cannot drift apart.
@@ -449,33 +460,60 @@ class TockBooker:
             # slot — if it's no longer visible, the slot vanished and the
             # first-button fallback would book the wrong time (Codex review).
             using_warm_page = not owns_page
-            slot_clicked = await self._click_time_slot(
-                page, slot, strict_time_match=using_warm_page
-            )
-            if not slot_clicked and skip_click and not day_clicked:
-                # B1.5 fallback: skip-mode found no slot buttons; click the
-                # calendar day and retry the time-slot click once.
-                logger.debug(
-                    f"[book] {slot} — skip-mode found no slot buttons; "
-                    "falling back to click_calendar_day + re-click"
-                )
-                if booking_won.is_set():
-                    self.notifier.booking_aborted(slot, "another slot already booked")
-                    return False
-                if not await self._click_calendar_day(page, slot):
-                    return False
-                day_clicked = True
-                for try_sel in get_slot_button_selectors()[:2]:
-                    try:
-                        await page.wait_for_selector(try_sel, timeout=2000)
-                        break
-                    except Exception:
-                        continue
+
+            # Fast path: the checker tagged the exact button it found with a
+            # data-sniper-target attribute on this (retained warm) page. Click
+            # it directly — skipping the ~4s selector rediscovery AND the
+            # parent-only time match that lost the 2026-06-05 slots. If the tag
+            # is gone the slot vanished (lost the race), so dump the DOM and
+            # fail fast instead of slow-scanning a page whose slot is gone.
+            if using_warm_page and slot.target_selector:
+                slot_clicked = await self._click_tagged_slot(page, slot)
+                if not slot_clicked:
+                    # Tag missing: the slot may have vanished OR an SPA rerender
+                    # dropped our custom attribute while the button is still
+                    # present (also covers a transient click error). Don't assume
+                    # vanished — rescan the live DOM (strict) before giving up, so
+                    # a benign rerender can't silently cost us a bookable slot.
+                    logger.info(
+                        f"[book] {slot} — tagged element not found; rescanning "
+                        "live DOM (strict) before giving up"
+                    )
+                    slot_clicked = await self._click_time_slot(
+                        page, slot, strict_time_match=True
+                    )
+                    if not slot_clicked:
+                        await self._dump_click_failure(page, slot)
+                        return False
+            else:
                 slot_clicked = await self._click_time_slot(
                     page, slot, strict_time_match=using_warm_page
                 )
-            if not slot_clicked:
-                return False
+                if not slot_clicked and skip_click and not day_clicked:
+                    # B1.5 fallback: skip-mode found no slot buttons; click the
+                    # calendar day and retry the time-slot click once.
+                    logger.debug(
+                        f"[book] {slot} — skip-mode found no slot buttons; "
+                        "falling back to click_calendar_day + re-click"
+                    )
+                    if booking_won.is_set():
+                        self.notifier.booking_aborted(slot, "another slot already booked")
+                        return False
+                    if not await self._click_calendar_day(page, slot):
+                        return False
+                    day_clicked = True
+                    for try_sel in get_slot_button_selectors()[:2]:
+                        try:
+                            await page.wait_for_selector(try_sel, timeout=2000)
+                            break
+                        except Exception:
+                            continue
+                    slot_clicked = await self._click_time_slot(
+                        page, slot, strict_time_match=using_warm_page
+                    )
+                if not slot_clicked:
+                    await self._dump_click_failure(page, slot)
+                    return False
 
             # Scroll to bottom so the confirm button (which may be below the fold
             # on a 800px viewport) becomes accessible before checkout detection.
@@ -497,6 +535,7 @@ class TockBooker:
                 "03_checkout_loaded" if checkout_ok else "03_checkout_timeout"
             )
             if not checkout_ok:
+                await self._dump_click_failure(page, slot)
                 return False
 
             # ── Step 5a: prep (NO lock — concurrent across tasks) ─────
@@ -512,6 +551,7 @@ class TockBooker:
                 page, slot, booking_won=booking_won
             )
             if not prep_ok:
+                await self._dump_click_failure(page, slot)
                 return False
 
             # ── Step 5b: confirm click + verify (locked — only one wins) ─
@@ -860,6 +900,88 @@ class TockBooker:
             f"(selector: {matched_selector!r})"
         )
         return False
+
+    async def _click_tagged_slot(self, page: Page, slot: AvailableSlot) -> bool:
+        """Click the exact button the checker tagged with data-sniper-target.
+
+        Returns True if the tagged element was found and clicked. Returns False
+        when the slot carries no tag (fresh-nav booking) or the tag is no longer
+        in the DOM (the slot vanished between detection and this click) — the
+        caller treats a False on a warm page as a vanished slot.
+        """
+        target = getattr(slot, "target_selector", None)
+        if not target:
+            return False
+        try:
+            loc = page.locator(target)
+            if await loc.count() > 0:
+                # Bounded timeout: if the tagged button is present-but-not-yet
+                # actionable, fail fast (3s) and let the caller rescan, rather
+                # than inheriting Playwright's 30s default on the race path.
+                await loc.first.click(timeout=3000)
+                logger.info(
+                    f"[book] Clicked checker-tagged slot {slot} via {target}"
+                )
+                return True
+        except Exception as e:
+            logger.error(
+                f"[book] Tagged-slot click failed for {slot} "
+                f"({target}): {type(e).__name__}: {e}"
+            )
+        return False
+
+    async def _dump_click_failure(self, page: Page, slot: AvailableSlot) -> None:
+        """Dump the live page HTML when a slot-click fails, so the next release
+        window reveals WHY: slot vanished (race-loss → no matching button in
+        the dump) vs. button present but unmatched (scope bug → the time is in
+        the dump but outside the matcher's reach). Best-effort; never raises.
+        """
+        try:
+            html = await page.content()
+        except Exception as e:
+            logger.debug(f"[book] click-failure dump skipped (no content): {e}")
+            return
+        try:
+            # mode=0o700 so the dump (full authenticated page HTML) isn't
+            # world-readable on a shared/CI host.
+            os.makedirs(_BOOKING_FAILURE_DIR, mode=0o700, exist_ok=True)
+            # Cap total dumps so a failure burst can't exhaust the disk.
+            try:
+                existing = [
+                    f for f in os.listdir(_BOOKING_FAILURE_DIR)
+                    if f.startswith("clickfail_")
+                ]
+            except OSError:
+                existing = []
+            if len(existing) >= _MAX_FAILURE_DUMPS:
+                logger.debug(
+                    f"[book] failure DOM dump skipped — {_MAX_FAILURE_DUMPS}-file "
+                    f"cap reached in {_BOOKING_FAILURE_DIR}"
+                )
+                return
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path = os.path.join(
+                _BOOKING_FAILURE_DIR, f"clickfail_{ts}_{slot.slot_date_str}.html"
+            )
+            # Strip query/fragment from the URL header — they carry
+            # session-ish params not needed for a diagnostic artifact.
+            raw_url = getattr(page, "url", "") or ""
+            try:
+                from urllib.parse import urlparse, urlunparse
+                clean_url = urlunparse(
+                    urlparse(raw_url)._replace(query="", fragment="")
+                )
+            except Exception:
+                clean_url = ""
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"<!-- url={clean_url} slot={slot} -->\n")
+                f.write(html)
+            logger.error(
+                f"[book] Failure DOM dumped → {path} "
+                f"(no clickable button matched {slot.slot_time})"
+            )
+        except Exception as e:
+            logger.debug(f"[book] failure DOM dump failed: {e}")
 
     async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
         """Return True when the checkout/booking-details page is detected.
