@@ -80,6 +80,23 @@ _BOOKING_FAILURE_DIR = os.path.join(
 # (self-DoS). ~50 full search-page HTMLs ≈ a few tens of MB.
 _MAX_FAILURE_DUMPS = 50
 
+
+def _write_failure_dump(
+    html: str, clean_url: str, slot_str: str, date_str: str, stage: str
+) -> str:
+    """Synchronous dump writer (run via asyncio.to_thread). Creates the file
+    owner-only (0600) so authenticated page HTML isn't world-readable even when
+    the process umask is permissive. Returns the written path."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(
+        _BOOKING_FAILURE_DIR, f"faildom_{stage}_{ts}_{date_str}.html"
+    )
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"<!-- stage={stage} url={clean_url} slot={slot_str} -->\n")
+        f.write(html)
+    return path
+
 # Codex MEDIUM 1: classification of "generic Book" selectors (vs.
 # specific per-time-slot selectors) now lives in src/selectors.py
 # alongside `get_slot_button_selectors` so the two cannot drift apart.
@@ -472,9 +489,13 @@ class TockBooker:
                 if not slot_clicked:
                     # Tag missing: the slot may have vanished OR an SPA rerender
                     # dropped our custom attribute while the button is still
-                    # present (also covers a transient click error). Don't assume
-                    # vanished — rescan the live DOM (strict) before giving up, so
+                    # present (also covers a transient click error). If another
+                    # task already won, abort quietly (no rescan, no dump).
+                    # Otherwise rescan the live DOM (strict) before giving up, so
                     # a benign rerender can't silently cost us a bookable slot.
+                    if booking_won.is_set():
+                        self.notifier.booking_aborted(slot, "another slot already booked")
+                        return False
                     logger.info(
                         f"[book] {slot} — tagged element not found; rescanning "
                         "live DOM (strict) before giving up"
@@ -483,7 +504,8 @@ class TockBooker:
                         page, slot, strict_time_match=True
                     )
                     if not slot_clicked:
-                        await self._dump_click_failure(page, slot)
+                        if not booking_won.is_set():
+                            await self._dump_click_failure(page, slot, stage="click")
                         return False
             else:
                 slot_clicked = await self._click_time_slot(
@@ -512,7 +534,10 @@ class TockBooker:
                         page, slot, strict_time_match=using_warm_page
                     )
                 if not slot_clicked:
-                    await self._dump_click_failure(page, slot)
+                    # Don't dump if another task already won — that's a clean
+                    # race loss, not a diagnosable click failure.
+                    if not booking_won.is_set():
+                        await self._dump_click_failure(page, slot, stage="click")
                     return False
 
             # Scroll to bottom so the confirm button (which may be below the fold
@@ -529,13 +554,16 @@ class TockBooker:
                 self.notifier.booking_aborted(slot, "another slot already booked")
                 return False
 
-            checkout_ok = await self._wait_for_checkout(page, slot)
+            checkout_ok = await self._wait_for_checkout(
+                page, slot, booking_won=booking_won
+            )
             await self._booking_screenshot(
                 page,
                 "03_checkout_loaded" if checkout_ok else "03_checkout_timeout"
             )
             if not checkout_ok:
-                await self._dump_click_failure(page, slot)
+                if not booking_won.is_set():
+                    await self._dump_click_failure(page, slot, stage="checkout")
                 return False
 
             # ── Step 5a: prep (NO lock — concurrent across tasks) ─────
@@ -551,7 +579,8 @@ class TockBooker:
                 page, slot, booking_won=booking_won
             )
             if not prep_ok:
-                await self._dump_click_failure(page, slot)
+                if not booking_won.is_set():
+                    await self._dump_click_failure(page, slot, stage="prep")
                 return False
 
             # ── Step 5b: confirm click + verify (locked — only one wins) ─
@@ -918,7 +947,10 @@ class TockBooker:
                 # Bounded timeout: if the tagged button is present-but-not-yet
                 # actionable, fail fast (3s) and let the caller rescan, rather
                 # than inheriting Playwright's 30s default on the race path.
-                await loc.first.click(timeout=3000)
+                # no_wait_after=True: don't fold the post-click checkout
+                # navigation into the click budget — _wait_for_checkout owns
+                # that — so a successful click can't time out as a false miss.
+                await loc.first.click(timeout=3000, no_wait_after=True)
                 logger.info(
                     f"[book] Clicked checker-tagged slot {slot} via {target}"
                 )
@@ -930,61 +962,71 @@ class TockBooker:
             )
         return False
 
-    async def _dump_click_failure(self, page: Page, slot: AvailableSlot) -> None:
-        """Dump the live page HTML when a slot-click fails, so the next release
-        window reveals WHY: slot vanished (race-loss → no matching button in
-        the dump) vs. button present but unmatched (scope bug → the time is in
-        the dump but outside the matcher's reach). Best-effort; never raises.
+    async def _dump_click_failure(
+        self, page: Page, slot: AvailableSlot, stage: str = "click"
+    ) -> None:
+        """Dump the live page HTML on a booking-stage failure so the next
+        release window is self-diagnosing. `stage` (click/checkout/prep) is
+        reflected in the filename and log line so the artifact is NOT mislabeled
+        as a click-match failure when the click actually succeeded. Best-effort.
         """
+        # Cap check FIRST (cheap listdir) so we don't pay for a full-page
+        # serialization just to discard it once the cap is reached.
+        try:
+            os.makedirs(_BOOKING_FAILURE_DIR, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(_BOOKING_FAILURE_DIR, 0o700)  # tighten a pre-existing dir
+            except OSError:
+                pass
+            existing = [
+                f for f in os.listdir(_BOOKING_FAILURE_DIR)
+                if f.startswith("faildom_")
+            ]
+        except OSError:
+            existing = []
+        if len(existing) >= _MAX_FAILURE_DUMPS:
+            logger.debug(
+                f"[book] {stage} failure DOM dump skipped — "
+                f"{_MAX_FAILURE_DUMPS}-file cap reached in {_BOOKING_FAILURE_DIR}"
+            )
+            return
+
         try:
             html = await page.content()
         except Exception as e:
-            logger.debug(f"[book] click-failure dump skipped (no content): {e}")
+            logger.debug(f"[book] {stage} failure dump skipped (no content): {e}")
             return
-        try:
-            # mode=0o700 so the dump (full authenticated page HTML) isn't
-            # world-readable on a shared/CI host.
-            os.makedirs(_BOOKING_FAILURE_DIR, mode=0o700, exist_ok=True)
-            # Cap total dumps so a failure burst can't exhaust the disk.
-            try:
-                existing = [
-                    f for f in os.listdir(_BOOKING_FAILURE_DIR)
-                    if f.startswith("clickfail_")
-                ]
-            except OSError:
-                existing = []
-            if len(existing) >= _MAX_FAILURE_DUMPS:
-                logger.debug(
-                    f"[book] failure DOM dump skipped — {_MAX_FAILURE_DUMPS}-file "
-                    f"cap reached in {_BOOKING_FAILURE_DIR}"
-                )
-                return
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            path = os.path.join(
-                _BOOKING_FAILURE_DIR, f"clickfail_{ts}_{slot.slot_date_str}.html"
-            )
-            # Strip query/fragment from the URL header — they carry
-            # session-ish params not needed for a diagnostic artifact.
-            raw_url = getattr(page, "url", "") or ""
-            try:
-                from urllib.parse import urlparse, urlunparse
-                clean_url = urlunparse(
-                    urlparse(raw_url)._replace(query="", fragment="")
-                )
-            except Exception:
-                clean_url = ""
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(f"<!-- url={clean_url} slot={slot} -->\n")
-                f.write(html)
-            logger.error(
-                f"[book] Failure DOM dumped → {path} "
-                f"(no clickable button matched {slot.slot_time})"
-            )
-        except Exception as e:
-            logger.debug(f"[book] failure DOM dump failed: {e}")
 
-    async def _wait_for_checkout(self, page: Page, slot: AvailableSlot) -> bool:
+        # Strip query/fragment from the URL header — they carry session-ish
+        # params not needed for a diagnostic artifact.
+        raw_url = getattr(page, "url", "") or ""
+        try:
+            from urllib.parse import urlparse, urlunparse
+            clean_url = urlunparse(urlparse(raw_url)._replace(query="", fragment=""))
+        except Exception:
+            clean_url = ""
+
+        # Offload the blocking file write to a thread so a large HTML dump can't
+        # stall the event loop (and another racing task's confirm-verify).
+        try:
+            path = await asyncio.to_thread(
+                _write_failure_dump, html, clean_url, str(slot),
+                slot.slot_date_str, stage,
+            )
+            logger.error(f"[book] {stage}-stage failure DOM dumped → {path}")
+        except Exception as e:
+            logger.debug(f"[book] {stage} failure DOM dump failed: {e}")
+
+    async def _wait_for_checkout(
+        self, page: Page, slot: AvailableSlot,
+        booking_won: asyncio.Event | None = None,
+    ) -> bool:
         """Return True when the checkout/booking-details page is detected.
+
+        When `booking_won` is provided, a fourth waiter races it so a losing
+        task bails in milliseconds (returning False) instead of sitting the full
+        30s once another slot has won — avoiding wasted latency and spurious
+        diagnostic dumps.
 
         Race three Playwright waiters concurrently and return True on the
         first success, cutting 0–1900 ms off the old 2-s polling tick:
@@ -1020,6 +1062,13 @@ class TockBooker:
             asyncio.create_task(_via_url(), name="wait_for_checkout::url"),
             asyncio.create_task(_via_function(), name="wait_for_checkout::function"),
         ]
+        if booking_won is not None:
+            async def _via_aborted():
+                await booking_won.wait()
+                return "__aborted__"
+            tasks.append(
+                asyncio.create_task(_via_aborted(), name="wait_for_checkout::aborted")
+            )
         won_via: str | None = None
         try:
             for fut in asyncio.as_completed(tasks, timeout=total_wait):
@@ -1042,6 +1091,12 @@ class TockBooker:
             # coroutines and so any stray Playwright cleanup runs.
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        if won_via == "__aborted__":
+            logger.info(
+                f"[book] Checkout wait aborted — another slot won "
+                f"({slot.slot_date_str})"
+            )
+            return False
         if won_via:
             logger.info(
                 f"[book] Checkout detected via {won_via} for {slot.slot_date_str}"
