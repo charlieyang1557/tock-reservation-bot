@@ -125,7 +125,8 @@ def test_looks_like_protobuf_for_empty_calendar_body():
     assert body_looks_protobuf(body) is False
 
 
-def test_fetch_calendar_returns_none_for_html_body(monkeypatch):
+@pytest.mark.asyncio
+async def test_fetch_calendar_returns_none_for_html_body(monkeypatch):
     """When fetch returns 200 + HTML body (CF interstitial), the
     fetch_calendar wrapper should return None to trigger fallback."""
     from src.calendar_replay import fetch_calendar, CalendarReplaySession
@@ -152,8 +153,7 @@ def test_fetch_calendar_returns_none_for_html_body(monkeypatch):
         restaurant_slug="benu",
     )
 
-    import asyncio
-    result = asyncio.get_event_loop().run_until_complete(fetch_calendar(sess))
+    result = await fetch_calendar(sess)
     assert result is None, (
         "fetch_calendar must return None when body is HTML (likely "
         "CF interstitial) so check_all falls back to legacy path"

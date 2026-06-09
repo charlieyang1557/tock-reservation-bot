@@ -1256,7 +1256,8 @@ class AvailabilityChecker:
         logger.info(
             f"[replay-diag] body_len={diag.body_len} date_hits={diag.date_hits} "
             f"unique_dates={diag.unique_dates} sections_passed={diag.sections_passed} "
-            f"sections_filtered={diag.sections_filtered}"
+            f"sections_filtered={diag.sections_filtered} "
+            f"decode_ok={getattr(diag, 'decode_ok', True)}"
         )
 
     def _capture_replay_miss(self) -> None:

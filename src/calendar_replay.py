@@ -16,8 +16,9 @@ How it works:
   4. The browser supplies cookies + TLS fingerprint automatically, so
      Cloudflare allows the request. Tock allows it because we present
      its own auth headers.
-  5. Response body is protobuf-encoded but date/time strings are stored
-     as plain ASCII inside the binary frame — regex-parse them out.
+  5. Response body is protobuf-encoded; a strict wire-format decode
+     extracts date sections and their seating time strings (see the
+     structural-decode notes above parse_with_diagnostics).
 
 Default OFF behind `USE_CALENDAR_REPLAY` config flag. When enabled,
 `AvailabilityChecker.check_all` short-circuits the normal per-date
@@ -64,41 +65,181 @@ _HTML_SIGNATURE_BYTES = (b"<!doctype", b"<html", b"<HTML", b"<HEAD", b"<head")
 # safer to treat as failure (fall back) than as "no slots success".
 _PROTOBUF_MIN_PLAUSIBLE_BYTES = 20
 
-# Per-date section heuristics (empirical, 2026-05-10):
-# benu (has slots):     each date section is 1000-1500 bytes, 11-17 times
-# fuhuihua (sold out):  each date section is 16-322 bytes, 0-2 times
-# A "real bookable date" section is large because it contains slot
-# metadata (party limits, prices, availability counts) per slot. A
-# "sold out" date section is just the date marker + a few framing bytes.
-# Filter date sections that look too small to plausibly contain real
-# slot metadata, AND require at least N time strings — together this
-# rejects fuhuihua's ghost slots while keeping all benu's real ones.
-_MIN_BOOKABLE_SECTION_BYTES = 800
-_MIN_BOOKABLE_TIMES_PER_SECTION = 5
+# --- Structural decode (recalibrated after the 2026-06-05 release miss) ---
+# The 2026-05-10 ghost-slot guards (_MIN_BOOKABLE_SECTION_BYTES=800,
+# _MIN_BOOKABLE_TIMES_PER_SECTION=5) were calibrated on benu's high-volume
+# shape (1000-1500 b/section, 11-17 seatings) and FILTERED ALL 8 SECTIONS
+# of the real Fuhuihua release (~180-400 b sections, 1-2 seatings each —
+# bot.log:256945, capture: tests/fixtures/20260605T200009_*.bin). Instead
+# of re-tuning size thresholds per restaurant, the parser now decodes the
+# protobuf wire format. In every observed capture (benu trace + fuhuihua
+# release) a real seating is an exactly-5-byte "HH:MM" string field inside
+# a slot message nested under a date section:
+#
+#   f1 { f1: "YYYY-MM-DD"                  # date section
+#        f2 { ... f2 { f3: "HH:MM" ... }}} # seating entries
+#   f1 { f1: "YYYY-MM-DD"  f2: <empty> }   # sold out / not released
+#
+# Ghost protection (the reason the size guards existed) now comes from
+# structure instead of size:
+#   - raw framing bytes can't fullmatch an exactly-5-byte string field;
+#   - times inside prose (experience descriptions) are substrings of long
+#     string fields, never standalone 5-byte fields;
+#   - messages listing MANY dates (the requested-range echo) provide no
+#     unambiguous date context, so stray times there are dropped;
+#   - malformed bodies fail strict decode → zero slots; the DOM safety-net
+#     in checker.py bounds false negatives.
 
-# Time marker pattern (HH:MM, 24-hour). Note: the body has many "00:00"
-# style framing artifacts (zero offsets in the protobuf wire format) so
-# we filter to plausible booking times (10:00–23:59).
-_TIME_RE = re.compile(rb"\b([0-2]\d):([0-5]\d)\b")
+# Exact-field patterns: the WHOLE length-delimited payload must match.
+_DATE_FIELD_RE = re.compile(rb"\A20\d{2}-\d{2}-\d{2}\Z")
+_TIME_FIELD_RE = re.compile(rb"\A([0-2]\d):([0-5]\d)\Z")
+
+# Seatings outside plausible booking hours are dropped (defense against
+# schemas encoding non-seating times like 00:00 sentinels).
 _MIN_BOOKING_HOUR = 10
 _MAX_BOOKING_HOUR = 23
+
+# Protobuf spec maximum field number (2^29 - 1). Tag varints above it
+# are invalid wire format — rejecting them stops binary garbage from
+# "decoding" into messages. Do NOT lower this to something "plausible":
+# Tock's real envelope field in the 06/05 capture is 60686.
+_MAX_PLAUSIBLE_FIELD_NUMBER = 536_870_911
+
+# Real captures nest ~8 levels deep; bound recursion into misidentified
+# binary blobs.
+_MAX_DECODE_DEPTH = 16
+
+
+def _read_varint(buf: bytes, i: int) -> "tuple[int, int] | None":
+    """Read one varint at offset i. Returns (value, next_offset) or None
+    on overrun/overlong."""
+    val = 0
+    shift = 0
+    n = len(buf)
+    while i < n:
+        b = buf[i]
+        i += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, i
+        shift += 7
+        if shift > 63:
+            return None
+    return None
+
+
+def _decode_message(buf: bytes) -> "list[tuple[int, int, object]] | None":
+    """Strictly decode buf as ONE protobuf message. Returns a list of
+    (field_number, wire_type, value) — value is an int for varints, bytes
+    for length-delimited/fixed fields — or None if buf is not a valid
+    message (truncation, invalid wire type, implausible field number).
+    """
+    out: list[tuple[int, int, object]] = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        r = _read_varint(buf, i)
+        if r is None:
+            return None
+        tag, i = r
+        field_no, wt = tag >> 3, tag & 7
+        if field_no < 1 or field_no > _MAX_PLAUSIBLE_FIELD_NUMBER:
+            return None
+        if wt == 0:  # varint
+            r = _read_varint(buf, i)
+            if r is None:
+                return None
+            val, i = r
+            out.append((field_no, wt, val))
+        elif wt == 1:  # fixed64
+            if n - i < 8:
+                return None
+            out.append((field_no, wt, buf[i:i + 8]))
+            i += 8
+        elif wt == 2:  # length-delimited
+            r = _read_varint(buf, i)
+            if r is None:
+                return None
+            ln, i = r
+            if ln > n - i:
+                return None
+            out.append((field_no, wt, buf[i:i + ln]))
+            i += ln
+        elif wt == 5:  # fixed32
+            if n - i < 4:
+                return None
+            out.append((field_no, wt, buf[i:i + 4]))
+            i += 4
+        else:  # deprecated groups (3/4) and invalid types (6/7)
+            return None
+    return out
+
+
+def _collect_seating_times(
+    buf: bytes,
+    context_date: "str | None",
+    out: "dict[str, set[tuple[int, int]]]",
+    depth: int = 0,
+) -> bool:
+    """Recursively decode buf as a protobuf message, collecting seating
+    times into out[date_iso] = {(hh, mm), ...}.
+
+    Date context: a message whose direct fields include EXACTLY ONE
+    distinct date string sets the context for its whole subtree. Multiple
+    distinct dates (the range-echo shape) make attribution ambiguous →
+    context is cleared for that subtree. Times found with no context are
+    discarded.
+
+    Returns True if buf decoded as a valid message (used by the caller to
+    report decode_ok); nested blobs that fail to decode are simply treated
+    as opaque bytes.
+    """
+    if depth > _MAX_DECODE_DEPTH:
+        return False
+    fields = _decode_message(buf)
+    if fields is None:
+        return False
+    dates = {
+        v for _, wt, v in fields
+        if wt == 2 and _DATE_FIELD_RE.match(v)  # \A..\Z anchored
+    }
+    if len(dates) == 1:
+        ctx: "str | None" = next(iter(dates)).decode()
+    elif dates:
+        ctx = None  # ambiguous — never attribute times across many dates
+    else:
+        ctx = context_date
+    for _, wt, v in fields:
+        if wt != 2 or not v or not isinstance(v, bytes):
+            continue
+        if _DATE_FIELD_RE.match(v):
+            continue
+        m = _TIME_FIELD_RE.match(v)
+        if m:
+            if ctx is not None:
+                out.setdefault(ctx, set()).add(
+                    (int(m.group(1)), int(m.group(2)))
+                )
+            continue
+        _collect_seating_times(v, ctx, out, depth + 1)
+    return True
 
 
 @dataclass
 class ReplayParseDiag:
     """Diagnostics from one parse of a calendar/full body.
 
-    We are otherwise BLIND to why the replay path returns 0 slots for
-    fuhuihua (the ghost-slot guards silently filter sections). These
-    counts let `check_all` log, at INFO, exactly how many date sections
-    the size/time guards rejected so the thresholds can be re-tuned from
-    real captures instead of guessed.
+    These counts are logged at INFO by `check_all` so a replay miss can
+    be diagnosed from bot.log (it's how the 2026-06-05 incident was
+    root-caused). date_hits/unique_dates stay raw byte-scan counters so
+    the numbers remain comparable with pre-recalibration logs.
     """
     body_len: int = 0
     date_hits: int = 0          # total date-string regex matches in body
     unique_dates: int = 0       # distinct date markers
-    sections_passed: int = 0    # date sections that cleared BOTH guards
-    sections_filtered: int = 0  # date sections rejected by a guard
+    sections_passed: int = 0    # dates with >=1 structurally valid seating
+    sections_filtered: int = 0  # dates with none (sold out / not released)
+    decode_ok: bool = True      # top-level body decoded as valid protobuf
 
 
 @dataclass
@@ -293,99 +434,55 @@ def parse_with_diagnostics(
     body: bytes, target_dates: list[date],
 ) -> "tuple[list[AvailableSlot], ReplayParseDiag]":
     """Like `parse_available_slots`, but ALSO returns a `ReplayParseDiag`
-    counting body length, date-string hits, and how many date sections
-    passed vs were filtered by the ghost-slot guards.
+    counting body length, date-string hits, and how many dates carried
+    structurally valid seatings vs none.
 
-    Strategy:
-      - The body is protobuf-encoded but date/time strings are stored
-        as plain ASCII inside the binary frame.
-      - Each available date appears in the body 1+ times, followed by
-        the available time slots for that date, until the next date
-        boundary.
-      - We scan the body linearly: for each date we find, collect
-        unique times that appear BEFORE the next date's first byte.
-      - Filter to `target_dates` so the caller only gets back dates
-        they care about.
-      - Filter times to plausible booking hours (10:00–23:59) since
-        the protobuf body has framing bytes that look like 00:00,
-        01:23, etc.
+    Strategy (structural decode — see the notes above _DATE_FIELD_RE):
+      - Strictly decode the protobuf wire format, recursively.
+      - A message whose direct fields include exactly one distinct
+        date-string field establishes the date context for its subtree.
+      - Every exactly-5-byte "HH:MM" string field under a date context
+        is a seating time for that date.
+      - Filter to plausible booking hours (10:00–23:59) and to
+        `target_dates`, dedupe, order by date then time.
 
-    The diagnostics exist because the size/time guards below were
-    calibrated on benu (high-volume) and silently drop a real fuhuihua
-    release (few seatings → sub-threshold section). Surfacing the
-    passed/filtered counts lets `check_all` log them so we can re-tune
-    from real captures instead of flying blind.
+    A body that fails strict decode yields zero slots (diag.decode_ok
+    False); checker.py's post-release DOM safety-net bounds the false-
+    negative cost, and the replay-miss capture dump preserves the bytes
+    for recalibration — exactly how the 2026-06-05 capture was obtained.
     """
     from src.checker import AvailableSlot
 
     target_iso = {d.isoformat(): d for d in target_dates}
     diag = ReplayParseDiag(body_len=len(body))
 
-    # Find every date occurrence with its byte offset
-    date_hits: list[tuple[int, str]] = []
-    for m in _DATE_RE.finditer(body):
-        date_hits.append((m.start(), m.group(0).decode()))
-    diag.date_hits = len(date_hits)
-    if not date_hits:
-        return [], diag
+    # Raw byte-scan counters — kept comparable with pre-recalibration
+    # logs (the 06/05 incident line: date_hits=30 unique_dates=8).
+    raw_dates = [m.group(0).decode() for m in _DATE_RE.finditer(body)]
+    diag.date_hits = len(raw_dates)
+    diag.unique_dates = len(set(raw_dates))
 
-    # For each unique date, find the contiguous range from its FIRST
-    # occurrence to the FIRST occurrence of the next unique date.
-    # Within that range, collect plausible booking times.
-    seen_dates = []
-    first_offset_per_date: dict[str, int] = {}
-    for off, d in date_hits:
-        if d not in first_offset_per_date:
-            first_offset_per_date[d] = off
-            seen_dates.append(d)
-    diag.unique_dates = len(seen_dates)
+    times_by_date: dict[str, set[tuple[int, int]]] = {}
+    diag.decode_ok = _collect_seating_times(body, None, times_by_date)
 
-    slots_by_date: dict[str, set[str]] = {}
-    for i, d in enumerate(seen_dates):
-        start = first_offset_per_date[d]
-        end = (
-            first_offset_per_date[seen_dates[i + 1]]
-            if i + 1 < len(seen_dates)
-            else len(body)
-        )
-        section = body[start:end]
+    # Keep only plausible booking-hour seatings
+    slots_by_date: dict[str, set[tuple[int, int]]] = {}
+    for date_iso, hhmm_set in times_by_date.items():
+        plausible = {
+            (hh, mm) for hh, mm in hhmm_set
+            if _MIN_BOOKING_HOUR <= hh <= _MAX_BOOKING_HOUR
+        }
+        if plausible:
+            slots_by_date[date_iso] = plausible
 
-        # Ghost-slot guard (empirical 2026-05-10): real bookable date
-        # sections are >= 800 bytes (contain slot metadata: party
-        # limits, prices, availability counts per slot). Sold-out
-        # restaurants like fuhuihua have date markers in the body but
-        # only ~20-300 bytes per date section because there's no slot
-        # metadata to encode. Skip these to avoid attributing protobuf
-        # framing bytes that happen to look like times to a date the
-        # restaurant has 0 availability for.
-        if len(section) < _MIN_BOOKABLE_SECTION_BYTES:
-            diag.sections_filtered += 1
+    diag.sections_passed = len(slots_by_date)
+    diag.sections_filtered = max(0, diag.unique_dates - diag.sections_passed)
+    if logger.isEnabledFor(logging.DEBUG):
+        for d in sorted(set(raw_dates) - set(slots_by_date)):
             logger.debug(
-                f"[calendar-replay] skipping date {d}: "
-                f"section {len(section)}b < {_MIN_BOOKABLE_SECTION_BYTES}b "
-                "threshold (likely sold out / no real slot metadata)"
+                f"[calendar-replay] date {d}: no structurally valid "
+                "seating (sold out / not released / no date context)"
             )
-            continue
-
-        times: set[str] = set()
-        for tm in _TIME_RE.finditer(section):
-            hh = int(tm.group(1))
-            mm = int(tm.group(2))
-            if _MIN_BOOKING_HOUR <= hh <= _MAX_BOOKING_HOUR:
-                # Format as "H:MM AM/PM" to match the bot's slot_time format
-                times.add(_format_24h_to_12h(hh, mm))
-        if len(times) < _MIN_BOOKABLE_TIMES_PER_SECTION:
-            diag.sections_filtered += 1
-            logger.debug(
-                f"[calendar-replay] skipping date {d}: "
-                f"only {len(times)} time(s) found "
-                f"< {_MIN_BOOKABLE_TIMES_PER_SECTION} threshold (likely "
-                "ghost slots from protobuf framing)"
-            )
-            continue
-        diag.sections_passed += 1
-        if times:
-            slots_by_date[d] = times
 
     # Build AvailableSlot list filtered to target dates
     result: list[AvailableSlot] = []
@@ -393,11 +490,11 @@ def parse_with_diagnostics(
         if date_iso not in target_iso:
             continue
         d = target_iso[date_iso]
-        for t in sorted(slots_by_date[date_iso], key=_time_sort_key):
+        for hh, mm in sorted(slots_by_date[date_iso]):
             result.append(
                 AvailableSlot(
                     slot_date=d,
-                    slot_time=t,
+                    slot_time=_format_24h_to_12h(hh, mm),
                     day_of_week=d.strftime("%A"),
                 )
             )

@@ -4,9 +4,11 @@ path and the replay-miss raw-body capture (fix/replay-parallel-capture).
 Background — forensics from the 2026-05-29 20:00 fuhuihua release:
   A real slot release sold out within seconds. The bot polled ~7×/sec but
   detected 0 slots. Two compounding causes:
-    1. parse_available_slots' ghost-slot guard (>=800 bytes / >=5 times per
-       date section) was calibrated on benu (high-volume) and silently
-       filters a real fuhuihua release (few seatings → sub-threshold).
+    1. parse_available_slots' ghost-slot guard (then >=800 bytes / >=5
+       times per date section) was calibrated on benu (high-volume) and
+       silently filtered a real fuhuihua release (few seatings →
+       sub-threshold). Since the 2026-06-05 recalibration the parser is a
+       strict structural protobuf decode — no size guards.
     2. check_all early-returned the empty-but-valid replay result ([]) and
        NEVER fell back to the reliable DOM scan.
 
@@ -585,38 +587,35 @@ async def test_replay_empty_dom_path_counter_consistency(monkeypatch):
 def test_parse_with_diagnostics_counts_filtered_sections():
     """parse_with_diagnostics returns the same slots as parse_available_slots
     PLUS a diag object counting body length, date hits, and how many date
-    sections passed vs were filtered by the size/time ghost-slot guards."""
+    sections carried structurally valid seatings (passed) vs none
+    (filtered)."""
     from src.calendar_replay import (
         parse_with_diagnostics, parse_available_slots,
     )
 
     target = date(2026, 5, 15)
-    # A single date marker followed by a tiny section (sold-out shape) →
-    # below the byte threshold → filtered.
+    # A date marker followed by a truncated/malformed tail (sold-out
+    # forensics shape) → no decodable seating → the date counts filtered.
     body = b"\x0a\x0a2026-05-15\x12\x05\x1a\x05"  # ~16 bytes, no real metadata
     slots, diag = parse_with_diagnostics(body, [target])
 
     assert slots == parse_available_slots(body, [target])
     assert diag.body_len == len(body)
     assert diag.date_hits >= 1
-    # The only section is sub-threshold → filtered, none passed.
+    # The only date yields no valid seating → filtered, none passed.
     assert diag.sections_filtered >= 1
     assert diag.sections_passed == 0
 
 
 def test_parse_with_diagnostics_counts_passed_section():
-    """A fat section with many times passes both guards → counted as passed
-    and its slots returned."""
+    """A date section with structurally valid seatings → counted as passed
+    and its slots returned. One seating suffices (the 06/05 release shape);
+    sparse sections must not be filtered."""
     from src.calendar_replay import parse_with_diagnostics
+    from tests.proto_fixtures import calendar_body, date_section
 
     target = date(2026, 5, 15)
-    # Big section with >= 5 plausible booking times (17:00..21:00) and
-    # >= 800 bytes so it clears both thresholds. Times are separated by a
-    # NUL framing byte so each clears the \b word boundary in _TIME_RE
-    # (mirrors how anchors sit between protobuf field separators).
-    good_times = b"\x0017:00\x0018:00\x0019:00\x0020:00\x0021:00\x00"
-    padding = b"\x00" * 900
-    body = b"\x0a\x0a2026-05-15" + good_times + padding
+    body = calendar_body(date_section("2026-05-15", ["17:00"]))
     slots, diag = parse_with_diagnostics(body, [target])
 
     assert diag.sections_passed == 1
