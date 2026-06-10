@@ -106,6 +106,16 @@ _TIME_FIELD_RE = re.compile(rb"\A([0-2]\d):([0-5]\d)\Z")
 _MIN_BOOKING_HOUR = 10
 _MAX_BOOKING_HOUR = 23
 
+# Seating-entry capacity fields (2026-06-10 live-ghost incident): seating
+# entries PERSIST in the wire body after selling out — presence is NOT
+# availability. Observed in every seating message: f4 = total seats,
+# f5 = seats REMAINING, f7 = booked. Verified by diffing the 06/05 release
+# capture (bookable seatings: f5=8, f7=0) against the 06/10 sold-out
+# capture of the SAME seatings (f5=0, f7=8); the recalibrated parser
+# without this check surfaced those as bookable and the live bot attempted
+# real bookings against a sold-out calendar. Only f5>0 seatings count.
+_SEATS_REMAINING_FIELD_NO = 5
+
 # Protobuf spec maximum field number (2^29 - 1). Tag varints above it
 # are invalid wire format — rejecting them stops binary garbage from
 # "decoding" into messages. Do NOT lower this to something "plausible":
@@ -221,6 +231,13 @@ def _collect_seating_times(
         ctx = None  # ambiguous — never attribute times across many dates
     else:
         ctx = context_date
+    # Bookability: a time string only counts when ITS OWN message carries
+    # remaining capacity (f5 > 0) — sold-out seatings keep their time
+    # strings forever (see _SEATS_REMAINING_FIELD_NO).
+    remaining = sum(
+        v for fno, wt, v in fields
+        if fno == _SEATS_REMAINING_FIELD_NO and wt == 0 and isinstance(v, int)
+    )
     for _, wt, v in fields:
         if wt != 2 or not v or not isinstance(v, bytes):
             continue
@@ -228,7 +245,7 @@ def _collect_seating_times(
             continue
         m = _TIME_FIELD_RE.match(v)
         if m:
-            if ctx is not None:
+            if ctx is not None and remaining > 0:
                 out.setdefault(ctx, set()).add(
                     (int(m.group(1)), int(m.group(2)))
                 )

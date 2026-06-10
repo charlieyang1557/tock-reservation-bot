@@ -117,7 +117,7 @@ def test_diag_truncated_false_for_real_release_capture():
     )
     assert diag.truncated is False
     assert diag.decode_ok is True
-    assert len(slots) == 6
+    assert len(slots) == 3  # the 3 BOOKABLE (f5>0) seatings
 
 
 def test_diag_truncated_false_for_simple_valid_body():

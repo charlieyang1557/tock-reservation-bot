@@ -49,19 +49,30 @@ def varint_field(field_no: int, value: int) -> bytes:
     return varint(field_no << 3) + varint(value)
 
 
-def seating(time_str: str) -> bytes:
-    """One seating entry: f2 { f3: "HH:MM", metadata } — the shape every
-    real bookable slot has in both the benu and fuhuihua captures."""
+def seating(time_str: str, remaining: int = 8) -> bytes:
+    """One seating entry: f2 { f3: "HH:MM", capacity varints, metadata } —
+    the shape every real seating has in the fuhuihua captures. f4=total
+    seats, f5=REMAINING (the availability discriminator — the 2026-06-10
+    live-ghost incident proved sold-out seatings persist in the body with
+    f5=0), f7=booked."""
     nested_availability = len_field(1, varint_field(1, 3) + varint_field(2, 1))
     inner = (
         len_field(3, time_str.encode())
         + varint_field(4, 8)
-        + varint_field(5, 8)
+        + varint_field(5, remaining)
         + varint_field(6, 0)
+        + varint_field(7, 8 - remaining)
         + varint_field(9, 1)
         + len_field(13, nested_availability)
     )
     return len_field(2, inner)
+
+
+def sold_out_seating(time_str: str) -> bytes:
+    """A seating that already sold (f5=0, f7=8) — present in the wire body
+    but NOT bookable. The exact shape of 06-06/06-07 in the 06/05 capture
+    and of 06-11/06-12/06-13 in the 06/10 sold-out capture."""
+    return seating(time_str, remaining=0)
 
 
 def date_section(date_iso: str, times: list[str]) -> bytes:

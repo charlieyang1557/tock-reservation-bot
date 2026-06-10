@@ -13,15 +13,23 @@ had ~180-400 byte sections with 1-2 seatings each.
 These tests run against the EXACT captured bytes
 (tests/fixtures/20260605T200009_…_replay.bin, dumped by the replay-miss
 calibration path that night). Ground truth, established by a strict
-protobuf wire decode of the capture:
+protobuf wire decode AND corrected by the 2026-06-10 live-ghost incident
+(seating entries persist after selling out — f4=total seats, f5=REMAINING,
+f7=booked; only f5>0 is bookable):
 
-    2026-06-06  17:00            2026-06-12  17:00
-    2026-06-07  17:00, 20:00     2026-06-13  17:00
-    2026-06-11  18:30            (06-05, 06-10, 06-14: zero-length f2 → empty)
+    BOOKABLE (f5=8): 2026-06-11 18:30, 2026-06-12 17:00, 2026-06-13 17:00
+      — exactly the set the incident DOM scan saw (06-12, 06-13) plus the
+      Thursday (06-11) that PREFERRED_DAYS never let the DOM scan check.
+    SOLD OUT but still encoded (f5=0, f7=8): 06-06 17:00, 06-07 17:00+20:00
+      — sold in an earlier release; treating presence as availability
+      ghosted these (and, on 06/10, ghosted 06-12/06-13 the moment they
+      sold out — the live bot attempted real bookings against them).
+    NEVER RELEASED (zero-length f2): 06-05, 06-10, 06-14.
 
 The capture also embeds the classic ghost traps: a 1441-byte prose
 description, a date-range echo listing all 8 dates with no seatings,
 and a "2026-06-05T19:59:56" timestamp string — none may produce slots.
+The 2026-06-10 sold-out body is the companion negative fixture.
 """
 import pathlib
 from datetime import date
@@ -78,51 +86,73 @@ def test_release_capture_finds_thursday_0611(release_body):
 
 def test_release_capture_full_inventory_exact(release_body):
     """With every calendar date as a target, the parse must return exactly
-    the 6 real seatings — nothing from the empty dates, the prose
-    description, the date-range echo, or the trailing timestamp."""
+    the 3 BOOKABLE seatings (f5>0) — nothing from the sold-out seatings
+    (f5=0: 06-06, 06-07), the never-released dates, the prose description,
+    the date-range echo, or the trailing timestamp."""
     from src.calendar_replay import parse_available_slots
 
     slots = parse_available_slots(release_body, ALL_CAPTURE_DATES)
     found = {(s.slot_date_str, s.slot_time) for s in slots}
     assert found == {
-        ("2026-06-06", "5:00 PM"),
-        ("2026-06-07", "5:00 PM"),
-        ("2026-06-07", "8:00 PM"),
         ("2026-06-11", "6:30 PM"),
         ("2026-06-12", "5:00 PM"),
         ("2026-06-13", "5:00 PM"),
     }
-    assert len(slots) == 6, "exactly one AvailableSlot per real seating"
+    assert len(slots) == 3, "exactly one AvailableSlot per BOOKABLE seating"
 
 
 def test_release_capture_empty_dates_stay_empty(release_body):
-    """The capture's zero-availability dates (f2 is zero-length) must not
-    ghost — even though their date strings appear in the body 2-4 times
-    (section + range echo + trailer)."""
+    """Never-released dates (zero-length f2) AND dates whose seatings are
+    all sold out (f5=0 — 06-06/06-07, sold in a prior release) must not
+    ghost, even though their date strings and seating entries are in the
+    body."""
     from src.calendar_replay import parse_available_slots
 
     slots = parse_available_slots(
-        release_body, [date(2026, 6, 5), date(2026, 6, 10), date(2026, 6, 14)]
+        release_body,
+        [date(2026, 6, 5), date(2026, 6, 6), date(2026, 6, 7),
+         date(2026, 6, 10), date(2026, 6, 14)],
     )
-    assert slots == [], f"empty dates must yield no slots; got {slots}"
+    assert slots == [], f"non-bookable dates must yield no slots; got {slots}"
 
 
 def test_release_capture_diagnostics(release_body):
-    """The diag counters that flagged the incident must now show 5 passed /
-    3 filtered (5 dates with real seatings, 3 released-but-empty dates),
-    with raw byte-scan counters unchanged from the incident log line."""
+    """The diag counters that flagged the incident must now show 3 passed /
+    5 filtered (3 dates with BOOKABLE seatings; 3 never-released + 2
+    sold-out dates), with raw byte-scan counters unchanged from the
+    incident log line."""
     from src.calendar_replay import parse_with_diagnostics
 
     slots, diag = parse_with_diagnostics(release_body, ALL_CAPTURE_DATES)
     assert diag.body_len == 3166
     assert diag.date_hits == 30
     assert diag.unique_dates == 8
-    assert diag.sections_passed == 5, (
-        f"5 dates carry real seatings; diag says {diag.sections_passed} "
+    assert diag.sections_passed == 3, (
+        f"3 dates carry bookable seatings; diag says {diag.sections_passed} "
         f"(incident value was 0)"
     )
-    assert diag.sections_filtered == 3
-    assert len(slots) == 6
+    assert diag.sections_filtered == 5
+    assert len(slots) == 3
+
+
+def test_sold_out_capture_yields_zero_slots():
+    """2026-06-10 LIVE-GHOST regression: minutes after the recalibrated
+    parser went live, it surfaced 06-12/06-13 from THIS body (captured
+    same hour) and the bot attempted real bookings against a sold-out
+    calendar. Seating entries persist after selling out with f5=0 —
+    the whole body must parse to ZERO slots."""
+    from src.calendar_replay import parse_available_slots, parse_with_diagnostics
+
+    body = (
+        pathlib.Path(__file__).parent / "fixtures"
+        / "20260610_fui-hui-hua_sold_out_replay.bin"
+    ).read_bytes()
+    assert len(body) == 2577, "fixture must be the exact captured body"
+    targets = [date(2026, 6, d) for d in range(5, 28)]
+    assert parse_available_slots(body, targets) == []
+    _, diag = parse_with_diagnostics(body, targets)
+    assert diag.decode_ok is True
+    assert diag.sections_passed == 0
 
 
 def test_empty_calendar_tiny_body_is_negative():

@@ -32,7 +32,48 @@ from tests.proto_fixtures import (
     len_field,
     seating,
     sold_out_date_section,
+    sold_out_seating,
 )
+
+
+def _section_with(date_iso: str, seatings: bytes) -> bytes:
+    """A date section holding pre-built seating bytes (real nesting)."""
+    inner_day = len_field(
+        1, len_field(1, date_iso.encode()) + len_field(2, seatings)
+    )
+    return len_field(
+        1, len_field(1, date_iso.encode()) + len_field(2, inner_day)
+    )
+
+
+def test_sold_out_seatings_are_not_bookable():
+    """2026-06-10 live-ghost class: seating entries PERSIST in the body
+    after selling out, with f5 (remaining seats) = 0. Presence is not
+    availability — only f5>0 seatings may produce slots. (This exact
+    class made the live bot attempt real bookings against a sold-out
+    calendar minutes after deploy.)"""
+    from src.calendar_replay import parse_available_slots
+
+    body = calendar_body(
+        _section_with("2026-06-12", sold_out_seating("17:00"))
+    )
+    assert parse_available_slots(body, [date(2026, 6, 12)]) == []
+
+
+def test_mixed_seatings_keep_only_remaining_capacity():
+    """A date with one sold-out and one open seating yields ONLY the open
+    one."""
+    from src.calendar_replay import parse_available_slots
+
+    body = calendar_body(
+        _section_with(
+            "2026-06-12", sold_out_seating("17:00") + seating("20:00")
+        )
+    )
+    slots = parse_available_slots(body, [date(2026, 6, 12)])
+    assert [(s.slot_date_str, s.slot_time) for s in slots] == [
+        ("2026-06-12", "8:00 PM")
+    ]
 
 
 def test_single_seating_release_is_bookable():
