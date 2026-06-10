@@ -726,6 +726,11 @@ class TockMonitor:
                 # Clear normal-mode skip cache so all dates are retried fresh
                 # during the sniper window (release may open any date)
                 self.checker.clear_normal_skip_cache()
+                # Re-arm the replay circuit breaker — a circuit opened
+                # during normal polling (schema drift days earlier) must
+                # not forfeit the release-night fast path; it was only
+                # reset at window END before (merge-review finding).
+                self.checker.reset_replay_circuit()
                 # Refresh screenshot count from disk so rotation stays accurate
                 # even when old screenshots from previous runs are on disk
                 self.checker.refresh_screenshot_count()

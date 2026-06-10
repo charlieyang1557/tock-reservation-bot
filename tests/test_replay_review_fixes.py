@@ -147,25 +147,32 @@ def test_truncated_body_can_still_yield_slots():
 # --------------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_decode_failure_returns_none_and_counts_failure(monkeypatch):
+async def test_decode_failure_returns_none_without_breaker_count(monkeypatch):
     """Body that fails strict decode → _try_calendar_replay returns None
-    (caller falls back to DOM) and the breaker counter increments."""
+    (caller falls back to DOM) and the bytes are dumped for calibration.
+    It must NOT count toward the circuit breaker: the fetch succeeded, and
+    the pre-release sold-out body has a different shape than the release
+    body — opening the circuit on a parse anomaly would forfeit the fast
+    path for the release moment (merge-review finding)."""
     body = b"\x0a\x0a2026-05-15" + b"\x00" * 300  # raw date + invalid tags
     checker = _make_replay_checker(monkeypatch, body)
+    checker._capture_replay_miss = MagicMock()
 
     result = await checker._try_calendar_replay(sniper_mode=False)
     assert result is None
-    assert checker._replay_failure_count == 1
+    assert checker._replay_failure_count == 0
+    checker._capture_replay_miss.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_truncated_empty_parse_returns_none(monkeypatch):
     """Depth-cap truncation with zero slots is equally suspect → None."""
     checker = _make_replay_checker(monkeypatch, _deep_chain())
+    checker._capture_replay_miss = MagicMock()
 
     result = await checker._try_calendar_replay(sniper_mode=False)
     assert result is None
-    assert checker._replay_failure_count == 1
+    assert checker._replay_failure_count == 0
 
 
 @pytest.mark.asyncio
@@ -195,15 +202,106 @@ async def test_truncated_with_slots_still_returns_slots(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_repeated_decode_failures_open_circuit(monkeypatch):
-    """Persistent decode breakage (schema change) must open the breaker
-    like any other replay failure mode."""
+async def test_suspect_empty_never_opens_circuit(monkeypatch):
+    """Persistent suspect-empty parses must keep RETRYING replay every
+    poll (DOM fallback covers each one) — pre-release sniper polls run at
+    0s interval, so any breaker here would open within ~2 seconds and
+    disable the ~160ms fast path for the release moment itself."""
     body = b"\x0a\x0a2026-05-15" + b"\x00" * 300
     checker = _make_replay_checker(monkeypatch, body)
+    checker._capture_replay_miss = MagicMock()
 
+    for _ in range(checker._REPLAY_FAILURE_THRESHOLD + 2):
+        result = await checker._try_calendar_replay(sniper_mode=False)
+        assert result is None
+    assert checker._replay_circuit_open is False
+
+
+@pytest.mark.asyncio
+async def test_parse_exception_opens_circuit_and_dumps_body(monkeypatch):
+    """Persistent parse EXCEPTIONS (a crashing parser, distinct from
+    suspect-empty) still open the breaker — and the body that crashes the
+    parser is dumped for offline calibration BEFORE the circuit kills all
+    further fetches (merge-review finding: this branch lost the evidence)."""
+    body = calendar_body(sold_out_date_section("2026-05-15"))
+    checker = _make_replay_checker(monkeypatch, body)
+    checker._capture_replay_miss = MagicMock()
+
+    def boom(*a, **k):
+        raise ValueError("schema drift")
+
+    monkeypatch.setattr("src.calendar_replay.parse_with_diagnostics", boom)
     for _ in range(checker._REPLAY_FAILURE_THRESHOLD):
         await checker._try_calendar_replay(sniper_mode=False)
+
     assert checker._replay_circuit_open is True
+    checker._capture_replay_miss.assert_called()
+
+
+def test_reset_replay_circuit_rearms_breaker():
+    """reset_replay_circuit clears the counter, the open flag, AND the
+    once-per-window capture budget — a calibration dump consumed during
+    Wednesday normal polling must not starve Friday's release-night
+    capture (sweep finding)."""
+    from src.checker import AvailabilityChecker
+
+    cfg = _make_config()
+    cfg.use_calendar_replay = True
+    c = AvailabilityChecker(cfg, MagicMock(), MagicMock())
+    c._replay_failure_count = 5
+    c._replay_circuit_open = True
+    c._replay_capture_dumped_this_window = True
+
+    c.reset_replay_circuit()
+    assert c._replay_failure_count == 0
+    assert c._replay_circuit_open is False
+    assert c._replay_capture_dumped_this_window is False
+
+
+def test_priority_capture_bypasses_window_budget():
+    """The post-release DOM-beat-replay capture is the artifact the whole
+    mechanism exists for (it root-caused 06/05) — it must dump even when
+    a transient suspect-empty body consumed the window budget earlier
+    (sweep finding); non-priority dumps still respect the budget."""
+    from src.checker import AvailabilityChecker
+
+    cfg = _make_config()
+    cfg.use_calendar_replay = True
+    c = AvailabilityChecker(cfg, MagicMock(), MagicMock())
+    c._dump_body = MagicMock()
+    c._last_replay_body = b"\x0a" * 30
+    c._replay_capture_dumped_this_window = True
+
+    c._capture_replay_miss()  # budget consumed → no dump
+    c._dump_body.assert_not_called()
+
+    c._capture_replay_miss(priority=True)  # release-night artifact → dump
+    c._dump_body.assert_called_once()
+
+
+def test_sniper_window_start_resets_replay_circuit(monkeypatch):
+    """The monitor must re-arm the breaker when a sniper window STARTS —
+    a circuit opened during Wednesday normal polling (schema drift) must
+    not forfeit Friday's release-night fast path (merge-review finding:
+    the only reset was at window END)."""
+    from unittest.mock import patch as _patch
+    from src.monitor import TockMonitor
+
+    cfg = _make_config()
+    browser = MagicMock()
+    checker = MagicMock()
+    notifier = MagicMock()
+    tracker = MagicMock()
+    with _patch("src.monitor.TockBooker"):
+        monitor = TockMonitor(cfg, browser, checker, notifier, tracker)
+    monitor._sniper_active = False
+    monkeypatch.setattr(
+        monitor, "_sniper_window_info", lambda now: "20:10"
+    )
+
+    interval = monitor._get_poll_interval()
+    assert interval == 0
+    checker.reset_replay_circuit.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
@@ -215,28 +313,37 @@ def _make_booker():
     return TockBooker(_make_config(), MagicMock(), MagicMock())
 
 
-def _instrumented(booker, page, calls, click_results=(False,), day_click=False):
+def _instrumented(
+    booker, page, calls,
+    click_results=(False,), day_results=(True,), container_ok=True,
+):
     """Wire _book_single's collaborators to record an ordered call trace.
 
-    click_results: successive _click_time_slot returns (last repeats).
-    day_click: what _click_calendar_day reports.
+    click_results / day_results: successive returns (last repeats).
+    container_ok: what the post-reload calendar_container wait reports.
     """
-    results = list(click_results)
+    clicks = list(click_results)
+    days = list(day_results)
 
     async def fake_click(*a, **k):
         calls.append("click")
-        return results.pop(0) if len(results) > 1 else results[0]
+        return clicks.pop(0) if len(clicks) > 1 else clicks[0]
 
     async def fake_reload(*a, **k):
         calls.append("reload")
 
     async def fake_day_click(*a, **k):
         calls.append("day")
-        return day_click
+        return days.pop(0) if len(days) > 1 else days[0]
+
+    async def fake_wait_for_selector(*a, **k):
+        calls.append("container")
+        return container_ok
 
     page.reload = fake_reload
     booker._click_time_slot = fake_click
     booker._click_calendar_day = fake_day_click
+    booker._wait_for_selector = fake_wait_for_selector
     booker._click_tagged_slot = AsyncMock(return_value=False)
     booker._dump_click_failure = AsyncMock()
     booker._booking_screenshot = AsyncMock()
@@ -269,41 +376,60 @@ def test_source_not_part_of_slot_identity():
 
 
 @pytest.mark.asyncio
-async def test_replay_slot_reloads_warm_page_before_click():
-    """Reload precedes the click; when the click then finds no buttons the
-    day-click fallback must be ARMED (adversarial-verify finding: the
-    reload may reset the SPA's day selection — the checker re-clicks the
-    day after every reuse-poll reload for the same reason)."""
+async def test_replay_slot_reload_container_then_strict_click():
+    """The final post-reload sequence (two merge-review rounds): reload →
+    wait for calendar_container (domcontentloaded fires before SPA
+    hydration) → strict time click TRUSTING the page's own ?date= URL,
+    with the day-click fallback ARMED. No unconditional day click: the
+    booker's _click_calendar_day matches day-NUMBER text with no month
+    validation, so clicking it eagerly is itself a wrong-date vector
+    (and can de-select the date the URL already selected)."""
     booker = _make_booker()
     page = _warm_page()
     calls: list[str] = []
-    _instrumented(booker, page, calls)
+    _instrumented(booker, page, calls, day_results=(False,))
     slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
 
     ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
     assert ok is False
-    assert calls == ["reload", "click", "day"], (
-        f"replay slot must reload BEFORE clicking and arm the day-click "
-        f"fallback when no buttons match; got {calls}"
+    assert calls == ["reload", "container", "click", "day"], (
+        f"replay slot: reload, container wait, strict click first, "
+        f"day-click only as fallback; got {calls}"
     )
 
 
 @pytest.mark.asyncio
-async def test_replay_slot_day_click_fallback_recovers_slot():
-    """The full recovery path: reload → no buttons → day click → retry
-    click succeeds. Without arming the fallback the slot is lost on
-    exactly the path fix #2 exists to save."""
+async def test_replay_slot_fallback_day_click_recovers_slot():
+    """Recovery path: ?date= didn't render buttons → strict click misses →
+    fallback day click → retry click books the slot."""
     booker = _make_booker()
     page = _warm_page()
     calls: list[str] = []
     _instrumented(
-        booker, page, calls, click_results=(False, True), day_click=True
+        booker, page, calls,
+        click_results=(False, True), day_results=(True,),
     )
     slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
 
     await booker._book_single(slot, asyncio.Event(), warm_page=page)
-    assert calls == ["reload", "click", "day", "click"], (
-        f"failed click on reloaded page must day-click and retry; got {calls}"
+    assert calls == ["reload", "container", "click", "day", "click"], (
+        f"failed strict click must day-click and retry once; got {calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_slot_no_unconditional_day_click_on_success():
+    """When the strict click succeeds straight off the reloaded ?date=
+    page, NO day click ever runs (month-boundary wrong-date protection)."""
+    booker = _make_booker()
+    page = _warm_page()
+    calls: list[str] = []
+    _instrumented(booker, page, calls, click_results=(True,))
+    slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
+
+    await booker._book_single(slot, asyncio.Event(), warm_page=page)
+    assert calls == ["reload", "container", "click"], (
+        f"successful strict click must not day-click at all; got {calls}"
     )
 
 
@@ -323,13 +449,13 @@ async def test_dom_slot_does_not_reload_warm_page():
 
 
 @pytest.mark.asyncio
-async def test_reload_failure_still_attempts_click():
-    """A reload hiccup must not abort the attempt — the strict click scan
-    (with the day-click fallback armed) remains the arbiter."""
+async def test_reload_failure_on_open_page_still_attempts_click():
+    """A reload hiccup with the page still ALIVE must not abort — the
+    container wait + day click + strict click still run."""
     booker = _make_booker()
     page = _warm_page()
     calls: list[str] = []
-    _instrumented(booker, page, calls)
+    _instrumented(booker, page, calls, day_results=(False,))
 
     async def failing_reload(*a, **k):
         calls.append("reload")
@@ -340,8 +466,51 @@ async def test_reload_failure_still_attempts_click():
 
     ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
     assert ok is False
-    assert calls == ["reload", "click", "day"], (
+    assert calls == ["reload", "container", "click", "day"], (
         f"click must still run after a failed reload; got {calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reload_failure_on_dead_page_fails_fast():
+    """If the page DIED during the reload (CF kill, renderer crash), fail
+    fast instead of grinding the full click pipeline against a dead page
+    (merge-review finding) — sibling race tasks / the next poll recover."""
+    booker = _make_booker()
+    page = _warm_page()
+    # is_closed: warm-page checks at entry (×2) say open; post-reload says dead
+    page.is_closed = MagicMock(side_effect=[False, False, True])
+    calls: list[str] = []
+    _instrumented(booker, page, calls)
+
+    async def dying_reload(*a, **k):
+        calls.append("reload")
+        raise RuntimeError("Target closed")
+
+    page.reload = dying_reload
+    slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
+
+    ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
+    assert ok is False
+    assert calls == ["reload"], (
+        f"dead page after reload must fail fast; got {calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replay_reload_aborts_when_container_never_renders():
+    """If calendar_container never appears within the budget the page is
+    hosed — return False instead of clicking into a blank SPA."""
+    booker = _make_booker()
+    page = _warm_page()
+    calls: list[str] = []
+    _instrumented(booker, page, calls, container_ok=False)
+    slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
+
+    ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
+    assert ok is False
+    assert calls == ["reload", "container"], (
+        f"missing calendar container must abort the attempt; got {calls}"
     )
 
 
@@ -384,41 +553,6 @@ async def test_reload_block_does_not_duplicate_selector_waits():
 # --------------------------------------------------------------------------- #
 # Fix #1 completions (adversarial-verify minors)
 # --------------------------------------------------------------------------- #
-
-@pytest.mark.asyncio
-async def test_suspect_circuit_open_dumps_calibration_capture(monkeypatch):
-    """When the suspect-empty branch OPENS the circuit, the stashed body
-    must be dumped for offline calibration — after the circuit opens no
-    further fetch happens, so this is the last chance to capture the
-    bytes (the mechanism that root-caused 06/05)."""
-    body = b"\x0a\x0a2026-05-15" + b"\x00" * 300
-    checker = _make_replay_checker(monkeypatch, body)
-    checker._capture_replay_miss = MagicMock()
-
-    for _ in range(checker._REPLAY_FAILURE_THRESHOLD):
-        await checker._try_calendar_replay(sniper_mode=False)
-
-    assert checker._replay_circuit_open is True
-    checker._capture_replay_miss.assert_called()
-
-
-@pytest.mark.asyncio
-async def test_parse_exception_also_opens_circuit(monkeypatch):
-    """Persistent parse EXCEPTIONS (not just suspect-empty) must open the
-    breaker — previously this branch incremented the counter but never
-    checked the threshold."""
-    body = calendar_body(sold_out_date_section("2026-05-15"))
-    checker = _make_replay_checker(monkeypatch, body)
-
-    def boom(*a, **k):
-        raise ValueError("schema drift")
-
-    monkeypatch.setattr("src.calendar_replay.parse_with_diagnostics", boom)
-    for _ in range(checker._REPLAY_FAILURE_THRESHOLD):
-        await checker._try_calendar_replay(sniper_mode=False)
-
-    assert checker._replay_circuit_open is True
-
 
 # --------------------------------------------------------------------------- #
 # Gap 3 — selector waits race concurrently instead of 2s×2 sequentially
@@ -489,6 +623,44 @@ async def test_click_time_slot_uses_concurrent_wait():
     ok = await booker._click_time_slot(page, slot)
     assert ok is False
     booker._wait_any_slot_button.assert_awaited_once()
+
+
+def test_wait_any_default_budget_matches_old_worst_case():
+    """Merge-review finding: a 2s shared budget HALVED the old sequential
+    worst case (2s × 2). Buttons rendering at t≈3s under release-night
+    load were caught before and missed after. Default must be 4000ms —
+    same worst case as before, instant when any selector matches sooner."""
+    import inspect
+    from src.booker import TockBooker
+
+    sig = inspect.signature(TockBooker._wait_any_slot_button)
+    assert sig.parameters["timeout_ms"].default == 4000
+
+
+@pytest.mark.asyncio
+async def test_wait_any_handles_success_and_instant_failures_same_batch():
+    """One selector resolves while others raise in the SAME event-loop
+    batch (e.g. page context tearing down): the race must still report
+    True and retrieve every completed task's exception (merge-review
+    finding: any() short-circuit left exceptions un-retrieved →
+    'Task exception was never retrieved' spam in bot.log mid-race)."""
+    from src.selectors import get_slot_button_selectors
+
+    booker = _make_booker()
+
+    class _InstantPage:
+        def __init__(self):
+            self.matching = {get_slot_button_selectors()[2]}
+
+        async def wait_for_selector(self, selector, timeout=None):
+            # No awaits at all: every task completes on its first step,
+            # so successes and failures land in one done-batch.
+            if selector in self.matching:
+                return MagicMock()
+            raise TimeoutError(f"no {selector}")
+
+    found = await booker._wait_any_slot_button(_InstantPage(), timeout_ms=200)
+    assert found is True
 
 
 # --------------------------------------------------------------------------- #

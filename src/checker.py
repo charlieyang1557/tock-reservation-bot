@@ -350,6 +350,9 @@ class AvailabilityChecker:
         # close_sniper_pages()/close_replay_session() at window end so the next
         # window can capture again.
         self._replay_capture_dumped_this_window: bool = False
+        # Separate budget for the PRIORITY capture (post-release DOM-beat-
+        # replay) so a transient suspect-empty dump can never starve it.
+        self._replay_priority_capture_dumped: bool = False
         # Throttle for the per-poll replay-diag INFO line (sniper polls are
         # ~7/sec; logging every one would flood). Logged every Nth post-release
         # poll — see _REPLAY_DIAG_LOG_EVERY_N.
@@ -503,6 +506,12 @@ class AvailabilityChecker:
                 f"{type(e).__name__}: {e}"
             )
             self._replay_failure_count += 1
+            # Dump the body that CRASHED the parser before the breaker can
+            # kill further fetches — persistent parse exceptions are the
+            # most schema-drift-shaped failure and were the one mode that
+            # lost the calibration evidence (merge-review finding). Rate-
+            # limited once-per-window inside the dump.
+            self._capture_replay_miss()
             # Adversarial-verify minor: this branch previously never
             # checked the threshold, so persistent parse EXCEPTIONS
             # (vs suspect-empty) could not open the circuit on their own.
@@ -513,15 +522,19 @@ class AvailabilityChecker:
                     f"{self._replay_failure_count} consecutive failures."
                 )
             return None
-        # 2026-06-09 review fix #1: an EMPTY parse is only authoritative when
-        # the decode was clean. A top-level wire-format failure (decode_ok
-        # False) or a depth-cap hit (truncated) with zero slots means the
-        # parser may have been blind to a real release — treat it as a
-        # failure so the caller falls back to the DOM scan and the circuit
-        # breaker can open on persistent schema breakage. (Previously this
-        # returned [] as "no slots": no DOM fallback in normal mode, breaker
-        # counter reset.) A truncated parse that still FOUND slots returns
-        # them — partial detection beats none in the fast path.
+        # 2026-06-09 review fix #1 (policy hardened by the merge review): an
+        # EMPTY parse is only authoritative when the decode was clean. A
+        # top-level wire-format failure (decode_ok False) or a depth-cap hit
+        # (truncated) with zero slots means the parser may have been blind
+        # to a real release — return None so the caller falls back to the
+        # DOM scan. Deliberately NOT counted toward the circuit breaker:
+        # the fetch succeeded (auth/CF are fine), pre-release sold-out
+        # bodies have a different shape than release bodies, and sniper
+        # polls run at 0s interval — a breaker here would open within ~2s
+        # of window start and disable the ~160ms fast path for the release
+        # moment itself over a parse anomaly the DOM fallback already
+        # covers. A truncated parse that still FOUND slots returns them —
+        # partial detection beats none.
         diag = self._last_replay_diag
         if not slots and diag is not None and (
             not diag.decode_ok or diag.truncated
@@ -532,19 +545,10 @@ class AvailabilityChecker:
                 f"body_len={diag.body_len}) — treating as failure, not "
                 "'no slots'"
             )
-            self._replay_failure_count += 1
-            if self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD:
-                self._replay_circuit_open = True
-                logger.error(
-                    f"[check-replay] CIRCUIT OPEN after "
-                    f"{self._replay_failure_count} consecutive failures."
-                )
-                # Last chance to capture the bytes: once the circuit is
-                # open no further fetch happens this window, so dump the
-                # stashed body for offline calibration now (the mechanism
-                # that root-caused 06/05). Best-effort, rate-limited
-                # once-per-window inside _capture_replay_miss.
-                self._capture_replay_miss()
+            # Capture the bytes that confused the parser for offline
+            # calibration (the mechanism that root-caused 06/05). Best-
+            # effort, rate-limited once-per-window inside the dump.
+            self._capture_replay_miss()
             return None
         # Codex HIGH 1: cap slots before returning so book_best_slot_race
         # doesn't fan out into 100+ concurrent booking pages on a calendar
@@ -561,6 +565,28 @@ class AvailabilityChecker:
         self._replay_failure_count = 0
         return slots
 
+    def reset_replay_circuit(self) -> None:
+        """Re-arm the replay circuit breaker. Called by the monitor when a
+        sniper window STARTS: a circuit opened during normal polling (e.g.
+        schema drift on Wednesday) must not forfeit the release-night fast
+        path — the breaker was previously reset only at window END
+        (close_replay_session), so a stale open circuit would silently
+        disable replay for the whole race. If replay is truly broken the
+        breaker re-opens within the first few polls."""
+        if self._replay_circuit_open:
+            logger.info(
+                "[check-replay] circuit re-armed for new sniper window "
+                f"(was open after {self._replay_failure_count} failures)"
+            )
+        self._replay_failure_count = 0
+        self._replay_circuit_open = False
+        # Also re-arm the once-per-window calibration-dump budget: a dump
+        # consumed during NORMAL polling (suspect-empty / parse-exception
+        # bodies now dump too) must not starve this window's release-night
+        # capture — in pure normal mode the flag otherwise never resets.
+        self._replay_capture_dumped_this_window = False
+        self._replay_priority_capture_dumped = False
+
     async def close_replay_session(self) -> None:
         """Close the replay session (best-effort). Called on shutdown
         OR when sniper window ends (so the next window starts fresh).
@@ -576,6 +602,7 @@ class AvailabilityChecker:
         # Window boundary: re-arm the once-per-window replay-miss capture and
         # the "first poll of the window logs" diag throttle.
         self._replay_capture_dumped_this_window = False
+        self._replay_priority_capture_dumped = False
         self._replay_diag_poll_count = 0
         await close_session(sess)
 
@@ -671,6 +698,7 @@ class AvailabilityChecker:
         # Window boundary: allow the next window to capture a replay-miss again
         # and re-arm the "first poll of the window logs" diag throttle.
         self._replay_capture_dumped_this_window = False
+        self._replay_priority_capture_dumped = False
         self._replay_diag_poll_count = 0
         # Re-arm the once-per-window calendar-timeout forensic screenshot.
         self._cal_timeout_diag_captured_window = False
@@ -1280,7 +1308,9 @@ class AvailabilityChecker:
                 f"[replay-miss] DOM found {len(dom_slots)} slot(s) replay "
                 "missed — dumping the poll's stashed body for calibration"
             )
-            self._capture_replay_miss()
+            # priority: THIS is the artifact the capture mechanism exists
+            # for — never let an earlier suspect-empty dump starve it.
+            self._capture_replay_miss(priority=True)
 
         return dom_slots
 
@@ -1309,21 +1339,26 @@ class AvailabilityChecker:
             f"decode_ok={diag.decode_ok} truncated={diag.truncated}"
         )
 
-    def _capture_replay_miss(self) -> None:
+    def _capture_replay_miss(self, priority: bool = False) -> None:
         """Dump the poll's stashed replay body for offline ghost-slot
-        calibration when DOM beat replay on a post-release poll. Rate-limited
-        to once per sniper window via _replay_capture_dumped_this_window
-        (reset at window end). Synchronous + best-effort — must NOT delay
-        booking and must never raise.
+        calibration. Rate-limited to once per sniper window via
+        _replay_capture_dumped_this_window (reset at window end AND window
+        start). Synchronous + best-effort — must NOT delay booking and must
+        never raise.
 
-        _last_replay_body is THIS poll's body — the exact bytes the parser
-        just wrongly returned empty for — so it's precisely the calibration
-        sample we need; no network re-fetch (which would tax the hottest poll,
-        codex HIGH). If the poll produced no body (replay failed before
-        parsing), there is nothing to dump and the once-per-window budget is
-        NOT consumed, so a later poll in the same window can still capture.
+        priority=True (the post-release DOM-beat-replay path): uses its
+        OWN once-per-window budget — that body is the exact bytes the
+        parser wrongly returned empty for during a REAL release (the
+        artifact that root-caused 06/05) and must never be starved by a
+        transient suspect-empty dump from earlier in the window.
+        priority=False (suspect-empty / parse-exception bodies): respects
+        the general budget. If the poll produced no body, nothing is
+        dumped and no budget is consumed.
         """
-        if self._replay_capture_dumped_this_window:
+        if priority:
+            if self._replay_priority_capture_dumped:
+                return
+        elif self._replay_capture_dumped_this_window:
             return
         body = self._last_replay_body
         if not body:
@@ -1333,6 +1368,8 @@ class AvailabilityChecker:
             )
             return
         self._dump_body(body)
+        if priority:
+            self._replay_priority_capture_dumped = True
 
     def _dump_body(self, body: bytes) -> None:
         """Write *body* to _REPLAY_CAPTURE_DIR and arm the once-per-window

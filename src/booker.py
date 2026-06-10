@@ -453,20 +453,18 @@ class TockBooker:
                     if not await self._click_calendar_day(page, slot):
                         return False
                     day_clicked = True
-
-                    # Wait reactively for slot buttons after day click —
-                    # all selectors race at once (gap-3 fix)
-                    await self._wait_any_slot_button(page)
+                    # No explicit slot-button wait here — _click_time_slot
+                    # owns it (a duplicate stacks dead time when buttons
+                    # never render).
             else:
-                if getattr(slot, "source", "dom") == "replay":
-                    # 2026-06-09 review fix #2: a replay-detected slot was
-                    # decoded from the protobuf body — NO page has rendered
-                    # the release. This warm page was last rendered by an
-                    # EARLIER poll (the replay fast path skips the DOM scan),
-                    # so its DOM still shows pre-release content with no Book
-                    # button; clicking it as-is repeats the 06/05
-                    # detected-but-click-failed incident. Reload to render
-                    # the released slot before the strict time match below.
+                if slot.source == "replay":
+                    # 2026-06-09 review fix #2 (hardened by merge review): a
+                    # replay-detected slot was decoded from the protobuf body
+                    # — NO page has rendered the release. This warm page was
+                    # last rendered by an EARLIER poll (the replay fast path
+                    # skips the DOM scan), so its DOM still shows pre-release
+                    # content with no Book button; clicking it as-is repeats
+                    # the 06/05 detected-but-click-failed incident.
                     if booking_won.is_set():
                         # Don't pay the ~10s reload for a race already lost.
                         self.notifier.booking_aborted(
@@ -485,15 +483,40 @@ class TockBooker:
                     except Exception as e:
                         logger.warning(
                             f"[book] {slot} — warm-page reload failed "
-                            f"({type(e).__name__}: {e}); attempting click on "
-                            "current DOM"
+                            f"({type(e).__name__}: {e})"
                         )
-                    # No selector wait here — _click_time_slot owns it
-                    # (duplicating it stacked +4s on the 06/05 DOM shape).
-                    # The reload may have RESET the SPA's day selection (the
-                    # checker re-clicks the day after every reuse-poll reload
-                    # for the same reason), so ARM the day-click-and-retry
-                    # fallback below instead of declaring the day clicked.
+                        if page.is_closed():
+                            # Page died mid-reload (CF kill, renderer crash):
+                            # fail fast — grinding the click pipeline against
+                            # a dead page burns the race attempt for nothing;
+                            # sibling tasks / the next poll recover.
+                            logger.error(
+                                f"[book] {slot} — warm page died during "
+                                "reload; abandoning attempt"
+                            )
+                            return False
+                        logger.info(
+                            f"[book] {slot} — page still open; attempting "
+                            "click on current DOM"
+                        )
+                    # domcontentloaded fires BEFORE SPA hydration. Give the
+                    # calendar the same render budget the checker gives its
+                    # own reuse-poll reloads (10s) — without this, the only
+                    # wait between reload and the strict click was the slot-
+                    # button race, far short of release-night render times.
+                    if not await self._wait_for_selector(
+                        page, "calendar_container", context=str(slot),
+                        timeout=10000,
+                    ):
+                        return False
+                    # Trust the page's own ?date= URL for day selection
+                    # (the reload re-navigates the same per-date search URL
+                    # this page was parked on) and ARM the day-click-and-
+                    # retry fallback below instead of eagerly clicking the
+                    # day: _click_calendar_day matches day-NUMBER text with
+                    # no month validation, so an eager click is itself a
+                    # wrong-date vector on month boundaries — and can
+                    # de-select the date the URL already selected.
                     skip_click = True
                     day_clicked = False
                 else:
@@ -563,8 +586,7 @@ class TockBooker:
                     if not await self._click_calendar_day(page, slot):
                         return False
                     day_clicked = True
-                    # All selectors race at once (gap-3 fix)
-                    await self._wait_any_slot_button(page)
+                    # No explicit wait — the retry's _click_time_slot waits.
                     slot_clicked = await self._click_time_slot(
                         page, slot, strict_time_match=using_warm_page
                     )
@@ -746,7 +768,7 @@ class TockBooker:
         return False
 
     async def _wait_any_slot_button(
-        self, page: Page, timeout_ms: int = 2000
+        self, page: Page, timeout_ms: int = 4000
     ) -> bool:
         """Wait until ANY selector in the slot-button cascade appears.
 
@@ -757,6 +779,12 @@ class TockBooker:
         gap in the incident log) before the cascade scan instantly found
         the buttons. All selectors race concurrently under ONE shared
         budget; returns True as soon as one resolves, False if none do.
+
+        The 4000ms default keeps the OLD worst-case render allowance
+        (2s × 2) — buttons appearing at t≈3s under release-night load were
+        caught before and must stay caught; a match still returns
+        immediately. Note: cancelling a loser does not stop the browser-
+        side poller — it self-terminates at timeout_ms.
         """
         tasks = [
             asyncio.create_task(page.wait_for_selector(s, timeout=timeout_ms))
@@ -769,9 +797,14 @@ class TockBooker:
                 done, pending = await asyncio.wait(
                     pending, return_when=asyncio.FIRST_COMPLETED
                 )
-                found = any(
+                # Materialize ALL verdicts before any() — a short-circuited
+                # generator would leave same-batch losers' exceptions
+                # un-retrieved → "Task exception was never retrieved" spam
+                # in bot.log mid-race.
+                verdicts = [
                     not t.cancelled() and t.exception() is None for t in done
-                )
+                ]
+                found = any(verdicts)
         finally:
             for t in pending:
                 t.cancel()
