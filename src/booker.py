@@ -80,6 +80,11 @@ _BOOKING_FAILURE_DIR = os.path.join(
 # (self-DoS). ~50 full search-page HTMLs ≈ a few tens of MB.
 _MAX_FAILURE_DUMPS = 50
 
+# Reload budget for a stale warm page handed to a replay-sourced slot
+# (2026-06-09 review fix #2). Bounded tight: the page is already on the
+# right ?date= search URL, so this is a same-URL re-render, not a cold goto.
+_REPLAY_WARM_RELOAD_TIMEOUT_MS = 10_000
+
 
 def _write_failure_dump(
     html: str, clean_url: str, slot_str: str, date_str: str, stage: str
@@ -449,21 +454,55 @@ class TockBooker:
                         return False
                     day_clicked = True
 
-                    # Wait reactively for slot buttons after day click
-                    for try_sel in get_slot_button_selectors()[:2]:
-                        try:
-                            await page.wait_for_selector(try_sel, timeout=2000)
-                            break
-                        except Exception:
-                            continue
+                    # Wait reactively for slot buttons after day click —
+                    # all selectors race at once (gap-3 fix)
+                    await self._wait_any_slot_button(page)
             else:
+                if getattr(slot, "source", "dom") == "replay":
+                    # 2026-06-09 review fix #2: a replay-detected slot was
+                    # decoded from the protobuf body — NO page has rendered
+                    # the release. This warm page was last rendered by an
+                    # EARLIER poll (the replay fast path skips the DOM scan),
+                    # so its DOM still shows pre-release content with no Book
+                    # button; clicking it as-is repeats the 06/05
+                    # detected-but-click-failed incident. Reload to render
+                    # the released slot before the strict time match below.
+                    if booking_won.is_set():
+                        # Don't pay the ~10s reload for a race already lost.
+                        self.notifier.booking_aborted(
+                            slot, "another slot already booked"
+                        )
+                        return False
+                    logger.info(
+                        f"[book] {slot} → replay-sourced slot on warm page; "
+                        "reloading to render post-release DOM"
+                    )
+                    try:
+                        await page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=_REPLAY_WARM_RELOAD_TIMEOUT_MS,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[book] {slot} — warm-page reload failed "
+                            f"({type(e).__name__}: {e}); attempting click on "
+                            "current DOM"
+                        )
+                    # No selector wait here — _click_time_slot owns it
+                    # (duplicating it stacked +4s on the 06/05 DOM shape).
+                    # The reload may have RESET the SPA's day selection (the
+                    # checker re-clicks the day after every reuse-poll reload
+                    # for the same reason), so ARM the day-click-and-retry
+                    # fallback below instead of declaring the day clicked.
+                    skip_click = True
+                    day_clicked = False
+                else:
+                    # DOM-found slot: the checker already had the correct
+                    # date selected on this page. Initialize so the
+                    # post-Step-3 fallback below never trips.
+                    skip_click = False
+                    day_clicked = True
                 logger.info(f"[book] {slot} → using warm page (skipping navigation)")
-                # No skip-day-click decision needed when the booker reuses a
-                # warm page — the checker already had the correct date
-                # selected. Initialize so the post-Step-3 fallback below
-                # never trips for warm-page bookings.
-                skip_click = False
-                day_clicked = True
 
             await self._booking_screenshot(page, "01_booking_start")
 
@@ -524,12 +563,8 @@ class TockBooker:
                     if not await self._click_calendar_day(page, slot):
                         return False
                     day_clicked = True
-                    for try_sel in get_slot_button_selectors()[:2]:
-                        try:
-                            await page.wait_for_selector(try_sel, timeout=2000)
-                            break
-                        except Exception:
-                            continue
+                    # All selectors race at once (gap-3 fix)
+                    await self._wait_any_slot_button(page)
                     slot_clicked = await self._click_time_slot(
                         page, slot, strict_time_match=using_warm_page
                     )
@@ -710,6 +745,40 @@ class TockBooker:
         )
         return False
 
+    async def _wait_any_slot_button(
+        self, page: Page, timeout_ms: int = 2000
+    ) -> bool:
+        """Wait until ANY selector in the slot-button cascade appears.
+
+        Gap-3 fix (2026-06-10): replaces the sequential wait over
+        slot_selectors[:2] (2s × 2). On the 2026-06-05 release the live
+        DOM matched ONLY the generic Book selector — 3rd in the cascade —
+        so the sequential loop burned the full 4s (the 20:00:09→20:00:13
+        gap in the incident log) before the cascade scan instantly found
+        the buttons. All selectors race concurrently under ONE shared
+        budget; returns True as soon as one resolves, False if none do.
+        """
+        tasks = [
+            asyncio.create_task(page.wait_for_selector(s, timeout=timeout_ms))
+            for s in get_slot_button_selectors()
+        ]
+        found = False
+        pending = set(tasks)
+        try:
+            while pending and not found:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                found = any(
+                    not t.cancelled() and t.exception() is None for t in done
+                )
+        finally:
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        return found
+
     async def _click_time_slot(
         self, page: Page, slot: AvailableSlot,
         strict_time_match: bool = False,
@@ -732,13 +801,9 @@ class TockBooker:
         """
         slot_selectors = get_slot_button_selectors()
 
-        # Wait reactively for slot buttons (not fixed sleep)
-        for try_sel in slot_selectors[:2]:
-            try:
-                await page.wait_for_selector(try_sel, timeout=2000)
-                break
-            except Exception:
-                continue
+        # Wait reactively for slot buttons — all selectors race at once
+        # (gap-3 fix: the old [:2] sequential wait cost 4s on the 06/05 DOM)
+        await self._wait_any_slot_button(page)
 
         # Find which selector has buttons
         matched_selector = None

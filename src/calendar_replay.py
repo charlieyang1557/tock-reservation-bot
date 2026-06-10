@@ -65,6 +65,13 @@ _HTML_SIGNATURE_BYTES = (b"<!doctype", b"<html", b"<HTML", b"<HEAD", b"<head")
 # safer to treat as failure (fall back) than as "no slots success".
 _PROTOBUF_MIN_PLAUSIBLE_BYTES = 20
 
+# Above this, the body is not a plausible calendar either (real bodies:
+# fuhuihua release 3.2 KB, benu high-volume tens of KB). The structural
+# decode is synchronous O(depth × body_len) work on the event loop, so an
+# anomalous/hostile multi-MB 200 body must be rejected BEFORE parsing
+# (2026-06-09 review fix #4) — the caller falls back to the DOM scan.
+_PROTOBUF_MAX_PLAUSIBLE_BYTES = 2_000_000
+
 # --- Structural decode (recalibrated after the 2026-06-05 release miss) ---
 # The 2026-05-10 ghost-slot guards (_MIN_BOOKABLE_SECTION_BYTES=800,
 # _MIN_BOOKABLE_TIMES_PER_SECTION=5) were calibrated on benu's high-volume
@@ -105,9 +112,10 @@ _MAX_BOOKING_HOUR = 23
 # Tock's real envelope field in the 06/05 capture is 60686.
 _MAX_PLAUSIBLE_FIELD_NUMBER = 536_870_911
 
-# Real captures nest ~8 levels deep; bound recursion into misidentified
-# binary blobs.
-_MAX_DECODE_DEPTH = 16
+# Real captures nest ~11 levels deep; bound recursion into misidentified
+# binary blobs while keeping schema-drift headroom. Hitting the cap sets
+# ReplayParseDiag.truncated so an empty parse is never silently trusted.
+_MAX_DECODE_DEPTH = 32
 
 
 def _read_varint(buf: bytes, i: int) -> "tuple[int, int] | None":
@@ -179,6 +187,7 @@ def _collect_seating_times(
     buf: bytes,
     context_date: "str | None",
     out: "dict[str, set[tuple[int, int]]]",
+    diag: "ReplayParseDiag",
     depth: int = 0,
 ) -> bool:
     """Recursively decode buf as a protobuf message, collecting seating
@@ -192,9 +201,12 @@ def _collect_seating_times(
 
     Returns True if buf decoded as a valid message (used by the caller to
     report decode_ok); nested blobs that fail to decode are simply treated
-    as opaque bytes.
+    as opaque bytes. Hitting _MAX_DECODE_DEPTH sets diag.truncated —
+    subtrees may have been skipped, so an empty result is NOT trustworthy
+    (2026-06-09 review fix #3: previously this was silently swallowed).
     """
     if depth > _MAX_DECODE_DEPTH:
+        diag.truncated = True
         return False
     fields = _decode_message(buf)
     if fields is None:
@@ -221,7 +233,7 @@ def _collect_seating_times(
                     (int(m.group(1)), int(m.group(2)))
                 )
             continue
-        _collect_seating_times(v, ctx, out, depth + 1)
+        _collect_seating_times(v, ctx, out, diag, depth + 1)
     return True
 
 
@@ -240,6 +252,7 @@ class ReplayParseDiag:
     sections_passed: int = 0    # dates with >=1 structurally valid seating
     sections_filtered: int = 0  # dates with none (sold out / not released)
     decode_ok: bool = True      # top-level body decoded as valid protobuf
+    truncated: bool = False     # recursion hit _MAX_DECODE_DEPTH somewhere
 
 
 @dataclass
@@ -329,11 +342,15 @@ def body_looks_protobuf(body: bytes) -> bool:
     Returns False for:
       - HTML bodies (CF interstitial, error pages)
       - bodies smaller than _PROTOBUF_MIN_PLAUSIBLE_BYTES
+      - bodies larger than _PROTOBUF_MAX_PLAUSIBLE_BYTES (event-loop
+        protection — the decode is synchronous)
       - empty bodies
 
     True signals "ok to parse"; False signals "fall back to legacy".
     """
     if not body or len(body) < _PROTOBUF_MIN_PLAUSIBLE_BYTES:
+        return False
+    if len(body) > _PROTOBUF_MAX_PLAUSIBLE_BYTES:
         return False
     head = body[:60].lower()
     if any(sig in head for sig in (b"<!doctype", b"<html", b"<head")):
@@ -453,6 +470,7 @@ def parse_with_diagnostics(
     """
     from src.checker import AvailableSlot
 
+    body = bytes(body)  # bytearray/memoryview slices break the decoder
     target_iso = {d.isoformat(): d for d in target_dates}
     diag = ReplayParseDiag(body_len=len(body))
 
@@ -463,7 +481,7 @@ def parse_with_diagnostics(
     diag.unique_dates = len(set(raw_dates))
 
     times_by_date: dict[str, set[tuple[int, int]]] = {}
-    diag.decode_ok = _collect_seating_times(body, None, times_by_date)
+    diag.decode_ok = _collect_seating_times(body, None, times_by_date, diag)
 
     # Keep only plausible booking-hour seatings
     slots_by_date: dict[str, set[tuple[int, int]]] = {}
@@ -496,6 +514,10 @@ def parse_with_diagnostics(
                     slot_date=d,
                     slot_time=_format_24h_to_12h(hh, mm),
                     day_of_week=d.strftime("%A"),
+                    # Provenance: no page has RENDERED this slot — the booker
+                    # must reload any warm page before its strict time match
+                    # (2026-06-09 review fix #2).
+                    source="replay",
                 )
             )
     return result, diag

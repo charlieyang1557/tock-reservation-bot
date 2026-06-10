@@ -26,6 +26,8 @@ honest wire-format bodies instead of hand-glued byte soup.
 
 
 def varint(n: int) -> bytes:
+    if n < 0:
+        raise ValueError(f"varint requires n >= 0, got {n}")
     out = bytearray()
     while True:
         b = n & 0x7F

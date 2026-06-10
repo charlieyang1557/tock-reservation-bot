@@ -247,6 +247,12 @@ class AvailableSlot:
     # selector here. The booker clicks that element directly, skipping selector
     # rediscovery and the parent-only time match that lost the 2026-06-05 slots.
     target_selector: str | None = field(default=None, compare=False)
+    # Detection provenance (NOT slot identity): "dom" when a page scan found
+    # the slot rendered on a page; "replay" when the calendar-replay fast path
+    # decoded it from the protobuf body — in that case NO page has rendered
+    # the release yet, so the booker must reload any warm page it receives
+    # before the strict time match (2026-06-09 review fix #2).
+    source: str = field(default="dom", compare=False)
 
     @property
     def slot_date_str(self) -> str:
@@ -497,6 +503,48 @@ class AvailabilityChecker:
                 f"{type(e).__name__}: {e}"
             )
             self._replay_failure_count += 1
+            # Adversarial-verify minor: this branch previously never
+            # checked the threshold, so persistent parse EXCEPTIONS
+            # (vs suspect-empty) could not open the circuit on their own.
+            if self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD:
+                self._replay_circuit_open = True
+                logger.error(
+                    f"[check-replay] CIRCUIT OPEN after "
+                    f"{self._replay_failure_count} consecutive failures."
+                )
+            return None
+        # 2026-06-09 review fix #1: an EMPTY parse is only authoritative when
+        # the decode was clean. A top-level wire-format failure (decode_ok
+        # False) or a depth-cap hit (truncated) with zero slots means the
+        # parser may have been blind to a real release — treat it as a
+        # failure so the caller falls back to the DOM scan and the circuit
+        # breaker can open on persistent schema breakage. (Previously this
+        # returned [] as "no slots": no DOM fallback in normal mode, breaker
+        # counter reset.) A truncated parse that still FOUND slots returns
+        # them — partial detection beats none in the fast path.
+        diag = self._last_replay_diag
+        if not slots and diag is not None and (
+            not diag.decode_ok or diag.truncated
+        ):
+            logger.warning(
+                "[check-replay] empty parse is SUSPECT "
+                f"(decode_ok={diag.decode_ok} truncated={diag.truncated} "
+                f"body_len={diag.body_len}) — treating as failure, not "
+                "'no slots'"
+            )
+            self._replay_failure_count += 1
+            if self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD:
+                self._replay_circuit_open = True
+                logger.error(
+                    f"[check-replay] CIRCUIT OPEN after "
+                    f"{self._replay_failure_count} consecutive failures."
+                )
+                # Last chance to capture the bytes: once the circuit is
+                # open no further fetch happens this window, so dump the
+                # stashed body for offline calibration now (the mechanism
+                # that root-caused 06/05). Best-effort, rate-limited
+                # once-per-window inside _capture_replay_miss.
+                self._capture_replay_miss()
             return None
         # Codex HIGH 1: cap slots before returning so book_best_slot_race
         # doesn't fan out into 100+ concurrent booking pages on a calendar
@@ -1239,8 +1287,9 @@ class AvailabilityChecker:
     def _log_replay_diag(self, replay_failed: bool) -> None:
         """Log replay parse diagnostics at INFO, throttled to every Nth
         post-release poll (sniper polls are frequent). Surfaces body length,
-        date-string hits, and how many date sections the size/time guards
-        passed vs filtered — the signal we need to recalibrate thresholds.
+        date-string hits, how many dates carried structurally valid seatings
+        vs none, and decode health (decode_ok/truncated) — the signal needed
+        to diagnose a replay miss from bot.log (how 06/05 was root-caused).
         """
         self._replay_diag_poll_count += 1
         if (self._replay_diag_poll_count - 1) % self._REPLAY_DIAG_LOG_EVERY_N != 0:
@@ -1257,7 +1306,7 @@ class AvailabilityChecker:
             f"[replay-diag] body_len={diag.body_len} date_hits={diag.date_hits} "
             f"unique_dates={diag.unique_dates} sections_passed={diag.sections_passed} "
             f"sections_filtered={diag.sections_filtered} "
-            f"decode_ok={getattr(diag, 'decode_ok', True)}"
+            f"decode_ok={diag.decode_ok} truncated={diag.truncated}"
         )
 
     def _capture_replay_miss(self) -> None:

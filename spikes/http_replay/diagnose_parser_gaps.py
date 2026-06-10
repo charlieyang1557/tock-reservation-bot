@@ -21,7 +21,7 @@ async def _run() -> int:
     from src.config import load_config
     from src.calendar_replay import (
         initialize_replay_session, fetch_calendar, close_session,
-        _DATE_RE, _TIME_RE,
+        parse_with_diagnostics, _DATE_RE,
     )
 
     cfg = load_config()
@@ -47,6 +47,20 @@ async def _run() -> int:
             return 1
 
         print(f"Body length: {len(body)} bytes")
+        print()
+
+        # 0. What the PRODUCTION parser (structural protobuf decode since
+        # the 2026-06-05 recalibration) extracts — the baseline every
+        # raw-byte dump below is compared against.
+        candidates = [target + timedelta(days=i) for i in range(-7, 22)]
+        slots, diag = parse_with_diagnostics(body, candidates)
+        print(
+            f"=== Structural decode: decode_ok={diag.decode_ok} "
+            f"truncated={diag.truncated} sections_passed={diag.sections_passed} "
+            f"sections_filtered={diag.sections_filtered} ==="
+        )
+        for s in slots:
+            print(f"  {s.slot_date_str}  {s.slot_time}")
         print()
 
         # 1. Every date marker
