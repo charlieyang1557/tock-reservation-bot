@@ -191,11 +191,31 @@ def get(key: str) -> str:
 _SLOT_SELECTOR_ENTRIES: list[tuple[str, str]] = [
     (SELECTORS["available_slot_button"], "specific"),
     ("button.Consumer-resultsListItem", "specific"),
+    # Tock MUI search-result layout (2026-06-12): the bookable control is a
+    # card-level button whose own text is just "Book" — the slot time lives
+    # in the enclosing search-result card, so it's matched as "generic"
+    # (time confirmed from the card, not the button text). Listed BEFORE the
+    # loose :has-text("Book") fallback so this precise data-testid wins, and
+    # it's plain CSS so the JS fast path can use it.
+    ('button[data-testid="booking-card-button"]', "generic"),
     ('button:visible:has-text("Book")', "generic"),
     (SELECTORS["book_now_button"], "generic"),
     ("button.SearchExperience-bookButton", "generic"),
     ("[data-testid='book-button']", "generic"),
 ]
+
+
+# Scope selector for confirming a generic/card-level "Book" button's time
+# from its ENCLOSING result card (not just the button's immediate parent).
+# Tock's MUI layout puts the time label in a sibling subtree of the button,
+# so immediate-parent matching misses it (the 2026-06-12 click failure).
+# Ordered most-specific first; used by the booker's matcher via closest().
+RESULT_CARD_SCOPE_SELECTOR = (
+    '[data-testid="search-result"], '
+    'li.Consumer-resultsListItem, '
+    '[class*="resultsListItem"], '
+    '[class*="MuiCard-root"]'
+)
 
 
 def get_slot_button_selectors() -> list[str]:

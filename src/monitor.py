@@ -286,14 +286,29 @@ class TockMonitor:
                 try:
                     prewarm_dates = self._get_prewarm_dates()
                     if prewarm_dates:
-                        logger.info(
-                            f"[monitor] Pre-opening {len(prewarm_dates)} "
-                            f"target-date page(s) for {dates_prewarm_target}"
-                        )
-                        await self.checker.prewarm_target_dates(
-                            prewarm_dates, stagger_sec=30.0,
-                            notifier=self.notifier,
-                        )
+                        # Guard: don't start a prewarm that can't finish before
+                        # the window opens — it would block the first poll. If
+                        # there isn't enough time (or the budget is unknown),
+                        # skip and let the first poll cold-navigate (codex HIGH).
+                        secs_to_window = self._seconds_until_next_sniper()
+                        if not self._prewarm_fits(len(prewarm_dates), secs_to_window):
+                            budget = ("unknown" if secs_to_window is None
+                                      else f"{secs_to_window:.0f}s")
+                            logger.warning(
+                                f"[monitor] Skipping date-prewarm for "
+                                f"{dates_prewarm_target}: {budget} to window — "
+                                "not enough time to finish; first poll will "
+                                "cold-navigate rather than be delayed"
+                            )
+                        else:
+                            logger.info(
+                                f"[monitor] Pre-opening {len(prewarm_dates)} "
+                                f"target-date page(s) for {dates_prewarm_target}"
+                            )
+                            await self.checker.prewarm_target_dates(
+                                prewarm_dates, stagger_sec=30.0,
+                                notifier=self.notifier,
+                            )
                 except Exception as e:
                     prewarm_failed = True
                     logger.warning(
@@ -348,17 +363,19 @@ class TockMonitor:
                 self._session_dates_prewarmed_for = None
 
             if interval > 0:
-                # Cap sleep so the bot wakes exactly when a sniper window opens
-                secs_to_sniper = self._seconds_until_next_sniper()
-                if secs_to_sniper is not None and secs_to_sniper < interval:
+                # Cap sleep to wake at the sniper window OR the date-prewarm
+                # trigger (window − 5min), whichever is sooner — so the loop
+                # never overshoots the trigger and starts a multi-minute prewarm
+                # inside the window, delaying the first poll (codex HIGH).
+                sleep_for, cap_reason = self._capped_sleep_seconds(interval)
+                if cap_reason:
                     logger.info(
-                        f"Sleeping {secs_to_sniper:.1f}s (sniper window in "
-                        f"{secs_to_sniper:.1f}s, not the full {interval}s)"
+                        f"Sleeping {sleep_for:.1f}s (until {cap_reason}, "
+                        f"not the full {interval}s)"
                     )
-                    await asyncio.sleep(secs_to_sniper)
                 else:
                     logger.info(f"Sleeping {interval}s…")
-                    await asyncio.sleep(interval)
+                await asyncio.sleep(sleep_for)
                 # Re-check release page periodically between polls (not during sniper)
                 await self._refresh_release_schedule()
             else:
@@ -505,9 +522,7 @@ class TockMonitor:
             # one-shot fast-path lifetime (single poll).
             if self._sniper_active or enable_fast_handoff:
                 if self._sniper_active:
-                    def _drain(date_str: str):
-                        return (self.checker.pop_warm_page(date_str)
-                                or self.checker.pop_handoff_page(date_str))
+                    _drain = self._drain_sniper_page
                     source = "warm"
                 else:
                     _drain = self.checker.pop_handoff_page
@@ -897,18 +912,85 @@ class TockMonitor:
                 return f"{day_name}@{start_str}"
         return None
 
+    def _seconds_until_prewarm_trigger(self) -> "float | None":
+        """Seconds until the date-page prewarm should fire for the next sniper
+        window (window_start − PREWARM_DATES_BEFORE_MIN), or None when date-
+        prewarm is disabled or the window is already inside that span.
+
+        The pre-window sleep is capped to this so a coarse poll cadence can't
+        overshoot the trigger and start a multi-minute prewarm INSIDE the
+        window, delaying the first (race-winning) poll (codex HIGH)."""
+        if not (getattr(self.config, "sniper_prewarm_dates", True)
+                or getattr(self.config, "sniper_reuse_pages", False)):
+            return None
+        secs = self._seconds_until_next_sniper()
+        if secs is None:
+            return None
+        trigger = secs - PREWARM_DATES_BEFORE_MIN * 60
+        return trigger if trigger > 0 else None
+
+    def _prewarm_fits(self, n_dates: int, secs_to_window: "float | None") -> bool:
+        """True if a date-prewarm of `n_dates` pages can finish before the
+        sniper window opens. Estimate = (N−1) staggers (prewarm sleeps only
+        BETWEEN dates) + N × a per-date nav budget. Returns False when the
+        budget is None (unknown) or non-positive — the SAFE direction: skip
+        rather than risk a prewarm bleeding into the window and delaying the
+        first poll (codex / code-review hardening)."""
+        if secs_to_window is None or secs_to_window <= 0:
+            return False
+        est_secs = max(0, n_dates - 1) * 30.0 + n_dates * 12.0
+        return secs_to_window >= est_secs
+
+    def _capped_sleep_seconds(self, interval: float) -> "tuple[float, str | None]":
+        """Cap the post-poll sleep to wake at the EARLIEST of: the full
+        interval, the next sniper window opening, or the date-prewarm trigger.
+        Returns (seconds, reason) — reason names the cap (None = full interval),
+        for logging."""
+        sleep_for = float(interval)
+        reason: "str | None" = None
+        secs_to_sniper = self._seconds_until_next_sniper()
+        if secs_to_sniper is not None and 0 < secs_to_sniper < sleep_for:
+            sleep_for, reason = secs_to_sniper, "sniper window"
+        secs_to_prewarm = self._seconds_until_prewarm_trigger()
+        if secs_to_prewarm is not None and 0 < secs_to_prewarm < sleep_for:
+            sleep_for, reason = secs_to_prewarm, "date-prewarm trigger"
+        return sleep_for, reason
+
+    def _drain_sniper_page(self, date_str: str):
+        """Hand the booker the best available warm page for a date during a
+        sniper window, in priority order:
+          1. pop_warm_page    — a per-poll reuse page (reuse enabled), or
+          2. pop_handoff_page — the page that JUST rendered this slot in the
+             DOM scan (freshly hydrated, live Book button, source='dom' so the
+             booker clicks it without reloading), or
+          3. pop_prewarm_page — a one-shot PRE-RELEASE date-prewarm page (Fix
+             2). LAST because its DOM is stale until reloaded; only the replay
+             fast path (which parks no handoff page) relies on it, and the
+             booker reloads replay-sourced pages before clicking. Draining it
+             ahead of a fresh handoff page would feed the booker a button-less
+             pre-release DOM (code-review CONFIRMED).
+        Ownership transfers to the caller (the booker closes/re-parks it).
+        Returns None when no warm page exists → booker cold-navigates.
+        """
+        return (self.checker.pop_warm_page(date_str)
+                or self.checker.pop_handoff_page(date_str)
+                or self.checker.pop_prewarm_page(date_str))
+
     def _should_prewarm_dates(self) -> str | None:
         """Target ('DayName@HH:MM') if date-page prewarm should fire now, else None.
 
-        Date-page prewarm pre-opens one page per target date so the first sniper
-        poll can reload them — but that only pays off when sniper REUSES pages.
-        With reuse off (the default) the pages are discarded, so prewarm would
-        just burn pre-window time (and can delay the first poll) for nothing; the
-        cookie prewarm (warm_session) already refreshes the Cloudflare session.
-        Returns None unless reuse is enabled AND a window is in range AND we have
-        not already prewarmed for it this cycle.
+        Date-page prewarm pre-opens one page per target date. It fires when
+        EITHER sniper_prewarm_dates is on (default — parks a one-shot booker
+        handoff page in _prewarm_pages so the first post-release race reloads
+        instead of cold-navigating, the 2026-06-12 fix) OR sniper_reuse_pages
+        is on (the historical per-poll reuse path). With BOTH off the pre-opened
+        page is discarded, so prewarm would just burn pre-window time; the cookie
+        prewarm (warm_session) still refreshes the Cloudflare session.
+        Returns None when both are off, or no window is in range, or we already
+        prewarmed for it this cycle.
         """
-        if not getattr(self.config, "sniper_reuse_pages", False):
+        if not (getattr(self.config, "sniper_prewarm_dates", True)
+                or getattr(self.config, "sniper_reuse_pages", False)):
             return None
         target = self._get_dates_prewarm_target()
         if target is None or target == self._session_dates_prewarmed_for:

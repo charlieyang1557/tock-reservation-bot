@@ -440,7 +440,8 @@ class TestSniperPathUnaffectedByRetain:
 def _build_monitor(*, dry_run: bool, slots: list[AvailableSlot],
                    sniper_active: bool = False,
                    pop_handoff_results: list = None,
-                   pop_warm_results: list = None):
+                   pop_warm_results: list = None,
+                   pop_prewarm_results: list = None):
     """Build a TockMonitor with mocked checker/booker/notifier suitable for
     asserting how poll() wires data through."""
     from src.monitor import TockMonitor
@@ -459,6 +460,7 @@ def _build_monitor(*, dry_run: bool, slots: list[AvailableSlot],
     checker.flush_deferred = MagicMock()
     handoff_iter = iter(pop_handoff_results or [])
     warm_iter = iter(pop_warm_results or [])
+    prewarm_iter = iter(pop_prewarm_results or [])
 
     def pop_handoff(date_str):
         try:
@@ -472,8 +474,17 @@ def _build_monitor(*, dry_run: bool, slots: list[AvailableSlot],
         except StopIteration:
             return None
 
+    def pop_prewarm(date_str):
+        try:
+            return next(prewarm_iter)
+        except StopIteration:
+            return None
+
     checker.pop_handoff_page = MagicMock(side_effect=pop_handoff)
     checker.pop_warm_page = MagicMock(side_effect=pop_warm)
+    # Fix 2: the sniper drain now consults pop_prewarm_page between warm and
+    # handoff. Default (no results) → None, so existing tests fall through.
+    checker.pop_prewarm_page = MagicMock(side_effect=pop_prewarm)
 
     notifier = MagicMock()
     for name in [

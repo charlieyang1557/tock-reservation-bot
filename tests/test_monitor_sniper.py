@@ -565,6 +565,7 @@ class TestSniperWorkflowIntegration:
             # Iteration 1: 19:58:50 — hold guard fires (10s to window)
             _pt_datetime(2026, 3, 18, 19, 58, 50),  # _get_prewarm_target (cookie)
             _pt_datetime(2026, 3, 18, 19, 58, 50),  # _get_dates_prewarm_target (Fix 2: new call)
+            _pt_datetime(2026, 3, 18, 19, 58, 50),  # prewarm-fit guard _seconds_until_next_sniper (new)
             _pt_datetime(2026, 3, 18, 19, 58, 50),  # _seconds_until_next_sniper (hold guard)
             # After hold sleep, iteration 2: 19:59:00 — sniper mode
             _pt_datetime(2026, 3, 18, 19, 59, 0),   # _get_prewarm_target (cookie; delta=0, None)
@@ -723,18 +724,20 @@ class TestMonitorPrewarmFailure:
 class TestShouldPrewarmDates:
     """_should_prewarm_dates() gates the date-page (page-opening) prewarm.
 
-    Date-page prewarm only pays off when sniper REUSES pages — with reuse off
-    (the default) the pre-opened pages are discarded, so the helper returns None
-    and run() skips the work. It also returns None when no window is in range or
-    we already prewarmed for this one.
+    Fix 2 (2026-06-12): date-page prewarm now fires when EITHER sniper reuses
+    pages OR sniper_prewarm_dates is on (the latter defaults True — it parks a
+    one-shot booker-handoff page so the first post-release race reloads instead
+    of cold-navigating). So the helper short-circuits to None only when BOTH are
+    off. It also returns None when no window is in range or we already prewarmed.
+    (Prewarm-on + reuse-off is covered in test_sniper_prewarm_handoff.py.)
     """
 
-    def test_none_when_reuse_off(self):
-        mon = _make_monitor(sniper_reuse_pages=False)
+    def test_none_when_reuse_and_prewarm_off(self):
+        mon = _make_monitor(sniper_reuse_pages=False, sniper_prewarm_dates=False)
         mon._get_dates_prewarm_target = MagicMock(return_value="Friday@19:59")
         mon._session_dates_prewarmed_for = None
         assert mon._should_prewarm_dates() is None
-        # The flag short-circuits — don't even consult the timing helper.
+        # Both flags off short-circuits — don't even consult the timing helper.
         mon._get_dates_prewarm_target.assert_not_called()
 
     def test_returns_target_when_reuse_on_and_due(self):

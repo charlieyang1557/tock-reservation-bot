@@ -64,6 +64,25 @@ class Config:
     # page→booker handoff).
     sniper_reuse_pages: bool = False
 
+    # Date-page PREWARM (independent of reuse): open one page per target date
+    # ~5 min before the sniper window and park it as a ONE-SHOT booker handoff
+    # — reloaded exactly once at release by the booker's replay-source reload
+    # path — so the FIRST post-release race reloads a warm page instead of
+    # cold-navigating (the 2026-06-12 detect→click latency gap; the first poll
+    # is the only one fast enough to win). Unlike reuse, these pages are NOT
+    # reloaded every poll, so they avoid the 2026-05-31 hydration-starvation
+    # failure mode that made full reuse unreliable. SNIPER_PREWARM_DATES=false
+    # to opt out (falls back to cold goto() at release).
+    sniper_prewarm_dates: bool = True
+
+    # Book-button click retries per booking attempt (Fix 4, 2026-06-13). A
+    # single click on a live slot button can fail to register (SPA hiccup /
+    # transient state); a later click often goes through. The booker re-clicks
+    # up to this many times, waiting a short window for checkout each try and
+    # breaking as soon as checkout loads — so one missed click doesn't cost the
+    # slot. SLOT_CLICK_MAX_TRIES to override.
+    slot_click_max_tries: int = 10
+
     # B1.5 — skip _click_day when the URL date is authoritative.
     # When True, checker tries _collect_slots_multi without clicking the
     # calendar day first; falls back to clicking + retrying once if 0 slots
@@ -158,6 +177,8 @@ def load_config() -> Config:
         sniper_scan_weeks=int(os.getenv("SNIPER_SCAN_WEEKS", "2")),
         prewarm_min_days_out=int(os.getenv("PREWARM_MIN_DAYS_OUT", "5")),
         sniper_reuse_pages=os.getenv("SNIPER_REUSE_PAGES", "false").lower() == "true",
+        sniper_prewarm_dates=os.getenv("SNIPER_PREWARM_DATES", "true").lower() == "true",
+        slot_click_max_tries=int(os.getenv("SLOT_CLICK_MAX_TRIES", "10")),
         skip_day_click_check=os.getenv("SKIP_DAY_CLICK_CHECK", "false").lower() == "true",
         event_driven_detection=os.getenv("EVENT_DRIVEN_DETECTION", "false").lower() == "true",
         event_driven_url_pattern=os.getenv("EVENT_DRIVEN_URL_PATTERN", "").strip(),

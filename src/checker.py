@@ -278,6 +278,12 @@ class AvailabilityChecker:
         # Sniper mode: keep pages open across polls and reload them instead of
         # opening fresh — faster (no DNS/TCP overhead) and looks more human.
         self._sniper_pages: dict[str, "Page"] = {}  # date_str -> open Page
+        # One-shot date-page prewarm handoff (Fix 2, 2026-06-12): pages opened
+        # ~5 min before the window and parked for the booker to reload ONCE at
+        # release. Kept SEPARATE from _sniper_pages so the per-poll detection
+        # scan (which discards _sniper_pages entries when reuse is off) never
+        # touches them. Drained by the monitor via pop_prewarm_page().
+        self._prewarm_pages: dict[str, "Page"] = {}  # date_str -> open Page
         # Normal-mode fast-path handoff: when retain_found_pages=True, the page
         # that found slots is parked here for one cycle so the booker can click
         # the already-visible slot button instead of re-navigating. Drained by
@@ -683,6 +689,19 @@ class AvailabilityChecker:
             return None
         return page
 
+    def pop_prewarm_page(self, date_str: str) -> "Page | None":
+        """Remove and return the one-shot prewarm handoff page for a date —
+        ownership transfers to the caller (mirrors pop_warm_page).
+
+        These pages were opened ~5 min pre-window and parked in _prewarm_pages
+        (separate from _sniper_pages) for the booker to reload ONCE at release.
+        A closed page returns None so a stale entry can't poison the race.
+        """
+        page = self._prewarm_pages.pop(date_str, None)
+        if page and page.is_closed():
+            return None
+        return page
+
     async def close_sniper_pages(self) -> None:
         """Close all pages kept open during sniper mode. Call when window ends."""
         for page in list(self._sniper_pages.values()):
@@ -691,6 +710,14 @@ class AvailabilityChecker:
             except Exception:
                 pass
         self._sniper_pages.clear()
+        # One-shot prewarm handoff pages share the window lifetime — close any
+        # the booker never drained so they don't leak across release windows.
+        for page in list(self._prewarm_pages.values()):
+            try:
+                await page.close()
+            except Exception:
+                pass
+        self._prewarm_pages.clear()
         self._skip_dates.clear()
         self._sniper_cf_challenges = 0
         self._sniper_cf_attempts = 0
@@ -884,23 +911,14 @@ class AvailabilityChecker:
                 await page.wait_for_selector(
                     sel.get("calendar_container"), timeout=10000
                 )
-                if not getattr(self.config, "sniper_reuse_pages", False):
-                    # Reuse disabled (default): the navigation above already
-                    # refreshed the shared Cloudflare session — prewarm's
-                    # remaining value. Do NOT park the page: sniper polls open
-                    # fresh pages, and a parked-but-never-reloaded page would go
-                    # stale and could reach the booker via pop_warm_page(). The
-                    # finally block closes it.
-                    logger.info(
-                        f"[prewarm] {date_str} session warmed "
-                        "(reuse disabled — page not parked)"
-                    )
-                else:
-                    # If a previous prewarm parked a page for this date (e.g. a
-                    # schedule re-aim or a second sniper window in the same
-                    # process), close it before overwriting. Otherwise the old
-                    # Page object leaks — never reachable for cleanup since
-                    # close_sniper_pages() iterates the current dict.
+                reuse_on = getattr(self.config, "sniper_reuse_pages", False)
+                prewarm_on = getattr(self.config, "sniper_prewarm_dates", True)
+                if reuse_on:
+                    # Reuse enabled: park in _sniper_pages for the per-poll
+                    # reuse path (and the warm→booker handoff). Close any prior
+                    # page for this date first (schedule re-aim / second window
+                    # in one process) so the old Page can't leak — close_sniper_
+                    # pages() can only see what's currently in the dict.
                     old = self._sniper_pages.pop(date_str, None)
                     if old is not None:
                         try:
@@ -911,6 +929,34 @@ class AvailabilityChecker:
                     page = None  # ownership transferred — don't close in finally
                     logger.info(
                         f"[prewarm] {date_str} parked at CALENDAR_LOADED"
+                    )
+                elif prewarm_on:
+                    # Reuse off (default) but date-prewarm on: park as a
+                    # ONE-SHOT booker handoff in the dedicated _prewarm_pages
+                    # dict. The detection scan never touches it, and the booker
+                    # reloads it once at release (replay-source reload), so the
+                    # old "parked-but-never-reloaded page goes stale" concern
+                    # doesn't apply — this is exactly the warm page the first
+                    # post-release race needs to avoid cold navigation.
+                    old = self._prewarm_pages.pop(date_str, None)
+                    if old is not None:
+                        try:
+                            await old.close()
+                        except Exception:
+                            pass
+                    self._prewarm_pages[date_str] = page
+                    page = None  # ownership transferred — don't close in finally
+                    logger.info(
+                        f"[prewarm] {date_str} parked for booker handoff "
+                        "(reuse off; one-shot reload at release)"
+                    )
+                else:
+                    # Reuse off AND prewarm off: the navigation above already
+                    # refreshed the shared Cloudflare session — that's all we
+                    # keep. The finally block closes the page.
+                    logger.info(
+                        f"[prewarm] {date_str} session warmed "
+                        "(prewarm disabled — page not parked)"
                     )
             except Exception as e:
                 logger.warning(

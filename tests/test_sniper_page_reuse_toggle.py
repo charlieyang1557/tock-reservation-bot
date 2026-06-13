@@ -221,16 +221,19 @@ async def test_normal_mode_unaffected_by_flag(reuse):
 
 @pytest.mark.asyncio
 async def test_prewarm_off_warms_but_does_not_park():
-    """With reuse OFF, prewarm navigates (warming the CF session) but does NOT
-    park the page — _sniper_pages stays empty and the page is closed."""
-    checker = _make_checker(sniper_reuse_pages=False)
+    """With reuse OFF *and* date-prewarm OFF, prewarm navigates (warming the CF
+    session) but does NOT park the page — both page dicts stay empty and the
+    page is closed. (Fix 2: the reuse-off + prewarm-ON default now parks a
+    one-shot booker-handoff page — see test_sniper_prewarm_handoff.py.)"""
+    checker = _make_checker(sniper_reuse_pages=False, sniper_prewarm_dates=False)
     page = _make_page(_search_url("2026-06-05"))
     checker.browser.new_page = AsyncMock(return_value=page)
 
     await checker.prewarm_target_dates([date(2026, 6, 5)], stagger_sec=0)
 
     page.goto.assert_awaited()                       # session still warmed
-    assert checker._sniper_pages == {}               # nothing parked
+    assert checker._sniper_pages == {}               # nothing parked for reuse
+    assert checker._prewarm_pages == {}              # nothing parked for handoff
     page.close.assert_awaited()                       # page closed, not kept
 
 

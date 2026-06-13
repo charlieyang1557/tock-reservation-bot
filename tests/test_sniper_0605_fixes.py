@@ -48,6 +48,11 @@ def _make_notifier(**o):
 
 def _make_booker(**o):
     from src.booker import TockBooker
+    # These tests assert the per-ATTEMPT click routing (tag-first, strict
+    # fallback, dump stage). Pin one attempt so the Fix-4 click-retry loop
+    # doesn't multiply the calls; retry behavior is covered in
+    # tests/test_slot_click_retry.py. Override per-test if a test needs more.
+    o.setdefault("slot_click_max_tries", 1)
     return TockBooker(_make_config(**o), MagicMock(), MagicMock())
 
 
@@ -357,7 +362,7 @@ async def test_book_single_warm_tag_hit_skips_time_scan():
     assert ok is False
     booker._click_tagged_slot.assert_awaited_once()
     booker._click_time_slot.assert_not_awaited()
-    booker._wait_for_checkout.assert_awaited_once()
+    booker._wait_for_checkout.assert_awaited()  # per-try + final full wait (Fix-4)
 
 
 @pytest.mark.asyncio
@@ -406,7 +411,7 @@ async def test_book_single_warm_tag_miss_fallback_succeeds_proceeds():
     await booker._book_single(slot, asyncio.Event(), warm_page=_warm_page())
     booker._click_time_slot.assert_awaited_once()
     assert booker._click_time_slot.call_args.kwargs.get("strict_time_match") is True
-    booker._wait_for_checkout.assert_awaited_once()
+    booker._wait_for_checkout.assert_awaited()  # per-try + final full wait (Fix-4)
 
 
 @pytest.mark.asyncio

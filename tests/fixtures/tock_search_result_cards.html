@@ -1,0 +1,56 @@
+<!doctype html>
+<!--
+  SANITIZED fixture reproducing Tock's MUI search-result layout that broke
+  booking on 2026-06-12. NO production data / PII — structure only.
+
+  Key structural fact (the bug): inside each data-testid="search-result"
+  card, the time label lives in a <section> in one subtree while the
+  data-testid="booking-card-button" "Book" button lives in a SIBLING
+  subtree. So the button's IMMEDIATE parent does NOT contain the time —
+  only the enclosing card does. The old matcher checked only the button's
+  text / immediate parent and gave up; the fix scopes to the card.
+-->
+<html>
+  <body>
+    <div class="ConsumerCalendar-month">
+      <button class="ConsumerCalendar-day is-in-month is-available"><span class="MuiTypography-root">19</span></button>
+      <button class="ConsumerCalendar-day is-in-month is-available is-selected"><span class="MuiTypography-root">20</span></button>
+    </div>
+
+    <div class="Consumer-resultsList" data-testid="search-results">
+
+      <div class="MuiCard-root" data-testid="search-result">
+        <div class="MuiCardHeader-root" data-testid="search-result-card-header">
+          <div class="MuiCardHeader-content">
+            <span class="Consumer-resultsListItemWrap">
+              <section data-testid="result-time-section" class="time-section">
+                <span class="Consumer-resultsListItemTime" data-testid="search-result-time"><span class="MuiTypography-root"><span>5:00 PM</span></span></span>
+                <span class="css-price"><span data-testid="result-price"><span>$258</span> &times; 2</span></span>
+              </section>
+            </span>
+          </div>
+          <div class="MuiCardActions-root">
+            <button data-testid="booking-card-button" class="MuiButtonBase-root"><span role="presentation" class="MuiButton-label">Book</span></button>
+          </div>
+        </div>
+      </div>
+
+      <div class="MuiCard-root" data-testid="search-result">
+        <div class="MuiCardHeader-root" data-testid="search-result-card-header">
+          <div class="MuiCardHeader-content">
+            <span class="Consumer-resultsListItemWrap">
+              <section data-testid="result-time-section" class="time-section">
+                <span class="Consumer-resultsListItemTime" data-testid="search-result-time"><span class="MuiTypography-root"><span>8:00 PM</span></span></span>
+                <span class="css-price"><span data-testid="result-price"><span>$258</span> &times; 2</span></span>
+              </section>
+            </span>
+          </div>
+          <div class="MuiCardActions-root">
+            <button data-testid="booking-card-button" class="MuiButtonBase-root"><span role="presentation" class="MuiButton-label">Book</span></button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </body>
+</html>

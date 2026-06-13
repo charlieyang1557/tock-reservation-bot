@@ -340,7 +340,11 @@ def _instrumented(
         calls.append("container")
         return container_ok
 
+    # The replay warm-page path now NAVIGATES (page.goto to the slot's own URL,
+    # Fix 3 on the warm path) instead of page.reload(). Record either as the
+    # warm-navigation step so the existing reload→container→click traces hold.
     page.reload = fake_reload
+    page.goto = fake_reload
     booker._click_time_slot = fake_click
     booker._click_calendar_day = fake_day_click
     booker._wait_for_selector = fake_wait_for_selector
@@ -348,6 +352,10 @@ def _instrumented(
     booker._dump_click_failure = AsyncMock()
     booker._booking_screenshot = AsyncMock()
     booker._wait_for_checkout = AsyncMock(return_value=False)
+    # This tracer asserts the single-attempt reload→container→click→day order.
+    # Pin one attempt so the Fix-4 click-retry loop doesn't multiply the trace;
+    # retry behavior is covered in tests/test_slot_click_retry.py.
+    booker.config.slot_click_max_tries = 1
 
 
 def _warm_page():
@@ -461,7 +469,7 @@ async def test_reload_failure_on_open_page_still_attempts_click():
         calls.append("reload")
         raise RuntimeError("net hiccup")
 
-    page.reload = failing_reload
+    page.goto = failing_reload   # warm-replay path navigates via goto now
     slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
 
     ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
@@ -487,7 +495,7 @@ async def test_reload_failure_on_dead_page_fails_fast():
         calls.append("reload")
         raise RuntimeError("Target closed")
 
-    page.reload = dying_reload
+    page.goto = dying_reload   # warm-replay path navigates via goto now
     slot = AvailableSlot(TARGET, "5:00 PM", "Friday", source="replay")
 
     ok = await booker._book_single(slot, asyncio.Event(), warm_page=page)
