@@ -64,6 +64,15 @@ NORMAL_SKIP_TTL_SEC = 1200  # 20 minutes
 # intent for future maintainers.
 _CF_CHALLENGE_ALERT_THRESHOLD = 0.05
 
+# 06/26 incident P0a: in the sniper window, an empty post-release replay often
+# means the release is flipping to bookable RIGHT NOW. Before paying the
+# multi-second DOM safety-net scan (which on 06/26 blocked replay re-detection
+# for ~7s on the most time-critical poll), re-poll the cheap (~160ms) replay
+# path a few times. Total added latency budget ≈ _MAX_TRIES × (interval + fetch).
+# The DOM safety net still runs if replay stays empty across all re-polls.
+_REPLAY_REPOLL_MAX_TRIES = 6
+_REPLAY_REPOLL_INTERVAL_SEC = 0.25
+
 logger = logging.getLogger(__name__)
 
 
@@ -1314,18 +1323,42 @@ class AvailabilityChecker:
         returned empty for) for offline ghost-slot threshold calibration — no
         network re-fetch, which would delay booking (codex HIGH).
         """
-        replay_res = await self._try_calendar_replay(sniper_mode=keep_pages)
+        # Try replay; in sniper mode (keep_pages) RE-POLL briefly on an empty
+        # result before the slow DOM fallback — a real release frequently flips
+        # to bookable mid-poll (06/26: empty at 20:00:00, bookable by ~20:00:04,
+        # but the ~7s DOM scan blocked re-detection until the next poll at
+        # 20:00:07). _REPLAY_REPOLL_INTERVAL_SEC is monkeypatched to 0 in tests.
+        repoll_tries = _REPLAY_REPOLL_MAX_TRIES if keep_pages else 0
+        failcount_before = self._replay_failure_count
+        replay_res = None
+        for attempt in range(repoll_tries + 1):
+            if attempt > 0:
+                await asyncio.sleep(_REPLAY_REPOLL_INTERVAL_SEC)
+            replay_res = await self._try_calendar_replay(sniper_mode=keep_pages)
 
-        # FAST PATH — replay found a slot. Book it now; skip DOM entirely.
-        if replay_res:
-            self._record_slots(replay_res, keep_pages=keep_pages)
-            self.last_errors = 0
-            self.last_checks = 1  # one fetch represents the whole scan
-            logger.info(
-                f"[check-replay] {len(replay_res)} slot(s) via calendar-replay "
-                "fast-path (post-release) — DOM scan skipped"
+            # FAST PATH — replay found a slot. Book it now; skip DOM entirely.
+            if replay_res:
+                self._record_slots(replay_res, keep_pages=keep_pages)
+                self.last_errors = 0
+                self.last_checks = 1  # one fetch represents the whole scan
+                logger.info(
+                    f"[check-replay] {len(replay_res)} slot(s) via calendar-replay "
+                    f"fast-path (post-release"
+                    f"{f', re-poll {attempt}' if attempt else ''}) — DOM scan skipped"
+                )
+                return replay_res
+
+        # Collapse re-poll FAILURES into ONE logical failure for the circuit
+        # breaker (threshold=3): the re-polls are retries of a SINGLE detection
+        # poll, so N rapid genuine failures must not trip the breaker N× faster
+        # than the old once-per-poll cadence and disable replay for the whole
+        # window. Clean-empty results already reset the counter to 0 inside
+        # _try_calendar_replay, so this only fires on real fetch/parse failures.
+        if repoll_tries and self._replay_failure_count > failcount_before + 1:
+            self._replay_failure_count = failcount_before + 1
+            self._replay_circuit_open = (
+                self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD
             )
-            return replay_res
 
         # FALLBACK PATH — replay empty ([]) or failed (None). Run the DOM
         # safety net. replay_failed distinguishes the two for instrumentation.

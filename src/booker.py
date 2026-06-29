@@ -135,6 +135,36 @@ def _checkout_url_matches(url: str) -> bool:
     return bool(_CHECKOUT_PATH_RE.search(path))
 
 
+# 06/26 incident: after a "Book" click that loses the hold, Tock keeps the URL
+# on /search and surfaces one of two TERMINAL states — a race-loss error toast
+# or a sold-out modal. The booker was blind to both and re-clicked a dead Book
+# button for ~84s. These match the distinctive USER-FACING strings (each
+# verified to appear exactly once, in the rendered DOM only, in the 06/26
+# faildom_checkout dumps); class names are NOT used because MUI class names also
+# appear in <style> rules. Kept deliberately narrow to avoid a false abort on a
+# still-winnable slot.
+_RACE_LOSS_RE = re.compile(r"someone else just selected this", re.IGNORECASE)
+_SOLD_OUT_RE = re.compile(r"sold out all reservations", re.IGNORECASE)
+
+
+def classify_booking_terminal_state(html: "str | None") -> "str | None":
+    """Classify a post-click page as a TERMINAL booking failure.
+
+    Returns 'race_lost' when Tock's "… someone else just selected this and it is
+    no longer available." toast is present, 'sold_out' when its "… has sold out
+    all reservations …" modal is present, else None. race_lost takes precedence
+    (more specific). Operates on serialized page HTML so it is trivially unit-
+    testable against the captured failure dumps.
+    """
+    if not isinstance(html, str) or not html:
+        return None
+    if _RACE_LOSS_RE.search(html):
+        return "race_lost"
+    if _SOLD_OUT_RE.search(html):
+        return "sold_out"
+    return None
+
+
 def _slot_time_to_24h(slot_time: "str | None", fallback: str) -> str:
     """Convert a slot time like '8:00 PM' into Tock's URL time= value
     ('20:00'). Falls back to `fallback` (config.preferred_time) when the
@@ -184,6 +214,18 @@ _PAYMENT_VISIBLE_JS_SOURCE = (
     "    /add (payment|card|a card)/i.test(el.innerText || '')"
     "  );"
     "}"
+)
+
+
+# 06/26 incident P0b: Tock's hold/checkout can render as a URL-STABLE in-page
+# modal (the page stays on /search), so checkout_container CSS, the URL regex,
+# and the URL-GATED _PAYMENT_VISIBLE_JS_SOURCE above all miss it. This selector
+# is a non-URL-gated positive signal: a saved-card widget or CVC input means
+# we are at the payment step regardless of the URL. Deliberately excludes the
+# generic confirm_button (button[type=submit]) to avoid matching a search/notify
+# submit. Derived from selectors.py so it can't drift.
+_CHECKOUT_PAYMENT_SELECTOR = ", ".join(
+    s for s in (sel.get("saved_payment_card"), sel.get("cvc_input")) if s
 )
 
 
@@ -295,6 +337,11 @@ class TockBooker:
         # the next monitor poll from starting another race after a soft-win
         # (Codex pass 2 HIGH finding).
         self._unverified_confirm_slot: AvailableSlot | None = None
+        # Most-recent terminal booking state Tock surfaced (race-loss toast or
+        # sold-out modal). Set by _click_until_checkout's fast-abort so the
+        # failure notification can be race-loss-specific (06/26 incident). Reset
+        # per race in book_best_slot_race.
+        self.last_terminal_reason: str | None = None
 
     # ------------------------------------------------------------------
     # Public: race multiple slots
@@ -324,6 +371,9 @@ class TockBooker:
                                attempted slot. Bot must idle until restart.
           FAILED             — all attempts failed; slot is None.
         """
+        # Reset the terminal-failure reason at race entry so a stale reason from
+        # a prior poll can't leak into this race's failure notification (P1).
+        self.last_terminal_reason = None
         if not slots:
             return BookingOutcome.FAILED, None
 
@@ -881,6 +931,24 @@ class TockBooker:
                         )
                     return True
 
+            # Fast-abort (06/26): if Tock surfaced a TERMINAL state — the
+            # race-loss toast ("someone else just selected this …") or the
+            # sold-out modal — the slot is GONE. Stop re-clicking a dead Book
+            # button (06/26 burned ~84s × 4 tasks doing exactly that) and let
+            # the caller report a race-loss-specific failure.
+            # (No extra is_closed() guard here — a closed/navigating page makes
+            # the probe return None via its own try/except, and loop-top handles
+            # closure on the next iteration.)
+            if not booking_won.is_set():
+                terminal = await self._detect_booking_terminal_state(page)
+                if terminal:
+                    self.last_terminal_reason = terminal
+                    logger.info(
+                        f"[book] {slot} — Tock reports '{terminal}'; aborting "
+                        f"click retries on try {click_try}/{max_tries} (slot gone)"
+                    )
+                    break
+
             if click_try < max_tries:
                 logger.info(
                     f"[book] {slot} — click {click_try}/{max_tries} did not "
@@ -1303,6 +1371,21 @@ class TockBooker:
         except Exception as e:
             logger.debug(f"[book] {stage} failure DOM dump failed: {e}")
 
+    async def _detect_booking_terminal_state(self, page: Page) -> "str | None":
+        """Return 'race_lost' / 'sold_out' if Tock has surfaced a terminal
+        booking state on the current page, else None.
+
+        Reads the live serialized DOM (page.content()) and classifies it. Errors
+        (page mid-navigation / closed) are swallowed → None, so this never
+        breaks the booking flow.
+        """
+        try:
+            html = await page.content()
+        except Exception as e:
+            logger.debug(f"[book] terminal-state probe failed: {type(e).__name__}: {e}")
+            return None
+        return classify_booking_terminal_state(html)
+
     async def _wait_for_checkout(
         self, page: Page, slot: AvailableSlot,
         booking_won: asyncio.Event | None = None,
@@ -1344,10 +1427,21 @@ class TockBooker:
             await page.wait_for_function(_PAYMENT_VISIBLE_JS_SOURCE, timeout=timeout_ms)
             return "function"
 
+        async def _via_payment_element():
+            # 06/26 P0b: catch a URL-stable modal checkout — payment UI visible
+            # with no route change (the case the other three waiters miss).
+            await page.wait_for_selector(
+                _CHECKOUT_PAYMENT_SELECTOR, state="visible", timeout=timeout_ms
+            )
+            return "payment_element"
+
         tasks = [
             asyncio.create_task(_via_selector(), name="wait_for_checkout::selector"),
             asyncio.create_task(_via_url(), name="wait_for_checkout::url"),
             asyncio.create_task(_via_function(), name="wait_for_checkout::function"),
+            asyncio.create_task(
+                _via_payment_element(), name="wait_for_checkout::payment_element"
+            ),
         ]
         if booking_won is not None:
             async def _via_aborted():

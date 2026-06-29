@@ -94,6 +94,32 @@ _SNIPER_PRE_RELEASE_TICK_SEC = 0.5
 _SNIPER_METRICS_FLUSH_EVERY_N = 5
 
 
+def describe_booking_failure(terminal_reason: "str | None") -> str:
+    """Human-readable reason for the RED 'Booking Failed' Discord embed.
+
+    06/26 incident P1: when the booker detected a TERMINAL state (race-loss
+    toast / sold-out modal) it records `last_terminal_reason`; surface that
+    specifically instead of the catch-all. `None` preserves the original generic
+    wording so behavior is unchanged when the cause is unknown.
+    """
+    if terminal_reason == "race_lost":
+        return (
+            "lost the race — another guest selected the slot(s) before the bot "
+            "reached checkout (Tock: 'someone else just selected this and it is "
+            "no longer available'). See booking_failures/ for the captured DOM."
+        )
+    if terminal_reason == "sold_out":
+        return (
+            "sold out — Tock reported all reservations gone before the bot "
+            "reached checkout. See booking_failures/ for the captured DOM."
+        )
+    return (
+        "all booking attempts failed (slot vanished, checkout never loaded, or "
+        "payment prep failed) — see booking_failures/ for the captured page DOM "
+        "(if any)"
+    )
+
+
 class TockMonitor:
     def __init__(
         self,
@@ -588,9 +614,7 @@ class TockMonitor:
                     self._last_booking_failed_key = failed_key
                     self.notifier.booking_failed(
                         slots,
-                        "all booking attempts failed (slot vanished, checkout "
-                        "never loaded, or payment prep failed) — see "
-                        "booking_failures/ for the captured page DOM (if any)",
+                        describe_booking_failure(self.booker.last_terminal_reason),
                     )
                 else:
                     logger.debug(

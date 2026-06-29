@@ -224,3 +224,30 @@ async def test_existing_polling_test_still_passes_via_payment_query():
 
     result = await booker._wait_for_checkout(page, slot)
     assert result is True
+
+
+@pytest.mark.asyncio
+async def test_returns_on_payment_element_without_url_change():
+    """06/26 P0b: Tock's hold/checkout can render as a URL-STABLE modal — the
+    URL stays /search, so checkout_container CSS, the URL regex, AND the
+    URL-gated payment-visible JS all miss it. A non-URL-gated payment-element
+    waiter (saved card / CVC input) must still detect checkout."""
+    from src.booker import _CHECKOUT_PAYMENT_SELECTOR
+    booker = _make_booker()
+    slot = _make_slot()
+    page = AsyncMock()
+    page.url = "https://www.exploretock.com/test/search"  # never changes
+
+    async def sel_side_effect(selector, **kw):
+        if selector == _CHECKOUT_PAYMENT_SELECTOR:
+            return MagicMock()        # checkout payment UI is present
+        raise _timeout_exc()          # checkout_container never matches
+
+    page.wait_for_selector = AsyncMock(side_effect=sel_side_effect)
+    page.wait_for_url = AsyncMock(side_effect=_waiter(None, raise_exc=_timeout_exc()))
+    page.wait_for_function = AsyncMock(side_effect=_waiter(None, raise_exc=_timeout_exc()))
+    page.query_selector = AsyncMock(return_value=None)
+    page.screenshot = AsyncMock()
+
+    result = await booker._wait_for_checkout(page, slot)
+    assert result is True
