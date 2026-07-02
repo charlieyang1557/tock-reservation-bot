@@ -142,6 +142,11 @@ class TockMonitor:
         # Dedup key for booking_failed embeds — suppresses per-poll spam when
         # the same slot-set stays unbookable across a contested window.
         self._last_booking_failed_key: tuple | None = None
+        # Dedup flag for the 'total calendar failure' alert — fired at most
+        # once per sniper window. 06/19 incident: every calendar load errored
+        # for ~10 min and 0 slots, indistinguishable to the operator from a
+        # quiet no-release night (which is exactly what 06/19 was).
+        self._sniper_calendar_failure_alerted = False
 
         # Adaptive sniper mode: start concurrent, fall back to sequential if
         # Cloudflare error rate gets too high, retry concurrent after recovery.
@@ -509,6 +514,10 @@ class TockMonitor:
 
         if not slots:
             self.notifier.no_slots_found()
+            # 06/19 incident: distinguish a TOTAL calendar failure (every date
+            # errored — bot couldn't read the calendar at all) from a benign
+            # no-release/sold-out poll, and alert once per window if so.
+            self._maybe_alert_calendar_failure(sniper_age)
             # Slots cleared — re-arm the failure-dedup so a later failure of the
             # same slot-set alerts again rather than being suppressed.
             self._last_booking_failed_key = None
@@ -646,6 +655,29 @@ class TockMonitor:
             except Exception:
                 pass
 
+    def _maybe_alert_calendar_failure(self, sniper_age: float | None) -> None:
+        """Fire ONE Discord alert per sniper window when a 0-slot poll was a
+        TOTAL calendar failure (every date errored), as opposed to the benign
+        sold-out / no-release state (0 errors).
+
+        Gated to post-release polls (sniper_age >= 60s) so the expected
+        pre-release errors — slots not dropped yet — don't trigger it. Before
+        this, the 06/19 window (every calendar load errored for ~10 min, 0
+        slots) was indistinguishable from a quiet night and sent no alert."""
+        if not self._sniper_active:
+            return
+        if self._sniper_calendar_failure_alerted:
+            return
+        checks = self.checker.last_checks
+        errors = self.checker.last_errors
+        if checks <= 0 or errors < checks:
+            return
+        # Pre-release errors (first 60s, before the drop) are expected.
+        if sniper_age is not None and sniper_age < 60.0:
+            return
+        self._sniper_calendar_failure_alerted = True
+        self.notifier.sniper_calendar_failure(errors, checks)
+
     def _apply_adaptive_switching(self, sniper_age: float) -> None:
         """Update concurrent/sequential mode based on rolling error rate.
 
@@ -758,6 +790,7 @@ class TockMonitor:
                 self._sniper_active = True
                 self._sniper_slots_found = 0
                 self._last_booking_failed_key = None  # re-arm failure dedup
+                self._sniper_calendar_failure_alerted = False  # re-arm cal-fail alert
                 # Reset adaptive state for each new sniper window
                 self._sniper_concurrent = True
                 self._sniper_error_window.clear()

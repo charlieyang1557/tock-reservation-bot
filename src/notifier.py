@@ -233,6 +233,33 @@ class Notifier:
         )
         self._fire(title=title, description=msg, color=_RED)
 
+    def sniper_calendar_failure(self, errors: int, checks: int) -> None:
+        """Alert when EVERY date's calendar load failed during a sniper poll.
+
+        Separates 'the bot could not read the calendar at all' (errors ==
+        checks) from the benign 'released but sold out / no release' state
+        (0 errors, 0 slots), which stays console-only. The monitor fires this
+        at most once per sniper window. RED but not 'critical' — it's an
+        operational heads-up, not a booking outcome. (06/19 incident class:
+        every calendar load errored for ~10 min and looked like a quiet night.)
+        """
+        msg = (
+            f"Every calendar load failed this sniper poll — {errors}/{checks} "
+            f"dates errored (selector timeout / page never rendered).\n\n"
+            f"This is NOT the benign 'no slots' state: the bot could not read "
+            f"the calendar at all. If a release was expected, investigate now "
+            f"(stale selector, Tock outage, or stale session/cookies). If it "
+            f"was a quiet no-release night, this is harmless."
+        )
+        logger.warning(
+            f"[sniper] CALENDAR FAILURE — {errors}/{checks} dates errored"
+        )
+        self._fire(
+            title="🚨 Sniper — All Calendar Loads Failed",
+            description=msg,
+            color=_RED,
+        )
+
     # ------------------------------------------------------------------
     # Discord delivery (fire-and-forget)
     # ------------------------------------------------------------------

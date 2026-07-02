@@ -87,17 +87,38 @@ SELECTORS: dict[str, str] = {
     # Wrapping container for time-slot results — used by checker to scope slot
     # collection so global "Book" buttons (header CTAs, private-event tiles)
     # cannot become false positives. Multiple commas = OR-of-selectors.
+    # Tock's MUI layout (2026-06-12 capture) wraps the result cards in
+    # div.Consumer-resultsListVertical inside div.SearchModalExperiences-itemTimes,
+    # and each card is [data-testid="search-result"]. The old single
+    # div.Consumer-resultsList token does NOT match Consumer-resultsListVertical,
+    # so container-scoped collection used to fall back to page-wide. MUI tokens
+    # listed first; legacy tokens kept as fallbacks for older layouts.
     "slots_container": (
+        "div.Consumer-resultsListVertical, "
+        "div.SearchModalExperiences-itemTimes, "
+        "[data-testid='search-result'], "
         "div.Consumer-resultsList, "
         "div[role='region'][aria-label*='time'], "
         "div[data-testid='search-results'], "
         "div.SearchResults, "
         "section.search-results"
     ),
-    # Clickable button for an available time slot
+    # Clickable button for an available time slot (legacy class — matches
+    # nothing on the current MUI layout). The real MUI per-slot button
+    # <button data-testid="booking-card-button">Book</button> is handled by the
+    # booker cascade in _SLOT_SELECTOR_ENTRIES as a "generic" selector (time is
+    # confirmed from the enclosing [data-testid="search-result"] card). Do NOT
+    # add booking-card-button here: this key is tagged "specific" (click-
+    # directly) in _SLOT_SELECTOR_ENTRIES, and a card-level Book button must be
+    # generic so its time is verified before clicking (2026-06-12 mis-click risk).
     "available_slot_button": "button.Consumer-resultsListItem.is-available",
-    # <span> inside a slot button that shows the time text ("5:00 PM")
-    "slot_time_text": "span.Consumer-resultsListItemTime",
+    # Time label for a slot ("5:00 PM"). On the MUI layout the time lives in
+    # [data-testid="search-result-time"] (a sibling of the Book button, NOT a
+    # child of it); span.Consumer-resultsListItemTime is the legacy class.
+    "slot_time_text": (
+        '[data-testid="search-result-time"], '
+        'span.Consumer-resultsListItemTime'
+    ),
 
     # --- Checkout / booking form --------------------------------------------
     # Main checkout page container — presence signals we're past slot selection.
