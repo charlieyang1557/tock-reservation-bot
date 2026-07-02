@@ -892,9 +892,11 @@ class TockMonitor:
             )
             return 300
 
-        # 5. Default
-        logger.debug(f"[schedule] Default ({t.strftime('%H:%M')} PT) → 900s")
-        return 900
+        # 5. Default. 300s, not 900: on 07/02 Tock soft-launched real weekend
+        # inventory mid-day with no announcement and it vanished within 15
+        # minutes — a 900s cadence can sleep through an entire surprise window.
+        logger.debug(f"[schedule] Default ({t.strftime('%H:%M')} PT) → 300s")
+        return 300
 
     def _is_sniper_window(self) -> bool:
         """True if the current PT time falls within any configured sniper window."""

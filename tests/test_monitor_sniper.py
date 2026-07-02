@@ -187,15 +187,17 @@ class TestGetPollInterval:
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         result = monitor._get_poll_interval()
         assert monitor._sniper_active is False
-        assert result == 900  # default
+        assert result == 300  # default (release-eve hardening 07/02)
 
     @patch("src.monitor.datetime")
-    def test_returns_900_default(self, mock_dt):
-        """Normal Wednesday afternoon → 900s."""
+    def test_returns_300_default(self, mock_dt):
+        """Normal Wednesday afternoon → 300s (was 900; lowered 07/02 after a
+        soft-launch released real inventory mid-day and vanished within 15
+        minutes — a 900s cadence can miss an entire surprise window)."""
         monitor = _make_monitor()
         mock_dt.now.return_value = _pt_datetime(2026, 3, 18, 14, 0)
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
-        assert monitor._get_poll_interval() == 900
+        assert monitor._get_poll_interval() == 300
 
     @patch("src.monitor.datetime")
     def test_overnight(self, mock_dt):
@@ -425,13 +427,13 @@ class TestSniperWorkflowIntegration:
     async def test_bug_scenario_poll_before_window_gets_900s_sleep(self):
         """
         Reproduce the bug: poll starts at 19:58:59, finishes at 20:00:40.
-        OLD behavior: interval=900 (computed before poll, at 19:58:59).
+        OLD behavior: interval=default (computed before poll, at 19:58:59).
         NEW behavior: interval recomputed after poll → 0 (sniper mode).
         """
         monitor = _make_monitor()
 
         # Simulate: _get_poll_interval called twice —
-        # 1st call (pre-poll) at 19:58:59 outside window → would be 900
+        # 1st call (pre-poll) at 19:58:59 outside window → would be 300
         # 2nd call (post-poll) at 20:00:40 inside window → should be 0
         with patch("src.monitor.datetime") as mock_dt:
             # Pre-poll: 19:58:59 — just before window
@@ -439,7 +441,7 @@ class TestSniperWorkflowIntegration:
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             pre_interval = monitor._get_poll_interval()
 
-        assert pre_interval == 900, "Before window, default interval applies"
+        assert pre_interval == 300, "Before window, default interval applies"
         assert monitor._sniper_active is False
 
         with patch("src.monitor.datetime") as mock_dt:
