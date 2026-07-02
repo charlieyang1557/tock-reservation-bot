@@ -142,6 +142,12 @@ class TockMonitor:
         # Dedup key for booking_failed embeds — suppresses per-poll spam when
         # the same slot-set stays unbookable across a contested window.
         self._last_booking_failed_key: tuple | None = None
+        # Dedup key for booking_refused_uncertain embeds — a hot sniper window
+        # (2 polls/s, each detecting slots and refusing on the guard file)
+        # must fire ONE embed, not dozens. Keyed on the guard-file payload and
+        # re-armed at the same sites as _last_booking_failed_key (empty polls,
+        # window entry, confirmed booking).
+        self._last_refused_uncertain_key: tuple | None = None
         # Dedup flag for the 'total calendar failure' alert — fired at most
         # once per sniper window. 06/19 incident: every calendar load errored
         # for ~10 min and 0 slots, indistinguishable to the operator from a
@@ -521,6 +527,7 @@ class TockMonitor:
             # Slots cleared — re-arm the failure-dedup so a later failure of the
             # same slot-set alerts again rather than being suppressed.
             self._last_booking_failed_key = None
+            self._last_refused_uncertain_key = None
             return
 
         # Track slots found during sniper window for end-of-window summary
@@ -591,6 +598,7 @@ class TockMonitor:
             if outcome == BookingOutcome.CONFIRMED:
                 self._booking_secured = True
                 self._last_booking_failed_key = None
+                self._last_refused_uncertain_key = None
                 logger.info(
                     f"[monitor] *** Booking secured: {booked_slot} ***\n"
                     "Bot will idle from now on. Safe to Ctrl+C."
@@ -606,6 +614,39 @@ class TockMonitor:
                     "Bot will idle until restart. Verify manually at "
                     "https://www.exploretock.com/account/reservations."
                 )
+            elif outcome == BookingOutcome.REFUSED_UNCERTAIN_GUARD:
+                # 06/26 incident: this state used to be reported as
+                # UNVERIFIED_CONFIRM → _booking_secured=True → silent
+                # permanent idle. No confirm was clicked THIS session, so do
+                # NOT idle: the guard file is re-read at every race start —
+                # if the operator deletes booking_uncertain.json mid-window,
+                # the very next poll can book. Alert loudly (deduped) instead.
+                uncertain = self.booker.last_refused_uncertain
+                logger.error(
+                    f"[monitor] *** Booking REFUSED — booking_uncertain.json "
+                    f"exists (uncertain slot: {booked_slot}) ***\n"
+                    "Bot keeps scanning. Verify at "
+                    "https://www.exploretock.com/account/reservations, then "
+                    "delete booking_uncertain.json to re-enable booking "
+                    "(no restart needed)."
+                )
+                refused_key = (
+                    (
+                        uncertain.slot_date_str,
+                        uncertain.slot_time,
+                        uncertain.detected_at_iso,
+                    )
+                    if uncertain is not None
+                    else ("<no-payload>",)
+                )
+                if refused_key != self._last_refused_uncertain_key:
+                    self._last_refused_uncertain_key = refused_key
+                    self.notifier.booking_refused_uncertain(uncertain)
+                else:
+                    logger.debug(
+                        "[monitor] booking_refused_uncertain embed suppressed "
+                        "— same guard file already alerted this window"
+                    )
             else:  # FAILED
                 logger.warning(
                     "[monitor] All booking attempts failed this cycle. Will retry."
@@ -790,6 +831,7 @@ class TockMonitor:
                 self._sniper_active = True
                 self._sniper_slots_found = 0
                 self._last_booking_failed_key = None  # re-arm failure dedup
+                self._last_refused_uncertain_key = None  # re-arm refused dedup
                 self._sniper_calendar_failure_alerted = False  # re-arm cal-fail alert
                 # Reset adaptive state for each new sniper window
                 self._sniper_concurrent = True

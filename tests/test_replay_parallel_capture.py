@@ -26,6 +26,10 @@ detection is SEQUENTIAL, replay-first:
   3. replay empty/None  → run the DOM scan (the safety net) and return it.
 This is the ONLY path DOM runs on, so an empty/wrong replay can never
 suppress DOM, AND a found replay slot is booked without waiting on DOM.
+(06/26 P0 update: the clean-empty→DOM path is additionally throttled to once
+per _DOM_SAFETY_NET_MIN_INTERVAL_SEC — tests here pre-age the anchor via
+_arm_dom_safety_net so the scan is due; throttle semantics are covered by
+test_dom_safety_net_throttle.py.)
 
 Capture: on the replay-empty-but-DOM-found path, dump the body the poll
 already stashed (the exact bytes the parser just wrongly returned empty for)
@@ -125,6 +129,20 @@ def _single_target(checker, target: date):
     )
 
 
+def _arm_dom_safety_net(checker):
+    """06/26 P0: the post-release DOM safety net is throttled — the anchor
+    arms (without scanning) on the first clean-empty poll and a scan only
+    runs once _DOM_SAFETY_NET_MIN_INTERVAL_SEC has elapsed. Tests asserting
+    on the DOM-fallback path pre-age the anchor so the scan is due NOW.
+    (Throttle semantics themselves are covered by
+    test_dom_safety_net_throttle.py.)"""
+    import time
+    from src.checker import _DOM_SAFETY_NET_MIN_INTERVAL_SEC
+    checker._dom_safety_net_anchor = (
+        time.monotonic() - _DOM_SAFETY_NET_MIN_INTERVAL_SEC - 1.0
+    )
+
+
 # ---------------------------------------------------------------------------
 # (a) Post-release sniper: replay non-empty returns IMMEDIATELY, no DOM scan
 # ---------------------------------------------------------------------------
@@ -191,6 +209,7 @@ async def test_post_release_runs_dom_when_replay_empty(monkeypatch):
         return [dom_slot]
     monkeypatch.setattr(checker, "_check_date", fake_check_date)
 
+    _arm_dom_safety_net(checker)  # 06/26 P0 throttle: make the scan due
     result = await checker.check_all(
         concurrent=True, keep_pages=True,
         sniper_window_age_sec=POST_RELEASE_AGE,
@@ -267,6 +286,7 @@ async def test_replay_miss_dumps_stashed_body_without_refetch(monkeypatch, tmp_p
         return [_slot(target, "8:00 PM")]  # DOM found it
     monkeypatch.setattr(checker, "_check_date", fake_check_date)
 
+    _arm_dom_safety_net(checker)  # 06/26 P0 throttle: make the scan due
     result = await checker.check_all(concurrent=True, keep_pages=True,
                                      sniper_window_age_sec=POST_RELEASE_AGE)
 
@@ -302,12 +322,14 @@ async def test_replay_miss_dumps_once_per_window(monkeypatch, tmp_path):
         return [_slot(target, "8:00 PM")]
     monkeypatch.setattr(checker, "_check_date", fake_check_date)
 
-    # Poll 1 → one dump
+    # Poll 1 (safety-net scan due) → one dump
+    _arm_dom_safety_net(checker)
     await checker.check_all(concurrent=True, keep_pages=True,
                             sniper_window_age_sec=POST_RELEASE_AGE)
     assert len(os.listdir(tmp_path)) == 1
 
-    # Poll 2 (same window) → no second dump
+    # Poll 2 (same window, scan due again) → no second dump
+    _arm_dom_safety_net(checker)
     await checker.check_all(concurrent=True, keep_pages=True,
                             sniper_window_age_sec=POST_RELEASE_AGE)
     assert len(os.listdir(tmp_path)) == 1, "must dump at most once per window"
@@ -352,6 +374,7 @@ async def test_replay_miss_no_body_at_all_does_not_burn_budget(
         return []
     monkeypatch.setattr(checker, "_try_calendar_replay", replay_with_body)
 
+    _arm_dom_safety_net(checker)  # clean-empty path is throttled; make it due
     await checker.check_all(concurrent=True, keep_pages=True,
                             sniper_window_age_sec=POST_RELEASE_AGE)
     assert len(os.listdir(tmp_path)) == 1, (
@@ -379,6 +402,7 @@ async def test_replay_miss_dump_resets_on_close_sniper_pages(monkeypatch, tmp_pa
         return [_slot(target, "8:00 PM")]
     monkeypatch.setattr(checker, "_check_date", fake_check_date)
 
+    _arm_dom_safety_net(checker)  # 06/26 P0 throttle: make the scan due
     await checker.check_all(concurrent=True, keep_pages=True,
                             sniper_window_age_sec=POST_RELEASE_AGE)
     assert len(os.listdir(tmp_path)) == 1
@@ -388,6 +412,7 @@ async def test_replay_miss_dump_resets_on_close_sniper_pages(monkeypatch, tmp_pa
     assert checker._replay_capture_dumped_this_window is False
 
     # New window → a fresh capture is allowed
+    _arm_dom_safety_net(checker)  # (window end disarmed the throttle anchor)
     await checker.check_all(concurrent=True, keep_pages=True,
                             sniper_window_age_sec=POST_RELEASE_AGE)
     assert len(os.listdir(tmp_path)) == 2
@@ -568,6 +593,7 @@ async def test_replay_empty_dom_path_counter_consistency(monkeypatch):
         return [dom_slot]
     monkeypatch.setattr(checker, "_check_date", fake_check_date)
 
+    _arm_dom_safety_net(checker)  # 06/26 P0 throttle: make the scan due
     result = await checker.check_all(concurrent=True, keep_pages=True,
                                      sniper_window_age_sec=POST_RELEASE_AGE)
 

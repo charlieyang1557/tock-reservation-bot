@@ -145,22 +145,34 @@ async def test_close_sniper_pages_resets_counter():
 
 # ---------------------------------------------------------------------------
 # Post-release replay-first / DOM-fallback (fix/replay-parallel-capture):
-# when replay returns EMPTY, the DOM scan runs as the safety net on EVERY
-# post-release sniper poll, so the warmup counter ticks per poll. The Codex
-# MEDIUM "replay-success skips the page path" contract still holds for the
-# replay-FOUND case (DOM is skipped then — see the parallel-capture suite),
-# but on the empty-replay path DOM always runs. The warmup budget is spent on
-# the first 2 real DOM scans (the release-moment scans), so the spirit of the
-# 12s warmup survives; it is simply applied from poll #1.
+# when replay returns EMPTY, the DOM scan runs as the safety net — since the
+# 06/26 P0 throttle, at most once per _DOM_SAFETY_NET_MIN_INTERVAL_SEC (the
+# ~7s inline scan blocked the hot loop at the drop moment), and the warmup
+# counter ticks once per scan that RUNS. The Codex MEDIUM "replay-success
+# skips the page path" contract still holds for the replay-FOUND case (DOM is
+# skipped then — see the parallel-capture suite). The warmup budget is spent
+# on the first 2 real DOM scans, so the spirit of the 12s warmup survives.
+# Tests pre-age the throttle anchor so the safety-net scan is DUE.
 # ---------------------------------------------------------------------------
+
+def _arm_dom_safety_net(checker):
+    """Pre-age the 06/26 P0 DOM safety-net throttle anchor so the scan is
+    due NOW (throttle semantics live in test_dom_safety_net_throttle.py)."""
+    import time
+    from src.checker import _DOM_SAFETY_NET_MIN_INTERVAL_SEC
+    checker._dom_safety_net_anchor = (
+        time.monotonic() - _DOM_SAFETY_NET_MIN_INTERVAL_SEC - 1.0
+    )
+
 
 @pytest.mark.asyncio
 async def test_post_release_empty_replay_runs_dom_and_ticks_warmup_per_poll():
     """Post-release sniper with replay returning EMPTY runs the DOM scan as
-    the safety net, so _check_date is called and the warmup counter ticks
-    each poll. With exactly one preferred date and no fallback, each poll
-    invokes _check_date EXACTLY once → after two polls call_count == 2 and
-    the counter == 2. Pins the per-poll behavior precisely (not just >= 1)."""
+    the safety net whenever the throttle says it is due, and the warmup
+    counter ticks once per scan that runs. With exactly one preferred date
+    and no fallback, each due poll invokes _check_date EXACTLY once → after
+    two due polls call_count == 2 and the counter == 2. Pins the per-scan
+    behavior precisely (not just >= 1)."""
     checker = _make_checker()
     checker.config.use_calendar_replay = True
     # Deterministic target set: exactly one preferred date, no fallback, so
@@ -176,25 +188,27 @@ async def test_post_release_empty_replay_runs_dom_and_ticks_warmup_per_poll():
     ), patch.object(
         checker, "_check_date", new_callable=AsyncMock, return_value=[],
     ) as mock_check_date:
-        # Poll 1
+        # Poll 1 (safety-net scan due)
+        _arm_dom_safety_net(checker)
         await checker.check_all(
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )
         assert mock_check_date.call_count == 1, (
-            "first post-release poll must run the DOM scan exactly once "
+            "a due post-release poll must run the DOM scan exactly once "
             "(one preferred date, no fallback)"
         )
         assert checker._sniper_scan_count == 1
-        # Poll 2
+        # Poll 2 (due again)
+        _arm_dom_safety_net(checker)
         await checker.check_all(
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )
         assert mock_check_date.call_count == 2, (
-            "second post-release poll must run the DOM scan exactly once more"
+            "the next due post-release poll must run the DOM scan exactly once more"
         )
     assert checker._sniper_scan_count == 2, (
-        f"Each post-release empty-replay poll runs one real DOM scan → "
-        f"counter ticks per poll; counter was {checker._sniper_scan_count}"
+        f"Each DUE post-release empty-replay poll runs one real DOM scan → "
+        f"counter ticks per scan; counter was {checker._sniper_scan_count}"
     )
 
 
@@ -231,9 +245,10 @@ async def test_post_release_replay_found_skips_dom_and_does_not_tick_warmup():
 
 @pytest.mark.asyncio
 async def test_post_release_first_dom_scan_gets_warmup_timeout():
-    """The FIRST post-release DOM scan (which now runs from poll #1, in
-    parallel with replay) must get the 12s warmup calendar budget to absorb
-    the release-moment latency spike — not the 5s steady-state one."""
+    """The FIRST post-release DOM scan (which since the 06/26 P0 throttle
+    runs on the first DUE clean-empty poll) must get the 12s warmup calendar
+    budget to absorb the release-moment latency spike — not the 5s
+    steady-state one."""
     checker = _make_checker()
     checker.config.use_calendar_replay = True
 
@@ -241,13 +256,14 @@ async def test_post_release_first_dom_scan_gets_warmup_timeout():
     assert checker._sniper_scan_count == 0
     assert checker._compute_cal_timeout(keep_page=True) == 12000
 
-    # First post-release poll: replay empty, DOM runs in parallel.
+    # First DUE post-release poll: replay empty, DOM safety net runs.
     with patch.object(
         checker, "_try_calendar_replay",
         new_callable=AsyncMock, return_value=[],
     ), patch.object(
         checker, "_check_date", new_callable=AsyncMock, return_value=[],
     ):
+        _arm_dom_safety_net(checker)
         await checker.check_all(
             concurrent=True, keep_pages=True, sniper_window_age_sec=120.0,
         )

@@ -56,13 +56,24 @@ BASE_URL = "https://www.exploretock.com"
 class BookingOutcome(Enum):
     """Result of a booking race.
 
-    CONFIRMED           — slot booked and verified
-    UNVERIFIED_CONFIRM  — confirm clicked but verification timed out;
-                          Tock MAY have accepted. Operator must verify.
-    FAILED              — no confirm clicked, or click verifiably failed
+    CONFIRMED                — slot booked and verified
+    UNVERIFIED_CONFIRM       — confirm clicked THIS session but verification
+                               timed out; Tock MAY have accepted. Operator
+                               must verify. Monitor idles until restart.
+    REFUSED_UNCERTAIN_GUARD  — race refused BEFORE any task was created
+                               because a pre-existing booking_uncertain.json
+                               records an earlier unverifiable confirm. The
+                               file is re-read at every race start, so the
+                               monitor must KEEP polling — deleting the file
+                               re-enables booking on the very next poll.
+                               (06/26 incident: this used to be reported as
+                               UNVERIFIED_CONFIRM, which the monitor mapped
+                               to a silent permanent idle.)
+    FAILED                   — no confirm clicked, or click verifiably failed
     """
     CONFIRMED = "confirmed"
     UNVERIFIED_CONFIRM = "unverified_confirm"
+    REFUSED_UNCERTAIN_GUARD = "refused_uncertain_guard"
     FAILED = "failed"
 
 _SCREENSHOT_DIR = os.path.join(
@@ -79,6 +90,11 @@ _BOOKING_FAILURE_DIR = os.path.join(
 # Cap dump files so a pathological failure burst can't exhaust the disk
 # (self-DoS). ~50 full search-page HTMLs ≈ a few tens of MB.
 _MAX_FAILURE_DUMPS = 50
+# Confirm-stage artifacts get their OWN small cap: a race-loss burst can fill
+# the shared faildom_ budget with click/checkout dumps, and the confirm dump
+# is the single artifact that makes an unverified confirm diagnosable
+# (06/26 23:30 — pre-deploy review P1).
+_MAX_CONFIRM_DUMPS = 10
 
 # Reload budget for a stale warm page handed to a replay-sourced slot
 # (2026-06-09 review fix #2). Bounded tight: the page is already on the
@@ -229,6 +245,65 @@ _CHECKOUT_PAYMENT_SELECTOR = ", ".join(
 )
 
 
+# 06/26 23:30 incident (a): 'Checkout detected via url' fires at SPA
+# route-commit, BEFORE the checkout content renders. The payment probes then
+# all miss and confirm gets clicked on a half-rendered page with the CVC
+# unfilled. After checkout detection (any waiter) and BEFORE the payment
+# probes, wait up to this budget for the page to actually paint checkout UI:
+# confirm button visible AND at least one payment-ish signal. Timeout is
+# NON-FATAL (WARNING + proceed best-effort) — never abort a won hold over
+# this. Runs after the hold is won, so it is not on the race-critical path.
+_CHECKOUT_RENDER_SETTLE_TIMEOUT_MS = 4000
+
+# Stripe hosts its card inputs in iframes; the iframe ELEMENT lives in the
+# main document, so its presence is a cheap "payment section rendered" signal
+# even before the cross-origin frame content is reachable.
+_STRIPE_IFRAME_SELECTOR = (
+    'iframe[src*="stripe" i], iframe[name*="stripe" i]'
+)
+
+# "Checkout content actually rendered" payment signal for the settle wait:
+# Stripe iframe / saved-card widget / CVC input / add-payment prompt.
+# Derived from selectors.py so it can't drift.
+_CHECKOUT_RENDER_PAYMENT_SELECTOR = ", ".join(
+    s for s in (
+        _STRIPE_IFRAME_SELECTOR,
+        sel.get("saved_payment_card"),
+        sel.get("cvc_input"),
+        sel.get("no_payment_indicator"),
+    ) if s
+)
+
+# 06/26 23:30 incident (b): the CVC frame scan was one-shot and ran before the
+# Stripe iframe finished rendering — it missed, logged only at DEBUG, and
+# confirm fired with the CVC provably unfilled. Retry the scan for up to
+# ~3s (12 × 250 ms) and log the miss at WARNING.
+_CVC_FILL_RETRY_TRIES = 12
+_CVC_FILL_RETRY_INTERVAL_SEC = 0.25
+
+# Delay before the second (post-selector-timeout) URL re-check in
+# _execute_confirm_click_and_verify. Module-level so tests can zero it.
+_CONFIRM_URL_RECHECK_DELAY_SEC = 5
+
+# 06/26 23:30 incident (d): one-shot visible-text scan for confirmation
+# markers (CONSUMER_CHECKOUT_DIALOG_MIGRATION renders success in-place with
+# NO URL change). innerText only returns rendered/visible text; curly
+# apostrophes are normalized so "You're all set" matches "You’re all set".
+# Markers live in selectors.CONFIRMATION_TEXT_MARKERS — best-guess strings
+# until a real confirmation page is captured.
+_CONFIRMATION_TEXT_SCAN_JS = r"""
+(markers) => {
+  const text = ((document.body && document.body.innerText) || '')
+    .replace(/’/g, "'")
+    .toLowerCase();
+  for (const m of markers) {
+    if (m && text.includes(m.replace(/’/g, "'").toLowerCase())) return m;
+  }
+  return null;
+}
+"""
+
+
 # Single-evaluate slot-click JS (Phase B1.2). Called from _click_time_slot.
 # Iterates DOM-side and clicks inside the same call, eliminating per-button
 # Python↔browser round-trips. Honors strict_time_match by refusing the
@@ -342,6 +417,12 @@ class TockBooker:
         # failure notification can be race-loss-specific (06/26 incident). Reset
         # per race in book_best_slot_race.
         self.last_terminal_reason: str | None = None
+        # UncertainBooking payload behind the most recent
+        # REFUSED_UNCERTAIN_GUARD outcome — the guard block stores what it
+        # read from booking_uncertain.json so the monitor can pass the
+        # date/time/detected_at through to the Discord embed. Reset per race
+        # in book_best_slot_race (same lifecycle as last_terminal_reason).
+        self.last_refused_uncertain: "UncertainBooking | None" = None
 
     # ------------------------------------------------------------------
     # Public: race multiple slots
@@ -369,11 +450,20 @@ class TockBooker:
           CONFIRMED          — slot booked and verified; slot is the winner
           UNVERIFIED_CONFIRM — confirm clicked but unverifiable; slot is the
                                attempted slot. Bot must idle until restart.
+          REFUSED_UNCERTAIN_GUARD — race refused because a PRE-EXISTING
+                               booking_uncertain.json exists; slot is the
+                               uncertain slot from the file. No task was
+                               created. The monitor must keep polling: the
+                               file is re-read here at every race start, so
+                               deleting it re-enables booking immediately.
           FAILED             — all attempts failed; slot is None.
         """
         # Reset the terminal-failure reason at race entry so a stale reason from
         # a prior poll can't leak into this race's failure notification (P1).
         self.last_terminal_reason = None
+        # Same lifecycle for the refused-guard payload: a stale payload from a
+        # prior refused race must not leak into this race's outcome handling.
+        self.last_refused_uncertain = None
         if not slots:
             return BookingOutcome.FAILED, None
 
@@ -391,8 +481,15 @@ class TockBooker:
                 f"{persisted.slot_date_str} ({persisted.day_of_week}) @ "
                 f"{persisted.slot_time}. Verify at "
                 "https://www.exploretock.com/account/reservations and "
-                "remove the file before running again."
+                "remove the file — no restart needed, the file is re-read "
+                "at every race start."
             )
+            # Distinct outcome from UNVERIFIED_CONFIRM: no confirm was
+            # clicked THIS session, so the monitor must keep polling (and
+            # alert loudly) instead of idling forever (06/26 incident).
+            # Stash the file payload so the Discord embed can name the
+            # uncertain slot and its detected_at timestamp.
+            self.last_refused_uncertain = persisted
             from src.checker import AvailableSlot as _AvailableSlot
             from datetime import date as _date_cls
             try:
@@ -400,7 +497,7 @@ class TockBooker:
             except ValueError:
                 slot_date = _date_cls.today()  # corrupt; degrade gracefully
             return (
-                BookingOutcome.UNVERIFIED_CONFIRM,
+                BookingOutcome.REFUSED_UNCERTAIN_GUARD,
                 _AvailableSlot(
                     slot_date=slot_date,
                     slot_time=persisted.slot_time,
@@ -704,7 +801,12 @@ class TockBooker:
                     return True
 
                 # Click happened but verification failed. Tock may have
-                # accepted the booking silently. Set BOTH the in-memory flag
+                # accepted the booking silently. Capture the page DOM +
+                # screenshot FIRST (best-effort, never raises): the 06/26
+                # 23:30 outcome is permanently unknowable because no such
+                # artifact exists.
+                await self._capture_confirm_failure_artifacts(page, slot)
+                # Set BOTH the in-memory flag
                 # AND write the disk file. The disk file survives main.py's
                 # auto-restart loop (Codex pass 3 finding); the in-memory
                 # flag covers the same-process case where disk write fails.
@@ -1324,6 +1426,10 @@ class TockBooker:
         reflected in the filename and log line so the artifact is NOT mislabeled
         as a click-match failure when the click actually succeeded. Best-effort.
         """
+        # Confirm-stage failures are rare and load-bearing for diagnosis, so
+        # their capture problems must be visible at production INFO level;
+        # click/checkout bursts stay at DEBUG to avoid log spam.
+        skip_log = logger.warning if stage == "confirm" else logger.debug
         # Cap check FIRST (cheap listdir) so we don't pay for a full-page
         # serialization just to discard it once the cap is reached.
         try:
@@ -1332,23 +1438,33 @@ class TockBooker:
                 os.chmod(_BOOKING_FAILURE_DIR, 0o700)  # tighten a pre-existing dir
             except OSError:
                 pass
-            existing = [
-                f for f in os.listdir(_BOOKING_FAILURE_DIR)
-                if f.startswith("faildom_")
-            ]
+            files = os.listdir(_BOOKING_FAILURE_DIR)
         except OSError:
-            existing = []
-        if len(existing) >= _MAX_FAILURE_DUMPS:
-            logger.debug(
+            files = []
+        # Confirm dumps count only against their own small cap so a race-loss
+        # burst of click/checkout dumps can't crowd out the one artifact that
+        # makes an unverified confirm diagnosable — and vice versa.
+        if stage == "confirm":
+            existing = [f for f in files if f.startswith("faildom_confirm_")]
+            cap = _MAX_CONFIRM_DUMPS
+        else:
+            existing = [
+                f for f in files
+                if f.startswith("faildom_")
+                and not f.startswith("faildom_confirm_")
+            ]
+            cap = _MAX_FAILURE_DUMPS
+        if len(existing) >= cap:
+            skip_log(
                 f"[book] {stage} failure DOM dump skipped — "
-                f"{_MAX_FAILURE_DUMPS}-file cap reached in {_BOOKING_FAILURE_DIR}"
+                f"{cap}-file cap reached in {_BOOKING_FAILURE_DIR}"
             )
             return
 
         try:
             html = await page.content()
         except Exception as e:
-            logger.debug(f"[book] {stage} failure dump skipped (no content): {e}")
+            skip_log(f"[book] {stage} failure dump skipped (no content): {e}")
             return
 
         # Strip query/fragment from the URL header — they carry session-ish
@@ -1369,7 +1485,51 @@ class TockBooker:
             )
             logger.error(f"[book] {stage}-stage failure DOM dumped → {path}")
         except Exception as e:
-            logger.debug(f"[book] {stage} failure DOM dump failed: {e}")
+            skip_log(f"[book] {stage} failure DOM dump failed: {e}")
+
+    async def _capture_confirm_failure_artifacts(
+        self, page: Page, slot: AvailableSlot
+    ) -> None:
+        """Capture confirm-stage diagnostics (DOM dump + screenshot) after a
+        booking-confirmed verification failure, BEFORE booking_uncertain.json
+        is written.
+
+        06/26 23:30 incident (c): confirm was clicked on a half-rendered page,
+        verification failed, and NOTHING was captured — the outcome is
+        permanently unknowable. The DOM lands in
+        booking_failures/faildom_confirm_<ts>_<date>.html (existing failure-
+        dump pattern) with a failshot_confirm_*.png alongside. Both captures
+        are best-effort — this method NEVER raises past the verification path.
+        """
+        try:
+            await self._dump_click_failure(page, slot, stage="confirm")
+        except Exception as e:
+            # WARNING, not DEBUG: if the forensic capture itself fails on drop
+            # night, the operator must at least see THAT it failed (review P1).
+            logger.warning(f"[book] confirm-stage DOM dump failed: {e}")
+        try:
+            os.makedirs(_BOOKING_FAILURE_DIR, mode=0o700, exist_ok=True)
+            existing = [
+                f for f in os.listdir(_BOOKING_FAILURE_DIR)
+                if f.startswith("failshot_")
+            ]
+            if len(existing) >= _MAX_CONFIRM_DUMPS:
+                logger.warning(
+                    f"[book] confirm-stage screenshot skipped — "
+                    f"{_MAX_CONFIRM_DUMPS}-file cap reached"
+                )
+                return
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            shot_path = os.path.join(
+                _BOOKING_FAILURE_DIR,
+                f"failshot_confirm_{ts}_{slot.slot_date_str}.png",
+            )
+            await page.screenshot(path=shot_path, full_page=True)
+            logger.error(
+                f"[book] confirm-stage failure screenshot → {shot_path}"
+            )
+        except Exception as e:
+            logger.warning(f"[book] confirm-stage screenshot failed: {e}")
 
     async def _detect_booking_terminal_state(self, page: Page) -> "str | None":
         """Return 'race_lost' / 'sold_out' if Tock has surfaced a terminal
@@ -1507,6 +1667,62 @@ class TockBooker:
         except Exception as e:
             logger.debug(f"[book] Screenshot failed at step '{step}': {e}")
 
+    async def _settle_checkout_render(
+        self, page: Page, slot: AvailableSlot
+    ) -> bool:
+        """Wait (bounded) for the checkout page to actually RENDER before the
+        payment probes run.
+
+        06/26 23:30 incident (a): 'Checkout detected via url' fires at SPA
+        route-commit, BEFORE content paints. The one-shot payment probes then
+        all missed and confirm was clicked on a half-rendered page with the
+        CVC unfilled. Requires BOTH: the confirm button visible AND at least
+        one payment-ish signal (Stripe iframe / saved-card widget / CVC input
+        / add-payment prompt), racing under one shared
+        _CHECKOUT_RENDER_SETTLE_TIMEOUT_MS budget.
+
+        Timeout is NON-FATAL by contract: log a WARNING and return False —
+        the caller proceeds best-effort (never abort a won hold over this).
+        Runs AFTER the hold is won, so it is not on the race-critical path.
+        """
+        timeout_ms = _CHECKOUT_RENDER_SETTLE_TIMEOUT_MS
+        confirm_selector = sel.get("confirm_button")
+        tasks = [
+            asyncio.create_task(
+                page.wait_for_selector(
+                    confirm_selector, state="visible", timeout=timeout_ms
+                ),
+                name="render_settle::confirm",
+            ),
+            asyncio.create_task(
+                page.wait_for_selector(
+                    _CHECKOUT_RENDER_PAYMENT_SELECTOR, timeout=timeout_ms
+                ),
+                name="render_settle::payment",
+            ),
+        ]
+        try:
+            await asyncio.gather(*tasks)
+            logger.info(
+                f"[book] {slot} — checkout render settled "
+                "(confirm button + payment UI present)"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[book] {slot} — checkout render did not settle within "
+                f"{timeout_ms / 1000:.1f}s ({type(e).__name__}: {e}); "
+                "proceeding to payment probes best-effort"
+            )
+            return False
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Drain cancellations so Python doesn't warn about un-awaited
+            # coroutines (same pattern as _wait_for_checkout).
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _prepare_for_confirm(
         self, page: Page, slot: AvailableSlot,
         booking_won: asyncio.Event | None = None,
@@ -1516,6 +1732,7 @@ class TockBooker:
         (Phase B3.1).
 
         Steps:
+          - render-settle wait (bounded, non-fatal — 06/26 23:30 fix)
           - payment detection
           - wait up to 9 min for the operator to add a card if missing
           - CVC fill on the saved card (if any)
@@ -1526,6 +1743,11 @@ class TockBooker:
         wait (Codex B3 review MEDIUM 1: avoids N*4 reloads/min when
         N racing tasks are all waiting for the same card to appear).
         """
+        # (a) Render-settle: checkout detection can fire at SPA route-commit
+        # BEFORE content paints (06/26 23:30) — the one-shot probes below then
+        # miss everything on a half-rendered page. Bounded and non-fatal.
+        await self._settle_checkout_render(page, slot)
+
         needs_payment = await self._page_needs_payment(page)
         has_card = await self._has_saved_card(page)
 
@@ -1639,12 +1861,26 @@ class TockBooker:
                 return True
             # Server may be very slow to redirect under high traffic — wait 5s more
             logger.warning(
-                "[book] Confirmation page not detected yet — waiting 5s for slow server…"
+                "[book] Confirmation page not detected yet — waiting "
+                f"{_CONFIRM_URL_RECHECK_DELAY_SEC}s for slow server…"
             )
-            await asyncio.sleep(5)
+            await asyncio.sleep(_CONFIRM_URL_RECHECK_DELAY_SEC)
             url = page.url
             if any(p in url for p in ("confirmation", "confirmed", "success")):
                 logger.info(f"[book] Booking confirmed via URL (delayed): {url}")
+                return True
+            # (d) CONSUMER_CHECKOUT_DIALOG_MIGRATION: success may render
+            # IN-PLACE with NO URL change, so the selector wait and both URL
+            # checks can all miss a real success (06/26 23:30). Additive
+            # OR-signal — a text-marker hit upgrades to verified success; a
+            # miss falls through to the existing failure path unchanged.
+            marker = await self._detect_confirmation_text(page)
+            if marker:
+                logger.info(
+                    f"[book] Booking confirmed via on-page text marker "
+                    f"{marker!r} (no selector/URL signal — dialog-migration "
+                    f"checkout): {slot}"
+                )
                 return True
             logger.error(
                 f"SELECTOR_FAILED: key='{confirmed_key}'  selector={confirmed_selector!r}\n"
@@ -1653,6 +1889,29 @@ class TockBooker:
                 f"  → Check if booking actually succeeded, then update src/selectors.py"
             )
             return False
+
+    async def _detect_confirmation_text(self, page: Page) -> "str | None":
+        """Scan the page's VISIBLE text for a strong confirmation marker.
+
+        Returns the matching marker string, or None. Errors (page closed /
+        mid-navigation) and non-string evaluate results are swallowed → None,
+        so this can never fake a success or break the verification path.
+        HONESTY NOTE: the markers (selectors.CONFIRMATION_TEXT_MARKERS) are
+        best-guess until a real confirmation page is captured.
+        """
+        try:
+            marker = await page.evaluate(
+                _CONFIRMATION_TEXT_SCAN_JS, list(sel.CONFIRMATION_TEXT_MARKERS)
+            )
+        except Exception as e:
+            # WARNING so drop-night triage can tell 'scan crashed' apart from
+            # 'scan ran and found no marker' (review P2).
+            logger.warning(
+                f"[book] confirmation text scan failed — marker result "
+                f"unknown: {type(e).__name__}: {e}"
+            )
+            return None
+        return marker if isinstance(marker, str) and marker else None
 
     # Codex holistic review: the `_confirm_booking` shim was removed
     # because (a) no production code in src/ called it, (b) it was
@@ -1686,15 +1945,47 @@ class TockBooker:
 
         Tock/Stripe may embed the CVC input inside an iframe, so we search
         both the main frame and all child frames.
+
+        06/26 23:30 incident (b): this used to be a ONE-SHOT scan that ran
+        before the Stripe iframe finished rendering, missed, and logged only
+        at DEBUG — so confirm fired with the CVC provably unfilled and the
+        miss was invisible in bot.log. The frame scan now retries for up to
+        ~3s (_CVC_FILL_RETRY_TRIES × _CVC_FILL_RETRY_INTERVAL_SEC) and the
+        miss is a WARNING so the outcome is diagnosable after the fact.
         """
         selector = sel.get("cvc_input")
         # TockBrowser.find_in_frames searches main frame + all iframes (Stripe embeds CVC)
-        el = await self.browser.find_in_frames(page, selector)
-        if el:
-            await el.fill(self.config.card_cvc)
-            logger.info("[book] CVC filled.")
-        else:
-            logger.debug("[book] CVC field not found on page (may not be required).")
+        for attempt in range(1, _CVC_FILL_RETRY_TRIES + 1):
+            el = await self.browser.find_in_frames(page, selector)
+            if el:
+                # fill() can raise on a still-rendering Stripe iframe (element
+                # detached between scan and fill). That must not kill the
+                # WINNING task via the generic error handler — warn and keep
+                # retrying within the remaining budget (review P2).
+                try:
+                    await el.fill(self.config.card_cvc)
+                except Exception as e:
+                    logger.warning(
+                        f"[book] CVC fill attempt "
+                        f"{attempt}/{_CVC_FILL_RETRY_TRIES} failed "
+                        f"({type(e).__name__}: {e}) — retrying"
+                    )
+                else:
+                    # Keep this exact string — prior-incident forensics grep for it.
+                    logger.info("[book] CVC filled.")
+                    if attempt > 1:
+                        logger.info(
+                            f"[book] CVC field appeared on frame scan "
+                            f"{attempt}/{_CVC_FILL_RETRY_TRIES}."
+                        )
+                    return
+            if attempt < _CVC_FILL_RETRY_TRIES:
+                await asyncio.sleep(_CVC_FILL_RETRY_INTERVAL_SEC)
+        budget = _CVC_FILL_RETRY_TRIES * _CVC_FILL_RETRY_INTERVAL_SEC
+        logger.warning(
+            f"[book] CVC field not found after {budget:.1f}s — "
+            "proceeding to confirm without it"
+        )
 
     async def _has_saved_card(self, page: Page) -> bool:
         """True if a saved payment card widget is visible.

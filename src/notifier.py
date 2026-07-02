@@ -20,6 +20,8 @@ from datetime import datetime
 
 import pytz
 
+from src.booking_uncertain import UNCERTAIN_FILE
+
 logger = logging.getLogger(__name__)
 
 PT = pytz.timezone("America/Los_Angeles")
@@ -162,6 +164,46 @@ class Notifier:
         logger.warning(f"[book] FAILED ({len(slots)} slot(s)): {reason}")
         self._fire(
             title=f"❌ Booking Failed — {len(slots)} slot(s)",
+            description=msg,
+            color=_RED,
+            critical=True,
+        )
+
+    def booking_refused_uncertain(self, uncertain) -> None:
+        """Critical alert: slots were detected but the race was REFUSED
+        because booking_uncertain.json exists (a previous confirm click could
+        not be verified — Tock MAY have accepted it).
+
+        `uncertain` is the UncertainBooking payload read from the guard file
+        (passed through from the booker), or None if it was unavailable.
+        Fires a critical RED embed so it survives the shutdown drain. The
+        monitor keeps polling after this — the guard file is re-read at every
+        race start, so deleting it re-enables booking with no restart.
+        (06/26 incident: this state used to be a silent permanent idle.)
+        """
+        if uncertain is not None:
+            slot_desc = (
+                f"{uncertain.slot_date_str} ({uncertain.day_of_week}) @ "
+                f"{uncertain.slot_time} — confirm attempted at "
+                f"{uncertain.detected_at_iso}"
+            )
+        else:
+            slot_desc = "(payload unavailable — inspect the file on disk)"
+        msg = (
+            f"Slots were detected but booking was **REFUSED** because "
+            f"`booking_uncertain.json` exists — a previous confirm click "
+            f"could not be verified and Tock MAY have accepted it.\n\n"
+            f"**Uncertain slot:** {slot_desc}\n\n"
+            f"**Do this NOW:**\n"
+            f"1. Check https://www.exploretock.com/account/reservations\n"
+            f"2. Reservation EXISTS → keep the file and stop the bot\n"
+            f"3. Reservation does NOT exist → delete "
+            f"`{UNCERTAIN_FILE.resolve()}` "
+            f"— no restart needed; the very next poll can book."
+        )
+        logger.error(f"[book] REFUSED — uncertain guard active: {slot_desc}")
+        self._fire(
+            title="⛔ Booking REFUSED — Unverified Prior Confirm",
             description=msg,
             color=_RED,
             critical=True,
@@ -333,6 +375,10 @@ class Notifier:
 
         payload = {"embeds": [embed]}
 
+        # Delivery observability (06/26 postmortem): a successful send was
+        # previously invisible, so "embed never fired" and "embed fired but
+        # Discord dropped it" were indistinguishable in bot.log. Log every
+        # outcome; never block or raise into the caller (fire-and-forget).
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -340,13 +386,20 @@ class Notifier:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
-                    if resp.status not in (200, 204):
+                    if 200 <= resp.status < 300:
+                        logger.info(
+                            f"[notify] webhook delivered ({resp.status}) — {title}"
+                        )
+                    else:
                         text = await resp.text()
                         logger.warning(
-                            f"[discord] Webhook returned {resp.status}: {text[:200]}"
+                            f"[notify] webhook returned {resp.status} for "
+                            f"'{title}': {text[:200]}"
                         )
         except Exception as e:
-            logger.warning(f"[discord] Failed to send notification: {e}")
+            logger.warning(
+                f"[notify] webhook send failed for '{title}': {e!r}"
+            )
 
 
     # ------------------------------------------------------------------
@@ -400,6 +453,23 @@ class Notifier:
             (
                 "⚠️ Bot Error [TEST]",
                 "**Checkout page not found**\nSelector checkout_container failed",
+                _RED,
+                [],
+            ),
+            (
+                "⛔ Booking REFUSED — Unverified Prior Confirm [TEST]",
+                f"Slots were detected but booking was **REFUSED** because "
+                f"`booking_uncertain.json` exists — a previous confirm click "
+                f"could not be verified and Tock MAY have accepted it.\n\n"
+                f"**Uncertain slot:** {fake_slot.slot_date_str} "
+                f"({fake_slot.day_of_week}) @ {fake_slot.slot_time} — confirm "
+                f"attempted at 2026-03-14T17:00:05\n\n"
+                f"**Do this NOW:**\n"
+                f"1. Check https://www.exploretock.com/account/reservations\n"
+                f"2. Reservation EXISTS → keep the file and stop the bot\n"
+                f"3. Reservation does NOT exist → delete "
+                f"`{UNCERTAIN_FILE.resolve()}` "
+                f"— no restart needed; the very next poll can book.",
                 _RED,
                 [],
             ),

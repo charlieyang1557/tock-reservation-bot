@@ -73,6 +73,31 @@ _CF_CHALLENGE_ALERT_THRESHOLD = 0.05
 _REPLAY_REPOLL_MAX_TRIES = 6
 _REPLAY_REPOLL_INTERVAL_SEC = 0.25
 
+# 06/26 incident P0 (Tier-1): sniper release-timing constants. The sniper
+# window opens 60s before the NOMINAL release (window start 19:59:00, release
+# 20:00:00) — _RELEASE_AT_WINDOW_AGE_SEC encodes "release = window start +
+# 60s". On 06/26 the first replay fetch fired at exactly T0, raced the release
+# commit, and read the pre-release body. Replay fetching therefore begins
+# _PRE_RELEASE_FETCH_LEAD_SEC BEFORE the nominal release (window age 45s =
+# T-15s): pre-release fetches are cheap and expected-empty, and they guarantee
+# the fetch cadence is already at full speed when the release actually
+# commits. The DOM scan still NEVER runs before T0 (nothing to safety-net,
+# and a ~7s scan straddling T0 would be catastrophic).
+_RELEASE_AT_WINDOW_AGE_SEC = 60.0
+_PRE_RELEASE_FETCH_LEAD_SEC = 15.0
+
+# 06/26 incident P0 (Tier-1): the inline serial DOM safety-net scan costs ~7s
+# and blocks the monitor's strictly serial poll loop — on 06/26 it burned the
+# most time-critical seconds of the drop and made post-race polls 8.8s each.
+# Post-release, on CLEAN-EMPTY replay (decode_ok, not truncated — suspect
+# empties are mapped to None upstream) the scan now runs AT MOST once per this
+# many seconds of wall clock (time.monotonic anchor). The anchor is armed
+# WITHOUT scanning on the first post-release clean-empty poll, so the earliest
+# possible scan is ~T+10 — and only if replay is STILL empty by then (the
+# replay false-negative case the safety net exists for). Replay FAILURES
+# (None) bypass the throttle: replay is broken, DOM is the only detection.
+_DOM_SAFETY_NET_MIN_INTERVAL_SEC = 10.0
+
 logger = logging.getLogger(__name__)
 
 
@@ -349,6 +374,11 @@ class AvailabilityChecker:
         # known-broken auth/headers while the legacy path runs each poll.
         self._replay_failure_count: int = 0
         self._replay_circuit_open: bool = False
+        # Pre-deploy review P2: margin-phase (T-15..T0) fetch failures must
+        # not leave the circuit open at the release moment — the breaker is
+        # re-armed ONCE when a window crosses the release boundary. Armed by
+        # any pre-release poll, consumed by the first post-release poll.
+        self._release_boundary_reset_pending: bool = False
         # Raw protobuf body + parse diagnostics from the MOST RECENT replay
         # fetch this poll. Stashed by _try_calendar_replay so the post-release
         # replay-first detect path can (a) log calibration diagnostics on the
@@ -372,6 +402,13 @@ class AvailabilityChecker:
         # ~7/sec; logging every one would flood). Logged every Nth post-release
         # poll — see _REPLAY_DIAG_LOG_EVERY_N.
         self._replay_diag_poll_count: int = 0
+        # Wall-clock anchor (time.monotonic) of the most recent post-release
+        # DOM safety-net scan — None until the first post-release clean-empty
+        # poll ARMS it (without scanning). Reset whenever a pre-fetch-phase
+        # poll is observed (window age < 45s ⇒ a fresh sniper window) and at
+        # window teardown, so every window starts unarmed. See
+        # _DOM_SAFETY_NET_MIN_INTERVAL_SEC.
+        self._dom_safety_net_anchor: float | None = None
 
     # ------------------------------------------------------------------
     # Public
@@ -615,10 +652,12 @@ class AvailabilityChecker:
         self._replay_failure_count = 0
         self._replay_circuit_open = False
         # Window boundary: re-arm the once-per-window replay-miss capture and
-        # the "first poll of the window logs" diag throttle.
+        # the "first poll of the window logs" diag throttle, and disarm the
+        # DOM safety-net throttle so the next window starts fresh.
         self._replay_capture_dumped_this_window = False
         self._replay_priority_capture_dumped = False
         self._replay_diag_poll_count = 0
+        self._dom_safety_net_anchor = None
         await close_session(sess)
 
     def clear_skip_cache(self) -> None:
@@ -738,6 +777,9 @@ class AvailabilityChecker:
         self._replay_diag_poll_count = 0
         # Re-arm the once-per-window calendar-timeout forensic screenshot.
         self._cal_timeout_diag_captured_window = False
+        # Disarm the DOM safety-net throttle so the next window starts fresh
+        # (also reset by any pre-fetch-phase poll — belt and suspenders).
+        self._dom_safety_net_anchor = None
         logger.debug("[check] Sniper pages closed.")
 
     def _compute_cal_timeout(self, keep_page: bool) -> int:
@@ -1061,10 +1103,34 @@ class AvailabilityChecker:
         self._skip_dates.clear()
 
         # ── Two-phase sniper: Phase 1 (pre-release) ──────────────────────────
-        # The sniper window starts 60s before the actual release time.
-        # Scanning calendars before release produces only timeouts and error
-        # counts. Return immediately; Phase 2 (aggressive scan) begins at 60s.
-        if keep_pages and sniper_window_age_sec < 60.0:
+        # The sniper window starts _RELEASE_AT_WINDOW_AGE_SEC (60s) before the
+        # nominal release. Scanning calendars before release produces only
+        # timeouts and error counts, so the quiet PRE-FETCH phase (age < 45s)
+        # does no I/O at all. But waiting for T0 to fire the FIRST replay
+        # fetch raced the release on 06/26 — so with replay enabled, fetching
+        # begins _PRE_RELEASE_FETCH_LEAD_SEC early (age 45s = T-15s). The DOM
+        # scan still NEVER runs before T0: with replay off there is nothing
+        # safe to fetch pre-release, so the old no-I/O gate holds to 60s.
+        use_replay = getattr(self.config, "use_calendar_replay", False)
+        pre_release = (
+            keep_pages and sniper_window_age_sec < _RELEASE_AT_WINDOW_AGE_SEC
+        )
+        pre_fetch_phase = keep_pages and sniper_window_age_sec < (
+            _RELEASE_AT_WINDOW_AGE_SEC - _PRE_RELEASE_FETCH_LEAD_SEC
+        )
+        if pre_fetch_phase:
+            # Fresh window observed — reset the DOM safety-net throttle so
+            # the post-release phase starts unarmed.
+            self._dom_safety_net_anchor = None
+        if pre_release:
+            # Arm the one-shot breaker re-arm: a CF blip during the T-15..T0
+            # fetch margin must not disable the ~160ms replay fast path for
+            # the release moment itself (pre-deploy review P2).
+            self._release_boundary_reset_pending = True
+        elif keep_pages and self._release_boundary_reset_pending:
+            self._release_boundary_reset_pending = False
+            self.reset_replay_circuit()
+        if pre_fetch_phase or (pre_release and not use_replay):
             self.last_errors = 0
             self.last_checks = 0
             logger.debug(
@@ -1230,22 +1296,29 @@ class AvailabilityChecker:
                 return result_slots
 
             # ── Detection dispatch ───────────────────────────────────────
-            # POST-RELEASE sniper window (keep_pages AND age >= 60s, the same
-            # boundary as the pre-release skip above) is the ONLY place where
-            # a false negative is catastrophic: a real release sells out in
-            # seconds. There we run replay-FIRST and, ONLY if replay comes
-            # back empty/None, fall back to the reliable DOM scan — so a found
-            # replay slot is booked immediately (~160ms) without waiting on the
-            # multi-second DOM scan, AND an empty/wrong replay can never
-            # suppress the DOM safety net (the 2026-05-29 incident). Everywhere
-            # else, replay is the same pure fast-path: replay-if-on-else-DOM,
-            # early-return on success.
-            use_replay = getattr(self.config, "use_calendar_replay", False)
-            post_release_sniper = keep_pages and sniper_window_age_sec >= 60.0
+            # POST-RELEASE sniper window (keep_pages AND age >= 60s) is the
+            # ONLY place where a false negative is catastrophic: a real
+            # release sells out in seconds. There we run replay-FIRST and,
+            # ONLY if replay comes back empty/None, fall back to the reliable
+            # DOM scan — so a found replay slot is booked immediately (~160ms)
+            # without waiting on the multi-second DOM scan, AND an empty/wrong
+            # replay can never suppress the DOM safety net (the 2026-05-29
+            # incident; now throttled — see _DOM_SAFETY_NET_MIN_INTERVAL_SEC).
+            # The PRE-RELEASE MARGIN (45s <= age < 60s, replay on — the
+            # pre-fetch gate above returned earlier ages already) drives the
+            # same replay loop so fetches straddle the T0 boundary, but its
+            # DOM safety net is suppressed outright: pre-release empty is the
+            # expected state. Everywhere else, replay is the same pure
+            # fast-path: replay-if-on-else-DOM, early-return on success.
+            post_release_sniper = (
+                keep_pages
+                and sniper_window_age_sec >= _RELEASE_AT_WINDOW_AGE_SEC
+            )
 
-            if use_replay and post_release_sniper:
+            if use_replay and (post_release_sniper or pre_release):
                 return await self._replay_first_detect(
-                    _two_phase_dom_scan, keep_pages=keep_pages
+                    _two_phase_dom_scan, keep_pages=keep_pages,
+                    pre_release=pre_release,
                 )
 
             if use_replay:
@@ -1288,9 +1361,9 @@ class AvailabilityChecker:
                 logger.debug(f"[check] tracker.record failed: {e}")
 
     async def _replay_first_detect(
-        self, dom_scan, keep_pages: bool
+        self, dom_scan, keep_pages: bool, pre_release: bool = False
     ) -> list["AvailableSlot"]:
-        """Post-release sniper detection: replay-FIRST, DOM-FALLBACK.
+        """Sniper detection: replay-FIRST, DOM-FALLBACK.
 
         The objective is ONE reservation, and a real fuhuihua release sells
         out in seconds, so latency is everything:
@@ -1306,7 +1379,17 @@ class AvailabilityChecker:
              (init/fetch/parse failure), run the authoritative DOM scan (the
              safety net) and return its result. This is the ONLY path the DOM
              scan runs on, so an empty/wrong replay can never suppress it
-             (the 2026-05-29 incident).
+             (the 2026-05-29 incident). Two rate limits (06/26 P0 — the ~7s
+             inline scan blocked the hot loop at the drop moment):
+               - pre_release=True (the T-15..T0 fetch margin): the DOM scan
+                 is suppressed OUTRIGHT — pre-release empty is the expected
+                 state, and a multi-second scan straddling T0 would block
+                 detection at the exact release moment.
+               - post-release CLEAN-EMPTY replay: the scan runs at most once
+                 per _DOM_SAFETY_NET_MIN_INTERVAL_SEC (anchor armed without
+                 scanning on the first such poll, so the earliest scan is
+                 ~T+10). Replay FAILURE (None) bypasses the throttle: replay
+                 is broken, DOM is the only detection left.
 
         last_errors/last_checks:
           - Fast path (replay found slots): set to errors=0, checks=1
@@ -1341,9 +1424,10 @@ class AvailabilityChecker:
                 self._record_slots(replay_res, keep_pages=keep_pages)
                 self.last_errors = 0
                 self.last_checks = 1  # one fetch represents the whole scan
+                phase = "pre-release margin" if pre_release else "post-release"
                 logger.info(
                     f"[check-replay] {len(replay_res)} slot(s) via calendar-replay "
-                    f"fast-path (post-release"
+                    f"fast-path ({phase}"
                     f"{f', re-poll {attempt}' if attempt else ''}) — DOM scan skipped"
                 )
                 return replay_res
@@ -1360,9 +1444,67 @@ class AvailabilityChecker:
                 self._replay_failure_count >= self._REPLAY_FAILURE_THRESHOLD
             )
 
-        # FALLBACK PATH — replay empty ([]) or failed (None). Run the DOM
-        # safety net. replay_failed distinguishes the two for instrumentation.
         replay_failed = replay_res is None
+
+        # PRE-RELEASE MARGIN (T-15..T0): empty/None is the EXPECTED state —
+        # nothing has been released yet, so there is nothing to safety-net,
+        # and a multi-second DOM scan straddling T0 would block detection at
+        # the exact release moment (the 06/26 failure mode). Return fast so
+        # the next replay fetch fires at full cadence across the boundary.
+        if pre_release:
+            self.last_errors = 0
+            self.last_checks = 1  # one fetch represents the whole scan
+            logger.debug(
+                "[check-replay] pre-release margin replay returned "
+                f"{'None (failed)' if replay_failed else 'empty'} — expected "
+                "before release; DOM safety-net scan suppressed"
+            )
+            self._log_replay_diag(replay_failed=replay_failed)
+            return []
+
+        # POST-RELEASE DOM SAFETY-NET THROTTLE (sniper hot loop only): the
+        # inline serial DOM scan costs ~7s and blocks the monitor's strictly
+        # serial poll loop, so on CLEAN-EMPTY replay (decode_ok — suspect
+        # empties are mapped to None inside _try_calendar_replay) it runs at
+        # most once per _DOM_SAFETY_NET_MIN_INTERVAL_SEC. Replay FAILURE
+        # (None) bypasses the throttle: replay is broken, DOM is the only
+        # detection left. Throttle skips log at DEBUG (they fire ~2/sec).
+        if keep_pages and not replay_failed:
+            now = time.monotonic()
+            if self._dom_safety_net_anchor is None:
+                # First post-release clean-empty poll of the window: arm the
+                # anchor WITHOUT scanning — the earliest possible scan is
+                # ~10s after release, and only if replay is still empty.
+                self._dom_safety_net_anchor = now
+                self.last_errors = 0
+                self.last_checks = 1
+                logger.debug(
+                    "[check-replay] post-release replay empty — DOM "
+                    "safety-net armed (first scan due in "
+                    f"{_DOM_SAFETY_NET_MIN_INTERVAL_SEC:.0f}s if replay "
+                    "stays empty)"
+                )
+                self._log_replay_diag(replay_failed=False)
+                return []
+            since_last = now - self._dom_safety_net_anchor
+            if since_last < _DOM_SAFETY_NET_MIN_INTERVAL_SEC:
+                self.last_errors = 0
+                self.last_checks = 1
+                logger.debug(
+                    "[check-replay] post-release replay empty — DOM "
+                    f"safety-net scan throttled ({since_last:.1f}s since "
+                    f"last, min {_DOM_SAFETY_NET_MIN_INTERVAL_SEC:.0f}s)"
+                )
+                self._log_replay_diag(replay_failed=False)
+                return []
+
+        # FALLBACK PATH — replay empty ([]) with the safety-net scan due, or
+        # failed (None). Run the DOM safety net. replay_failed distinguishes
+        # the two for instrumentation.
+        if keep_pages:
+            # Any scan that runs (due OR failure-bypass) re-anchors the
+            # throttle — the multi-second scan itself is the cost rationed.
+            self._dom_safety_net_anchor = time.monotonic()
         logger.info(
             "[check-replay] post-release replay returned "
             f"{'None (failed)' if replay_failed else 'empty'} — running DOM "

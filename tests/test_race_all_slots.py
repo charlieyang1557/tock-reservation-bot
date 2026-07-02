@@ -290,7 +290,7 @@ async def test_failed_outcome_returned_when_no_winner():
 
 
 @pytest.mark.asyncio
-async def test_real_book_single_confirm_attempted_blocks_second_call():
+async def test_real_book_single_confirm_attempted_blocks_second_call(tmp_path):
     """Real _book_single (not a fake): two concurrent invocations on
     the SAME booker. First reaches the click-and-verify step and returns
     False; second sees _confirm_attempted set and aborts BEFORE the
@@ -330,13 +330,18 @@ async def test_real_book_single_confirm_attempted_blocks_second_call():
     # Patch external Playwright primitives only — NOT the lock/event/_confirm_attempted code.
     # Prep runs without the lock; click runs under the lock. Patch both to
     # isolate from real Playwright behavior.
+    # _BOOKING_FAILURE_DIR → tmp_path: the soft-win path now captures a real
+    # confirm-stage artifact (06/26 fix (c)); keep the mock-page dump out of
+    # the production booking_failures/ dir so suite runs don't eat its
+    # 50-file cap. Asserted semantics are unchanged.
     with patch.object(booker, "_click_calendar_day", AsyncMock(return_value=True)), \
          patch.object(booker, "_click_time_slot", AsyncMock(return_value=True)), \
          patch.object(booker, "_wait_for_checkout", AsyncMock(return_value=True)), \
          patch.object(booker, "_booking_screenshot", AsyncMock()), \
          patch.object(booker, "_prepare_for_confirm", AsyncMock(return_value=True)), \
          patch.object(booker, "_execute_confirm_click_and_verify",
-                      side_effect=fake_click_and_verify):
+                      side_effect=fake_click_and_verify), \
+         patch("src.booker._BOOKING_FAILURE_DIR", str(tmp_path)):
         outcome, returned_slot = await booker.book_best_slot_race(slots)
 
     # The locked click step must be called EXACTLY ONCE — even though
@@ -438,7 +443,11 @@ async def test_unverified_confirm_persists_across_booker_instances():
         f"Fresh booker must refuse to race when booking_uncertain.json "
         f"exists; got {len(attempts)} attempts. Auto-restart bypass detected."
     )
-    assert outcome == BookingOutcome.UNVERIFIED_CONFIRM
+    # Tier-1 fix (06/26 incident): the persisted-file guard now returns the
+    # distinct REFUSED_UNCERTAIN_GUARD outcome (refuse LOUDLY, keep polling)
+    # instead of UNVERIFIED_CONFIRM (which the monitor maps to a permanent
+    # idle). See tests/test_refused_uncertain_guard.py.
+    assert outcome == BookingOutcome.REFUSED_UNCERTAIN_GUARD
     assert returned_slot is not None
     assert returned_slot.slot_date_str == "2026-05-01"
     assert returned_slot.slot_time == "5:00 PM"

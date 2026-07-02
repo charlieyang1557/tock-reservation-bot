@@ -191,6 +191,31 @@ SELECTORS: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Text-based confirmation markers (additive OR-signal — NEVER a required AND)
+# ---------------------------------------------------------------------------
+# Tock's CONSUMER_CHECKOUT_DIALOG_MIGRATION feature flag can render booking
+# success IN-PLACE (a dialog on the checkout route) with NO URL change, so
+# both the `booking_confirmed` selector and the URL-substring checks can miss
+# a real success (06/26 23:30 unverifiable confirm). The booker scans the
+# page's visible text for these strings only AFTER the selector wait and both
+# URL checks have failed — a hit upgrades the outcome to verified success; a
+# miss changes nothing (the existing failure path runs unchanged).
+# Matching is case-insensitive with curly apostrophes normalized to ASCII.
+# HONESTY NOTE: these strings are best-guess (assembled from Tock email/web
+# copy) until a real confirmation page is captured — do not treat a miss as
+# proof of failure.
+# "you're going to" was dropped (pre-deploy review): a false positive here
+# upgrades FAILED→CONFIRMED, which skips the booking_uncertain guard and the
+# red 'verify manually' alert — only strong, specific phrases belong in this
+# tuple.
+CONFIRMATION_TEXT_MARKERS: tuple[str, ...] = (
+    "reservation is confirmed",
+    "you're all set",
+    "confirmation number",
+)
+
+
+# ---------------------------------------------------------------------------
 # Accessor
 # ---------------------------------------------------------------------------
 

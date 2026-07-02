@@ -66,10 +66,17 @@ async def test_repolls_replay_before_dom_scan_when_release_flips(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_falls_back_to_dom_when_repoll_stays_empty(monkeypatch):
-    """Replay empty across all re-polls → DOM safety net still runs (preserved)."""
+    """Replay empty across all re-polls → DOM safety net still runs (preserved).
+
+    06/26 P0 update: the safety net is now throttled to once per 10s of wall
+    clock (see test_dom_safety_net_throttle.py), so this test pre-ages the
+    anchor to make the scan DUE — the preserved contract is that a stuck-empty
+    replay still ends in the authoritative DOM scan."""
+    import time
     monkeypatch.setattr("src.checker._REPLAY_REPOLL_INTERVAL_SEC", 0)
     monkeypatch.setattr("src.checker._REPLAY_REPOLL_MAX_TRIES", 3)
     checker = _make_checker()
+    checker._dom_safety_net_anchor = time.monotonic() - 11.0  # scan due
 
     async def fake_replay(*a, **k):
         return []
